@@ -1,0 +1,2568 @@
+import { useState, useEffect, useMemo, useRef } from "react";
+import { useParams, useNavigate } from "react-router-dom";
+import { Layout } from "@/components/layout/Layout";
+import { StyleSelector } from "@/components/storyboard/StyleSelector";
+import { ModelSelector } from "@/components/storyboard/ModelSelector";
+import { SceneDetailModal } from "@/components/storyboard/SceneDetailModal";
+import { Button } from "@/components/ui/button";
+import { Badge } from "@/components/ui/badge";
+import { Card } from "@/components/ui/card";
+import { 
+  Download, 
+  Play, 
+  Wand2, 
+  ChevronDown,
+  BookOpen,
+  Loader2,
+  RefreshCw,
+  Image as ImageIcon,
+  FileText,
+  FolderArchive,
+  Printer,
+  Trash2,
+  Square
+} from "lucide-react";
+import { Dialog, DialogContent, DialogHeader, DialogTitle } from "@/components/ui/dialog";
+import {
+  DropdownMenu,
+  DropdownMenuContent,
+  DropdownMenuItem,
+  DropdownMenuTrigger,
+} from "@/components/ui/dropdown-menu";
+import {
+  AlertDialog,
+  AlertDialogAction,
+  AlertDialogCancel,
+  AlertDialogContent,
+  AlertDialogDescription,
+  AlertDialogFooter,
+  AlertDialogHeader,
+  AlertDialogTitle,
+} from "@/components/ui/alert-dialog";
+import { useScenes, useStories, Scene, Story } from "@/hooks/useStories";
+import { useAuth } from "@/hooks/useAuth";
+import { useToast } from "@/hooks/use-toast";
+import { supabase } from "@/integrations/supabase/client";
+import { Skeleton } from "@/components/ui/skeleton";
+import type { Json } from "@/integrations/supabase/types";
+import { buildAnchoredStoryHtmlDocument, buildStoryHtmlDocument, validateStoryHtmlDocument, validateStoryHtmlSceneCoverage } from "@/lib/story-html";
+import { StorySceneDragDropEditor, type StorySceneAnchors } from "@/components/storyboard/StorySceneDragDropEditor";
+
+import { Tabs, TabsContent, TabsList, TabsTrigger } from "@/components/ui/tabs";
+import { CharacterList } from "@/components/storyboard/CharacterList";
+
+export default function Storyboard() {
+  const { storyId } = useParams();
+  const navigate = useNavigate();
+  const { user } = useAuth();
+  const { stories, deleteStory, updateStory, fetchStories } = useStories();
+  const { scenes, loading: scenesLoading, fetchScenes, setScenes, updateScene, stopAllGeneration } = useScenes(storyId || null);
+  const { toast } = useToast();
+  
+  type BatchMode = "generate" | "regenerate";
+
+  const [story, setStory] = useState<Story | null>(null);
+  const [isGenerating, setIsGenerating] = useState(false);
+  const [generatingSceneId, setGeneratingSceneId] = useState<string | null>(null);
+  const [selectedStyle, setSelectedStyle] = useState("cinematic");
+  const [selectedModel, setSelectedModel] = useState("venice-sd35");
+  const [styleIntensity, setStyleIntensity] = useState(70);
+  const [disabledStyleElementsByStyle, setDisabledStyleElementsByStyle] = useState<Record<string, string[]>>({});
+  const [selectedScene, setSelectedScene] = useState<Scene | null>(null);
+  const [isModalOpen, setIsModalOpen] = useState(false);
+  const [isStoryModalOpen, setIsStoryModalOpen] = useState(false);
+  const [isStoryOpening, setIsStoryOpening] = useState(false);
+  const [isStoryPrinting, setIsStoryPrinting] = useState(false);
+  const [storyToDelete, setStoryToDelete] = useState<Story | null>(null);
+  const [isDeleting, setIsDeleting] = useState(false);
+  const [activeTab, setActiveTab] = useState("scenes");
+  const [batchSceneIds, setBatchSceneIds] = useState<string[]>([]);
+  const [batchMode, setBatchMode] = useState<BatchMode>("generate");
+  const [isRegenerateAllDialogOpen, setIsRegenerateAllDialogOpen] = useState(false);
+  const generateAllLockRef = useRef(false);
+  const storyPrintResetTimerRef = useRef<number | null>(null);
+  type SceneGenerationDebugInfo = {
+    timestamp: Date;
+    headers?: Record<string, string>;
+    redactedHeaders?: string[];
+    requestId?: string;
+    stage?: string;
+    error?: string;
+    suggestion?: string;
+    size?: number;
+    status?: number;
+    statusText?: string;
+    reasons?: string[];
+    upstreamError?: string;
+    requestParams?: {
+      model?: string;
+      artStyle?: string;
+      styleIntensity?: number;
+      strictStyle?: boolean;
+      disabledStyleElements?: string[];
+    };
+  };
+
+  const [debugInfo, setDebugInfo] = useState<Record<string, SceneGenerationDebugInfo>>({});
+
+  const batchSceneIdSet = useMemo(() => new Set(batchSceneIds), [batchSceneIds]);
+  const batchDoneCount = useMemo(() => {
+    if (batchSceneIds.length === 0) return 0;
+    return scenes.reduce((acc, s) => {
+      if (!batchSceneIdSet.has(s.id)) return acc;
+      if (s.generation_status === "completed" || s.generation_status === "error") return acc + 1;
+      return acc;
+    }, 0);
+  }, [batchSceneIds.length, batchSceneIdSet, scenes]);
+
+  const batchFailedCount = useMemo(() => {
+    if (batchSceneIds.length === 0) return 0;
+    return scenes.reduce((acc, s) => {
+      if (!batchSceneIdSet.has(s.id)) return acc;
+      if (s.generation_status === "error") return acc + 1;
+      return acc;
+    }, 0);
+  }, [batchSceneIds.length, batchSceneIdSet, scenes]);
+
+  const normalizeHeaderRecord = (headers: Record<string, string> | undefined) => {
+    if (!headers) return undefined;
+    const out: Record<string, string> = {};
+    for (const [k, v] of Object.entries(headers)) {
+      const key = String(k).toLowerCase();
+      out[key] = String(v);
+    }
+    return out;
+  };
+
+  const readInvokeBodyText = async (value: unknown) => {
+    if (typeof value === "string") return value;
+    if (value instanceof Uint8Array) return new TextDecoder().decode(value);
+    if (!value || typeof value !== "object") return null;
+
+    const rec = value as Record<string, unknown>;
+    const maybeText = rec.text as unknown;
+    if (typeof maybeText === "function") {
+      try {
+        return String(await (maybeText as () => Promise<unknown>)());
+      } catch {
+        return null;
+      }
+    }
+
+    const maybeGetReader = rec.getReader as unknown;
+    if (typeof maybeGetReader === "function") {
+      try {
+        const reader = (value as ReadableStream<Uint8Array>).getReader();
+        const chunks: Uint8Array[] = [];
+        while (true) {
+          const { done, value: chunk } = await reader.read();
+          if (done) break;
+          if (chunk) chunks.push(chunk);
+        }
+        const size = chunks.reduce((acc, c) => acc + c.length, 0);
+        const merged = new Uint8Array(size);
+        let offset = 0;
+        for (const c of chunks) {
+          merged.set(c, offset);
+          offset += c.length;
+        }
+        return new TextDecoder().decode(merged);
+      } catch {
+        return null;
+      }
+    }
+
+    return null;
+  };
+
+  const parseInvokeBodyObject = async (body: unknown) => {
+    const bodyText = await readInvokeBodyText(body);
+    const candidate = bodyText ?? body;
+    if (typeof candidate !== "string") return candidate;
+    try {
+      return JSON.parse(candidate) as unknown;
+    } catch {
+      return candidate;
+    }
+  };
+
+  const formatFunctionInvokeError = async (err: unknown, preParsedBody?: unknown) => {
+    const e = err as unknown as {
+      message?: string;
+      context?: { status?: number; body?: unknown };
+    };
+
+    const status = typeof e?.context?.status === "number" ? e.context.status : null;
+    const body = e?.context?.body;
+    const bodyObj = preParsedBody !== undefined ? preParsedBody : await parseInvokeBodyObject(body);
+
+    const bodyRec =
+      bodyObj && typeof bodyObj === "object" && !Array.isArray(bodyObj)
+        ? (bodyObj as Record<string, unknown>)
+        : null;
+
+    const serverError = bodyRec?.error ? String(bodyRec.error) : "";
+    const serverStage = bodyRec?.stage ? String(bodyRec.stage) : "";
+    const serverDbCode = bodyRec?.dbCode ? String(bodyRec.dbCode) : "";
+    const serverDbMessage = bodyRec?.dbMessage ? String(bodyRec.dbMessage) : "";
+    const serverDetails = (() => {
+      const d = bodyRec?.details;
+      if (!d) return "";
+      if (typeof d === "string") return d;
+      if (d && typeof d === "object" && !Array.isArray(d)) {
+        const rec = d as Record<string, unknown>;
+        
+        // Handle content violation details
+        if (rec.suggestion) {
+          return String(rec.suggestion);
+        }
+
+        const code = rec.code ? String(rec.code) : "";
+        const message = rec.message ? String(rec.message) : "";
+        const details = rec.details ? String(rec.details) : "";
+        const hint = rec.hint ? String(rec.hint) : "";
+        return [code ? `code=${code}` : null, message ? `message=${message}` : null, details ? `details=${details}` : null, hint ? `hint=${hint}` : null]
+          .filter(Boolean)
+          .join(" ");
+      }
+      return String(d);
+    })();
+    const serverModel = bodyRec?.model ? String(bodyRec.model) : "";
+    const serverRequestId = bodyRec?.requestId ? String(bodyRec.requestId) : "";
+
+    const parts = [
+      status ? `HTTP ${status}` : null,
+      serverError || null,
+      serverStage ? `stage=${serverStage}` : null,
+      serverModel ? `model=${serverModel}` : null,
+      serverRequestId ? `requestId=${serverRequestId}` : null,
+      serverDbCode ? `db=${serverDbCode}` : null,
+      serverDbMessage ? `dbMessage=${serverDbMessage}` : null,
+      serverDetails || null,
+      !serverError && typeof bodyObj === "string" ? bodyObj : null,
+      !serverError && e?.message ? e.message : null,
+    ].filter(Boolean);
+
+    return parts.join(" • ") || "Request failed";
+  };
+
+  const extractInvokeDebugInfo = async (error: unknown, preParsedBody?: unknown) => {
+    try {
+      const e = error as { context?: { body?: unknown; status?: unknown } } | null;
+      const bodyObj = preParsedBody !== undefined ? preParsedBody : await parseInvokeBodyObject(e?.context?.body);
+      
+      if (bodyObj && typeof bodyObj === "object" && !Array.isArray(bodyObj)) {
+        const rec = bodyObj as Record<string, unknown>;
+        const detailsRaw = rec.details;
+        const detailsObj =
+          detailsRaw && typeof detailsRaw === "object" && !Array.isArray(detailsRaw)
+            ? (detailsRaw as Record<string, unknown>)
+            : typeof detailsRaw === "string"
+              ? (() => {
+                  try {
+                    const parsed = JSON.parse(detailsRaw) as unknown;
+                    return parsed && typeof parsed === "object" && !Array.isArray(parsed)
+                      ? (parsed as Record<string, unknown>)
+                      : null;
+                  } catch {
+                    return null;
+                  }
+                })()
+              : null;
+
+        const headersObj =
+          detailsObj?.headers && typeof detailsObj.headers === "object" && !Array.isArray(detailsObj.headers)
+            ? (detailsObj.headers as Record<string, unknown>)
+            : null;
+        const headers = headersObj
+          ? (() => {
+              const out: Record<string, string> = {};
+              for (const [k, v] of Object.entries(headersObj)) {
+                if (typeof v === "string" || typeof v === "number" || typeof v === "boolean") {
+                  out[String(k).toLowerCase()] = String(v);
+                }
+              }
+              return out;
+            })()
+          : undefined;
+
+        const requestId = typeof rec.requestId === "string" ? rec.requestId : undefined;
+        const stage = typeof rec.stage === "string" ? rec.stage : undefined;
+        const status = typeof e?.context?.status === "number" ? (e.context.status as number) : undefined;
+        const serverError = typeof rec.error === "string" ? rec.error : undefined;
+        const suggestion = typeof detailsObj?.suggestion === "string" ? detailsObj.suggestion : undefined;
+        const size = typeof detailsObj?.size === "number" ? detailsObj.size : undefined;
+        const statusText = typeof detailsObj?.statusText === "string" ? detailsObj.statusText : undefined;
+        const upstreamError =
+          typeof detailsObj?.upstream_error === "string"
+            ? detailsObj.upstream_error
+            : typeof detailsObj?.upstreamError === "string"
+              ? detailsObj.upstreamError
+              : undefined;
+        const redactedHeaders = Array.isArray(detailsObj?.redactedHeaders)
+          ? (detailsObj.redactedHeaders as unknown[]).filter((v): v is string => typeof v === "string")
+          : undefined;
+        const reasons = Array.isArray(detailsObj?.reasons)
+          ? (detailsObj.reasons as unknown[]).filter((v): v is string => typeof v === "string")
+          : undefined;
+
+        return { headers, redactedHeaders, requestId, stage, status, statusText, serverError, suggestion, size, reasons, upstreamError };
+      }
+    } catch (e) {
+      console.error("Failed to extract debug headers from error:", e);
+    }
+    return null;
+  };
+
+  const recordSceneDebugInfo = (sceneId: string, next: Partial<SceneGenerationDebugInfo>) => {
+    setDebugInfo((prev) => {
+      const prevEntry = prev[sceneId];
+      const mergedHeaders =
+        next.headers
+          ? { ...(prevEntry?.headers ?? {}), ...normalizeHeaderRecord(next.headers) }
+          : prevEntry?.headers;
+      return {
+        ...prev,
+        [sceneId]: {
+          timestamp: next.timestamp ?? prevEntry?.timestamp ?? new Date(),
+          headers: mergedHeaders,
+          redactedHeaders: next.redactedHeaders ?? prevEntry?.redactedHeaders,
+          requestId: next.requestId ?? prevEntry?.requestId,
+          stage: next.stage ?? prevEntry?.stage,
+          error: next.error ?? prevEntry?.error,
+          suggestion: next.suggestion ?? prevEntry?.suggestion,
+          size: next.size ?? prevEntry?.size,
+          status: next.status ?? prevEntry?.status,
+          statusText: next.statusText ?? prevEntry?.statusText,
+          reasons: next.reasons ?? prevEntry?.reasons,
+          upstreamError: next.upstreamError ?? prevEntry?.upstreamError,
+        },
+      };
+    });
+  };
+
+  useEffect(() => {
+    if (!selectedScene?.id) return;
+    const updated = scenes.find((s) => s.id === selectedScene.id);
+    if (!updated) return;
+    if (updated.updated_at !== selectedScene.updated_at) setSelectedScene(updated);
+  }, [scenes, selectedScene]);
+
+  const validateGeneratedImage = async (url: string) => {
+    try {
+      const res = await fetch(url, { mode: "cors" });
+      if (!res.ok) {
+        return {
+          ok: false,
+          reason: `Failed to load generated image (HTTP ${res.status})`,
+          size: undefined as number | undefined,
+          mean: undefined as number | undefined,
+          std: undefined as number | undefined,
+        };
+      }
+
+      const blob = await res.blob();
+      const size = blob.size;
+      const bitmap = await createImageBitmap(blob);
+
+      const canvas = document.createElement("canvas");
+      const w = 64;
+      const h = 64;
+      canvas.width = w;
+      canvas.height = h;
+
+      const ctx = canvas.getContext("2d");
+      if (!ctx) {
+        bitmap.close();
+        return { ok: true, size, mean: undefined, std: undefined };
+      }
+
+      ctx.drawImage(bitmap, 0, 0, w, h);
+      bitmap.close();
+
+      const data = ctx.getImageData(0, 0, w, h).data;
+      let sum = 0;
+      let sumSq = 0;
+      let count = 0;
+
+      for (let i = 0; i < data.length; i += 16) {
+        const r = data[i] ?? 0;
+        const g = data[i + 1] ?? 0;
+        const b = data[i + 2] ?? 0;
+        const lum = 0.2126 * r + 0.7152 * g + 0.0722 * b;
+        sum += lum;
+        sumSq += lum * lum;
+        count += 1;
+      }
+
+      const mean = count > 0 ? sum / count : 0;
+      const variance = count > 0 ? sumSq / count - mean * mean : 0;
+      const std = Math.sqrt(Math.max(0, variance));
+      const blank = std < 2.5 && (mean < 6 || mean > 249);
+
+      return {
+        ok: !blank,
+        reason: blank ? `Generated image appears blank (mean=${mean.toFixed(1)}, std=${std.toFixed(1)})` : undefined,
+        size,
+        mean,
+        std,
+      };
+    } catch (e) {
+      const msg = e instanceof Error ? e.message : String(e);
+      return { ok: false, reason: `Failed to validate generated image: ${msg}`, size: undefined, mean: undefined, std: undefined };
+    }
+  };
+
+  useEffect(() => {
+    if (storyId && stories.length > 0) {
+      const found = stories.find(s => s.id === storyId);
+      if (found) {
+        setStory(found);
+        setSelectedStyle(found.art_style || "cinematic");
+        const settings =
+          found.consistency_settings && typeof found.consistency_settings === "object" && !Array.isArray(found.consistency_settings)
+            ? (found.consistency_settings as Record<string, unknown>)
+            : {};
+        const intensityRaw = settings.style_intensity;
+        const intensity = typeof intensityRaw === "number" ? intensityRaw : Number(intensityRaw);
+        setStyleIntensity(Number.isFinite(intensity) ? Math.max(0, Math.min(100, intensity)) : 70);
+        
+        const savedModel = settings.model;
+        if (typeof savedModel === "string") setSelectedModel(savedModel);
+      }
+    }
+  }, [storyId, stories]);
+
+  const updateConsistencySettings = async (updates: Record<string, unknown>) => {
+    if (!storyId) return;
+    const base =
+      story?.consistency_settings && typeof story.consistency_settings === "object" && !Array.isArray(story.consistency_settings)
+        ? (story.consistency_settings as Record<string, unknown>)
+        : {};
+    const next = { ...base, ...updates };
+    const updated = await updateStory(storyId, { consistency_settings: next as Json });
+    if (updated) setStory(updated);
+  };
+
+  const handleStyleChange = async (styleId: string) => {
+    setSelectedStyle(styleId);
+    if (!storyId) return;
+    const updated = await updateStory(storyId, { art_style: styleId });
+    if (updated) setStory(updated);
+  };
+
+  const handleStyleIntensityChange = async (intensity: number) => {
+    const clamped = Math.max(0, Math.min(100, intensity));
+    setStyleIntensity(clamped);
+    await updateConsistencySettings({ style_intensity: clamped });
+  };
+
+  const handleDisabledStyleElementsChange = (styleId: string, disabledElements: string[]) => {
+    setDisabledStyleElementsByStyle((prev) => {
+      const next = { ...prev, [styleId]: disabledElements };
+      return next;
+    });
+  };
+
+  const handleModelChange = async (modelId: string) => {
+    setSelectedModel(modelId);
+    await updateConsistencySettings({ model: modelId });
+  };
+
+  const handleDeleteStory = async () => {
+    if (!storyToDelete) return;
+    
+    setIsDeleting(true);
+    const success = await deleteStory(storyToDelete.id);
+    setIsDeleting(false);
+    setStoryToDelete(null);
+    
+    if (success) {
+      toast({
+        title: "Story deleted",
+        description: `"${storyToDelete.title}" has been removed`,
+      });
+    }
+  };
+
+  const handleGenerateImage = async (
+    sceneId: string,
+    opts?: { artStyle?: string; styleIntensity?: number; strictStyle?: boolean },
+  ) => {
+    if (!user) {
+      toast({
+        title: "Sign in required",
+        description: "Please sign in to generate images",
+        variant: "destructive",
+      });
+      return;
+    }
+
+    setGeneratingSceneId(sceneId);
+
+    try {
+      type GenerateSceneImageResponse = {
+        success?: boolean;
+        imageUrl?: string;
+        generationStatus?: string;
+        consistency?: unknown;
+        headers?: Record<string, string>;
+        redactedHeaders?: string[];
+        requestId?: string;
+        stage?: string;
+        error?: string;
+        message?: string;
+        details?: string;
+      };
+      const { data: { session } } = await supabase.auth.getSession();
+      
+      if (!session) {
+        toast({
+          title: "Not authenticated",
+          description: "Please sign in to generate images",
+          variant: "destructive",
+        });
+        return;
+      }
+
+      const artStyle = opts?.artStyle ?? selectedStyle;
+      const intensity = opts?.styleIntensity ?? styleIntensity;
+      const strictStyle = opts?.strictStyle ?? false;
+      const disabledStyleElements = disabledStyleElementsByStyle[artStyle] ?? [];
+
+      const requestParams = {
+        model: selectedModel,
+        artStyle,
+        styleIntensity: intensity,
+        strictStyle,
+        disabledStyleElements,
+      };
+
+      // Use direct fetch to bypass supabase-js error wrapping that might obscure headers
+      const { data: { session: currentSession } } = await supabase.auth.getSession();
+      const token = currentSession?.access_token ?? session.access_token;
+      
+      // Get the function URL
+      const functionUrl = `${import.meta.env.VITE_SUPABASE_URL ?? "https://placeholder.supabase.co"}/functions/v1/generate-scene-image`;
+      
+      let rawResponse: Response;
+      try {
+        rawResponse = await fetch(functionUrl, {
+          method: "POST",
+          headers: {
+            "Authorization": `Bearer ${token}`,
+            "Content-Type": "application/json"
+          },
+          body: JSON.stringify({ 
+            sceneId, 
+            artStyle,
+            styleIntensity: intensity,
+            strictStyle,
+            model: selectedModel,
+            disabledStyleElements,
+          })
+        });
+      } catch (netError) {
+        throw new Error(`Network error: ${netError instanceof Error ? netError.message : String(netError)}`);
+      }
+
+      // Extract all headers immediately
+      const responseHeaders: Record<string, string> = {};
+      rawResponse.headers.forEach((value, key) => {
+        responseHeaders[key.toLowerCase()] = value;
+      });
+
+      const responseStatus = rawResponse.status;
+      const responseStatusText = rawResponse.statusText;
+      
+      let responseBody: unknown;
+      try {
+        const text = await rawResponse.text();
+        try {
+          responseBody = JSON.parse(text);
+        } catch {
+          responseBody = text;
+        }
+      } catch {
+        responseBody = null;
+      }
+
+      // Handle non-200 responses
+      if (!rawResponse.ok) {
+        const bodyObj = responseBody && typeof responseBody === "object" ? responseBody as Record<string, unknown> : null;
+        const detailsObj = bodyObj?.details as Record<string, unknown> | undefined;
+        
+        // Merge headers from the body details if they exist (they might be richer)
+        const bodyHeaders = detailsObj?.headers as Record<string, string> | undefined;
+        const finalHeaders = { ...responseHeaders, ...(bodyHeaders || {}) };
+        
+        const reasons = Array.isArray(detailsObj?.reasons) ? detailsObj.reasons as string[] : undefined;
+        const upstreamError = detailsObj?.upstream_error as string | undefined;
+        const redactedHeaders = Array.isArray(detailsObj?.redactedHeaders) ? detailsObj.redactedHeaders as string[] : undefined;
+        
+        const errorMsg = String(bodyObj?.error || `HTTP ${responseStatus} ${responseStatusText}`);
+
+        recordSceneDebugInfo(sceneId, {
+          timestamp: new Date(),
+          headers: finalHeaders,
+          redactedHeaders,
+          status: responseStatus,
+          statusText: responseStatusText,
+          error: errorMsg,
+          reasons,
+          upstreamError,
+          requestId: (bodyObj?.requestId as string) || responseHeaders["x-request-id"],
+          requestParams
+        });
+
+        setScenes((prev) =>
+          prev.map((s) =>
+            s.id === sceneId
+              ? {
+                  ...s,
+                  generation_status: "error",
+                  consistency_details: {
+                    ...(s.consistency_details && typeof s.consistency_details === "object" && !Array.isArray(s.consistency_details)
+                      ? (s.consistency_details as Record<string, unknown>)
+                      : {}),
+                    generation_debug: {
+                      timestamp: new Date().toISOString(),
+                      headers: finalHeaders,
+                      redactedHeaders,
+                      status: responseStatus,
+                      statusText: responseStatusText,
+                      error: errorMsg,
+                      reasons,
+                      upstream_error: upstreamError,
+                      requestId: (bodyObj?.requestId as string) || responseHeaders["x-request-id"],
+                      requestParams
+                    },
+                  } as Json,
+                }
+              : s,
+          ),
+        );
+        throw new Error(errorMsg);
+      }
+
+      const response = responseBody as GenerateSceneImageResponse | null;
+      console.log("[Storyboard] Generation response:", response);
+
+      const ok = response?.success === true || Boolean(response?.imageUrl);
+      if (!ok) {
+        const bodyHeaders = response?.headers as Record<string, string> | undefined;
+        const finalHeaders = { ...responseHeaders, ...(bodyHeaders || {}) };
+
+        // Extract actual error details from response instead of using generic message
+        const errorMessage = response?.error || 
+                           response?.message || 
+                           response?.details || 
+                           finalHeaders["x-failure-reason"] || 
+                           finalHeaders["x-error-message"] || 
+                           finalHeaders["warning"] || 
+                           "Generation did not return an image";
+
+        recordSceneDebugInfo(sceneId, {
+          timestamp: new Date(),
+          headers: finalHeaders,
+          redactedHeaders: response?.redactedHeaders,
+          requestId: response?.requestId,
+          stage: response?.stage,
+          error: errorMessage,
+          requestParams
+        });
+        setScenes((prev) =>
+          prev.map((s) =>
+            s.id === sceneId
+              ? {
+                  ...s,
+                  generation_status: "error",
+                  consistency_details: {
+                    ...(s.consistency_details && typeof s.consistency_details === "object" && !Array.isArray(s.consistency_details)
+                      ? (s.consistency_details as Record<string, unknown>)
+                      : {}),
+                    generation_debug: {
+                      timestamp: new Date().toISOString(),
+                      headers: normalizeHeaderRecord(finalHeaders),
+                      redactedHeaders: response?.redactedHeaders,
+                      requestId: response?.requestId,
+                      stage: response?.stage,
+                      error: errorMessage,
+                      requestParams
+                    },
+                  } as Json,
+                }
+              : s,
+          ),
+        );
+        throw new Error(errorMessage);
+      }
+
+      if (response?.imageUrl) {
+        const validation = await validateGeneratedImage(response.imageUrl);
+        if (!validation.ok) {
+          const reason = validation.reason || "Generated image failed client validation";
+          recordSceneDebugInfo(sceneId, {
+            timestamp: new Date(),
+            headers: response?.headers,
+            redactedHeaders: response?.redactedHeaders,
+            requestId: response?.requestId,
+            stage: "client_image_validation",
+            size: validation.size,
+            error: reason,
+          });
+
+          setScenes((prev) =>
+            prev.map((s) =>
+              s.id === sceneId
+                ? {
+                    ...s,
+                    image_url: null,
+                    generation_status: "error",
+                    consistency_status: "fail",
+                    consistency_details: {
+                      ...(s.consistency_details && typeof s.consistency_details === "object" && !Array.isArray(s.consistency_details)
+                        ? (s.consistency_details as Record<string, unknown>)
+                        : {}),
+                      generation_debug: {
+                        timestamp: new Date().toISOString(),
+                        headers: normalizeHeaderRecord(response?.headers),
+                        redactedHeaders: response?.redactedHeaders,
+                        requestId: response?.requestId,
+                        stage: "client_image_validation",
+                        error: reason,
+                        size: validation.size,
+                      },
+                    } as Json,
+                  }
+                : s,
+            ),
+          );
+
+          void updateScene(sceneId, {
+            image_url: null,
+            generation_status: "error",
+            consistency_status: "fail",
+            consistency_details: {
+              generation_debug: {
+                timestamp: new Date().toISOString(),
+                headers: normalizeHeaderRecord(response?.headers),
+                redactedHeaders: response?.redactedHeaders,
+                requestId: response?.requestId,
+                stage: "client_image_validation",
+                error: reason,
+                size: validation.size,
+              },
+            } as Json,
+          });
+
+          toast({
+            title: "Generation failed",
+            description: reason,
+            variant: "destructive",
+          });
+          return;
+        }
+      }
+
+      const bodyHeaders = response?.headers as Record<string, string> | undefined;
+      const finalHeaders = { ...responseHeaders, ...(bodyHeaders || {}) };
+
+      if (Object.keys(finalHeaders).length > 0) {
+        console.log("[Storyboard] Setting debug info headers:", finalHeaders);
+        recordSceneDebugInfo(sceneId, {
+          timestamp: new Date(),
+          headers: finalHeaders,
+          redactedHeaders: response?.redactedHeaders,
+          requestId: response?.requestId,
+          stage: response?.stage,
+          requestParams
+        });
+      } else {
+        console.warn("[Storyboard] No headers in response");
+      }
+
+      setScenes((prev) =>
+        prev.map((s) =>
+          s.id === sceneId
+            ? {
+                ...s,
+                image_url: response?.imageUrl ?? s.image_url,
+                generation_status: "completed",
+                consistency_details: {
+                  ...(s.consistency_details && typeof s.consistency_details === "object" && !Array.isArray(s.consistency_details)
+                    ? (s.consistency_details as Record<string, unknown>)
+                    : {}),
+                  generation_debug: {
+                    timestamp: new Date().toISOString(),
+                    headers: normalizeHeaderRecord(finalHeaders),
+                    requestId: response?.requestId,
+                    stage: response?.stage,
+                    requestParams
+                  },
+                } as Json,
+              }
+            : s,
+        ),
+      );
+
+      if (!response?.imageUrl) await fetchScenes();
+
+      toast({
+        title: "Image generated!",
+        description: "Scene illustration has been created",
+      });
+    } catch (error) {
+      console.error("Error generating image:", error);
+      const message = error instanceof Error ? error.message : "Failed to generate image";
+      recordSceneDebugInfo(sceneId, { timestamp: new Date(), error: message });
+      setScenes((prev) =>
+        prev.map((s) =>
+          s.id === sceneId
+            ? {
+                ...s,
+                generation_status: "error",
+                consistency_details: {
+                  ...(s.consistency_details && typeof s.consistency_details === "object" && !Array.isArray(s.consistency_details)
+                    ? (s.consistency_details as Record<string, unknown>)
+                    : {}),
+                  generation_debug: {
+                    timestamp: new Date().toISOString(),
+                    error: message,
+                  },
+                } as Json,
+              }
+            : s,
+        ),
+      );
+      toast({
+        title: "Generation failed",
+        description: message,
+        variant: "destructive",
+      });
+    } finally {
+      setGeneratingSceneId(null);
+    }
+  };
+
+  const runBatchGeneration = async (
+    scenesToGenerate: Scene[],
+    mode: BatchMode,
+    opts?: { resetFirst?: boolean },
+  ) => {
+    if (!user || scenesToGenerate.length === 0) return;
+    if (generateAllLockRef.current) return;
+    generateAllLockRef.current = true;
+
+    setIsGenerating(true);
+    setBatchMode(mode);
+    setBatchSceneIds(scenesToGenerate.map((s) => s.id));
+
+    try {
+        type GenerateSceneImageResponse = {
+          success?: boolean;
+          imageUrl?: string;
+          headers?: Record<string, string>;
+          redactedHeaders?: string[];
+          requestId?: string;
+          stage?: string;
+          error?: string;
+          message?: string;
+          details?: string;
+        };
+        const { data: { session } } = await supabase.auth.getSession();
+
+      if (!session) {
+        toast({
+          title: "Not authenticated",
+          description: "Please sign in to generate images",
+          variant: "destructive",
+        });
+        return;
+      }
+
+      if (opts?.resetFirst) {
+        const ok = await resetAllSceneGenerations(session.access_token);
+        if (!ok) return;
+      }
+
+      let failedCount = 0;
+      for (const scene of scenesToGenerate) {
+        setGeneratingSceneId(scene.id);
+        setScenes((prev) =>
+          prev.map((s) =>
+            s.id === scene.id ? { ...s, generation_status: "generating" } : s,
+          ),
+        );
+
+        try {
+          // Use direct fetch to bypass supabase-js error wrapping that might obscure headers
+          const functionUrl = `${import.meta.env.VITE_SUPABASE_URL ?? "https://placeholder.supabase.co"}/functions/v1/generate-scene-image`;
+          
+          const requestParams = {
+            model: selectedModel,
+            artStyle: selectedStyle,
+            styleIntensity,
+            strictStyle: false,
+            disabledStyleElements: disabledStyleElementsByStyle[selectedStyle] ?? [],
+          };
+
+          let rawResponse: Response;
+          try {
+            rawResponse = await fetch(functionUrl, {
+              method: "POST",
+              headers: {
+                "Authorization": `Bearer ${session.access_token}`,
+                "Content-Type": "application/json"
+              },
+              body: JSON.stringify({ 
+                sceneId: scene.id, 
+                artStyle: selectedStyle, 
+                styleIntensity, 
+                strictStyle: false,
+                model: selectedModel,
+                disabledStyleElements: disabledStyleElementsByStyle[selectedStyle] ?? [],
+              })
+            });
+          } catch (netError) {
+            throw new Error(`Network error: ${netError instanceof Error ? netError.message : String(netError)}`);
+          }
+
+          // Extract all headers immediately
+          const responseHeaders: Record<string, string> = {};
+          rawResponse.headers.forEach((value, key) => {
+            responseHeaders[key.toLowerCase()] = value;
+          });
+
+          const responseStatus = rawResponse.status;
+          const responseStatusText = rawResponse.statusText;
+          
+          let responseBody: unknown;
+          try {
+            const text = await rawResponse.text();
+            try {
+              responseBody = JSON.parse(text);
+            } catch {
+              responseBody = text;
+            }
+          } catch {
+            responseBody = null;
+          }
+
+          // Handle non-200 responses
+          if (!rawResponse.ok) {
+            const bodyObj = responseBody && typeof responseBody === "object" ? responseBody as Record<string, unknown> : null;
+            const detailsObj = bodyObj?.details as Record<string, unknown> | undefined;
+            
+            // Merge headers from the body details if they exist (they might be richer)
+            const bodyHeaders = detailsObj?.headers as Record<string, string> | undefined;
+            const finalHeaders = { ...responseHeaders, ...(bodyHeaders || {}) };
+            
+            const reasons = Array.isArray(detailsObj?.reasons) ? detailsObj.reasons as string[] : undefined;
+            const upstreamError = detailsObj?.upstream_error as string | undefined;
+            const redactedHeaders = Array.isArray(detailsObj?.redactedHeaders) ? detailsObj.redactedHeaders as string[] : undefined;
+            
+            const errorMsg = String(bodyObj?.error || `HTTP ${responseStatus} ${responseStatusText}`);
+
+            recordSceneDebugInfo(scene.id, {
+              timestamp: new Date(),
+              headers: finalHeaders,
+              redactedHeaders,
+              status: responseStatus,
+              statusText: responseStatusText,
+              error: errorMsg,
+              reasons,
+              upstreamError,
+              requestId: (bodyObj?.requestId as string) || responseHeaders["x-request-id"],
+              requestParams
+            });
+
+            console.error(`Error generating scene ${scene.id}:`, errorMsg);
+            if (failedCount === 0) {
+              toast({
+                title: "Generation failed",
+                description: errorMsg,
+                variant: "destructive",
+              });
+            }
+            failedCount += 1;
+            setScenes((prev) =>
+              prev.map((s) =>
+                s.id === scene.id
+                  ? {
+                      ...s,
+                      generation_status: "error",
+                      consistency_details: {
+                        ...(s.consistency_details && typeof s.consistency_details === "object" && !Array.isArray(s.consistency_details)
+                          ? (s.consistency_details as Record<string, unknown>)
+                          : {}),
+                        generation_debug: {
+                          timestamp: new Date().toISOString(),
+                          headers: finalHeaders,
+                          redactedHeaders,
+                          status: responseStatus,
+                          statusText: responseStatusText,
+                          error: errorMsg,
+                          reasons,
+                          upstream_error: upstreamError,
+                          requestId: (bodyObj?.requestId as string) || responseHeaders["x-request-id"],
+                          requestParams
+                        },
+                      } as Json,
+                    }
+                  : s,
+              ),
+            );
+            continue;
+          }
+
+          const response = responseBody as GenerateSceneImageResponse | null;
+          const ok = response?.success === true || Boolean(response?.imageUrl);
+          if (!ok) {
+            const bodyHeaders = response?.headers as Record<string, string> | undefined;
+            const finalHeaders = { ...responseHeaders, ...(bodyHeaders || {}) };
+
+            // Extract actual error details from response instead of using generic message
+            const errorMessage = response?.error || 
+                               response?.message || 
+                               response?.details || 
+                               finalHeaders["x-failure-reason"] || 
+                               finalHeaders["x-error-message"] || 
+                               finalHeaders["warning"] || 
+                               "Generation did not return an image";
+
+            recordSceneDebugInfo(scene.id, {
+              timestamp: new Date(),
+              error: errorMessage,
+              requestId: response?.requestId,
+              stage: response?.stage,
+              headers: finalHeaders,
+              redactedHeaders: response?.redactedHeaders,
+              requestParams
+            });
+            failedCount += 1;
+            setScenes((prev) =>
+              prev.map((s) =>
+                s.id === scene.id
+                  ? {
+                      ...s,
+                      generation_status: "error",
+                      consistency_details: {
+                        ...(s.consistency_details && typeof s.consistency_details === "object" && !Array.isArray(s.consistency_details)
+                          ? (s.consistency_details as Record<string, unknown>)
+                          : {}),
+                        generation_debug: {
+                          timestamp: new Date().toISOString(),
+                          headers: normalizeHeaderRecord(finalHeaders),
+                          redactedHeaders: response?.redactedHeaders,
+                          requestId: response?.requestId,
+                          stage: response?.stage,
+                          error: errorMessage,
+                          requestParams
+                        },
+                      } as Json,
+                    }
+                  : s,
+              ),
+            );
+            continue;
+          }
+
+          if (response?.imageUrl) {
+            const validation = await validateGeneratedImage(response.imageUrl);
+            if (!validation.ok) {
+              const reason = validation.reason || "Generated image failed client validation";
+              recordSceneDebugInfo(scene.id, {
+                timestamp: new Date(),
+                error: reason,
+                requestId: response?.requestId,
+                stage: "client_image_validation",
+                headers: response?.headers,
+                redactedHeaders: response?.redactedHeaders,
+                size: validation.size,
+              });
+              failedCount += 1;
+              setScenes((prev) =>
+                prev.map((s) =>
+                  s.id === scene.id
+                    ? {
+                        ...s,
+                        image_url: null,
+                        generation_status: "error",
+                        consistency_status: "fail",
+                        consistency_details: {
+                          ...(s.consistency_details && typeof s.consistency_details === "object" && !Array.isArray(s.consistency_details)
+                            ? (s.consistency_details as Record<string, unknown>)
+                            : {}),
+                          generation_debug: {
+                            timestamp: new Date().toISOString(),
+                            headers: normalizeHeaderRecord(response?.headers),
+                            redactedHeaders: response?.redactedHeaders,
+                            requestId: response?.requestId,
+                            stage: "client_image_validation",
+                            error: reason,
+                            size: validation.size,
+                          },
+                        } as Json,
+                      }
+                    : s,
+                ),
+              );
+              void updateScene(scene.id, {
+                image_url: null,
+                generation_status: "error",
+                consistency_status: "fail",
+                consistency_details: {
+                  generation_debug: {
+                    timestamp: new Date().toISOString(),
+                    headers: normalizeHeaderRecord(response?.headers),
+                    redactedHeaders: response?.redactedHeaders,
+                    requestId: response?.requestId,
+                    stage: "client_image_validation",
+                    error: reason,
+                    size: validation.size,
+                  },
+                } as Json,
+              });
+              continue;
+            }
+          }
+          const bodyHeaders = response?.headers as Record<string, string> | undefined;
+          const finalHeaders = { ...responseHeaders, ...(bodyHeaders || {}) };
+
+          recordSceneDebugInfo(scene.id, {
+            timestamp: new Date(),
+            headers: finalHeaders,
+            redactedHeaders: response?.redactedHeaders,
+            requestId: response?.requestId,
+            stage: response?.stage,
+            requestParams
+          });
+          setScenes((prev) =>
+            prev.map((s) =>
+              s.id === scene.id
+                ? {
+                    ...s,
+                    image_url: response?.imageUrl ?? s.image_url,
+                    generation_status: "completed",
+                    consistency_details: {
+                      ...(s.consistency_details && typeof s.consistency_details === "object" && !Array.isArray(s.consistency_details)
+                        ? (s.consistency_details as Record<string, unknown>)
+                        : {}),
+                      generation_debug: {
+                        timestamp: new Date().toISOString(),
+                        headers: normalizeHeaderRecord(finalHeaders),
+                        redactedHeaders: response?.redactedHeaders,
+                        requestId: response?.requestId,
+                        stage: response?.stage,
+                        requestParams
+                      },
+                    } as Json,
+                  }
+                : s,
+            ),
+          );
+        } catch (error) {
+          const message = error instanceof Error ? error.message : "Failed to generate image";
+          recordSceneDebugInfo(scene.id, { timestamp: new Date(), error: message });
+          console.error(`Error generating scene ${scene.id}:`, message);
+          failedCount += 1;
+          setScenes((prev) =>
+            prev.map((s) =>
+              s.id === scene.id
+                ? {
+                    ...s,
+                    generation_status: "error",
+                    consistency_details: {
+                      ...(s.consistency_details && typeof s.consistency_details === "object" && !Array.isArray(s.consistency_details)
+                        ? (s.consistency_details as Record<string, unknown>)
+                        : {}),
+                      generation_debug: {
+                        timestamp: new Date().toISOString(),
+                        error: message,
+                      },
+                    } as Json,
+                  }
+                : s,
+            ),
+          );
+          continue;
+        }
+
+        await new Promise((resolve) => setTimeout(resolve, 1000));
+      }
+
+      toast({
+        title: mode === "regenerate" ? "Regeneration complete!" : "Generation complete!",
+        description: `Finished ${scenesToGenerate.length} scenes (${failedCount} failed)`,
+      });
+
+      await fetchScenes();
+    } catch (error) {
+      console.error("Error in batch generation:", error);
+      toast({
+        title: mode === "regenerate" ? "Regeneration failed" : "Generation failed",
+        description: "Some images failed to generate",
+        variant: "destructive",
+      });
+    } finally {
+      setIsGenerating(false);
+      setGeneratingSceneId(null);
+      setBatchSceneIds([]);
+      setBatchMode("generate");
+      generateAllLockRef.current = false;
+    }
+  };
+
+  const resetAllSceneGenerations = async (accessToken: string) => {
+    if (!storyId) return false;
+
+    setScenes((prev) =>
+      prev.map((s) => ({
+        ...s,
+        image_url: null,
+        generation_status: "pending",
+        consistency_score: null,
+        consistency_status: null,
+        consistency_details: {} as Json,
+      })),
+    );
+
+    const failures: string[] = [];
+
+    try {
+      const { data, error } = await supabase.functions.invoke("generate-scene-image", {
+        body: { action: "reset_story_scenes", storyId },
+        headers: { Authorization: `Bearer ${accessToken}` },
+      });
+
+      if (!error) {
+        const ok = Boolean((data as { success?: boolean } | null)?.success);
+        if (ok) return true;
+        failures.push("reset function returned no success");
+      } else {
+        failures.push(await formatFunctionInvokeError(error));
+      }
+    } catch (e) {
+      failures.push(e instanceof Error ? e.message : "reset function failed");
+    }
+
+    const { error: dbError } = await supabase
+      .from("scenes")
+      .update({ image_url: null, generation_status: "pending" })
+      .eq("story_id", storyId);
+
+    if (!dbError) return true;
+    failures.push(dbError.message || "database update failed");
+
+    await fetchScenes();
+    toast({
+      title: "Reset failed",
+      description: failures[0] ?? "Could not clear previous image generations",
+      variant: "destructive",
+    });
+    return false;
+  };
+
+  const handleStopGenerating = async () => {
+    // 1. Stop local batch loop if running
+    if (generateAllLockRef.current) {
+      // We can't easily "cancel" the running promise loop, but we can signal it to stop
+      // Since `runBatchGeneration` checks `scenesToGenerate` loop, we can't break it from outside easily 
+      // without an AbortController or a shared ref check inside the loop.
+      // However, we can just reset the state and let the loop fail/finish.
+      // Actually, we can just reload the page or force reset.
+      // But a better way is to rely on `stopAllGeneration` to clear the DB state,
+      // and the frontend will update via realtime or optimistic update.
+    }
+    
+    // 2. Call backend to reset status
+    await stopAllGeneration();
+    
+    // 3. Reset local state
+    setIsGenerating(false);
+    setGeneratingSceneId(null);
+    setBatchSceneIds([]);
+    setBatchMode("generate");
+    generateAllLockRef.current = false;
+  };
+
+  const handleGenerateAll = async () => {
+    if (isGenerating || generateAllLockRef.current) return;
+    if (!user || scenes.length === 0) return;
+
+    const eligible = scenes.filter(
+      (s) => s.generation_status === "pending" || s.generation_status === "error",
+    );
+
+    const hasAnyGeneratedImages = scenes.some((s) => Boolean(s.image_url));
+    if (hasAnyGeneratedImages) {
+      setIsRegenerateAllDialogOpen(true);
+      return;
+    }
+
+    if (eligible.length > 0) await runBatchGeneration(eligible, "generate");
+    else setIsRegenerateAllDialogOpen(true);
+  };
+
+  const handleGenerateRemainingFromDialog = async () => {
+    if (isGenerating || generateAllLockRef.current) return;
+    if (!user || scenes.length === 0) return;
+
+    setIsRegenerateAllDialogOpen(false);
+    const eligible = scenes.filter(
+      (s) => s.generation_status === "pending" || s.generation_status === "error",
+    );
+    await runBatchGeneration(eligible, "generate");
+  };
+
+  const handleConfirmRegenerateAll = async () => {
+    if (isGenerating || generateAllLockRef.current) return;
+    if (!user || scenes.length === 0) return;
+
+    setIsRegenerateAllDialogOpen(false);
+    await runBatchGeneration(scenes, "regenerate", { resetFirst: true });
+  };
+
+  const handleSceneClick = (scene: Scene) => {
+    setSelectedScene(scene);
+    setIsModalOpen(true);
+  };
+
+  const handleSavePrompt = async (sceneId: string, newPrompt: string) => {
+    try {
+      const { error } = await supabase
+        .from('scenes')
+        .update({ image_prompt: newPrompt })
+        .eq('id', sceneId);
+
+      if (error) throw error;
+
+      setScenes(scenes.map(s => 
+        s.id === sceneId ? { ...s, image_prompt: newPrompt } : s
+      ));
+      
+      // Update selected scene if it's the same
+      if (selectedScene?.id === sceneId) {
+        setSelectedScene({ ...selectedScene, image_prompt: newPrompt });
+      }
+
+      toast({
+        title: "Prompt saved",
+        description: "Image prompt has been updated",
+      });
+    } catch (error) {
+      console.error("Error saving prompt:", error);
+      toast({
+        title: "Save failed",
+        description: "Failed to save the prompt",
+        variant: "destructive",
+      });
+    }
+  };
+
+  const normalizeCharacterStateField = (value: unknown, maxLen: number) => {
+    if (typeof value !== "string") return "";
+    const collapsed = value.replace(/\s+/g, " ").trim();
+    return collapsed.length > maxLen ? collapsed.slice(0, maxLen) : collapsed;
+  };
+
+  const normalizeCharacterStatesRecord = (value: Record<string, unknown>) => {
+    const out: Record<string, unknown> = {};
+    for (const [name, rawState] of Object.entries(value)) {
+      if (!rawState || typeof rawState !== "object" || Array.isArray(rawState)) continue;
+      const state = rawState as Record<string, unknown>;
+      const clothing = normalizeCharacterStateField(state.clothing, 400);
+      const condition = normalizeCharacterStateField(state.state ?? state.condition, 400);
+      const physicalAttributes = normalizeCharacterStateField(state.physical_attributes, 600);
+
+      const next: Record<string, string> = {};
+      if (clothing) next.clothing = clothing;
+      if (condition) next.state = condition;
+      if (physicalAttributes) next.physical_attributes = physicalAttributes;
+      if (Object.keys(next).length > 0) out[name] = next;
+    }
+    return out;
+  };
+
+  const handleSaveCharacterStates = async (sceneId: string, characterStates: Record<string, unknown>) => {
+    if (!storyId) return;
+    try {
+      const sceneRow = scenes.find((s) => s.id === sceneId);
+      const allowedNames = new Set((sceneRow?.characters || []).map((n) => String(n || "").toLowerCase()).filter(Boolean));
+      const normalizedInput = normalizeCharacterStatesRecord(characterStates);
+      const normalizedForScene: Record<string, unknown> = {};
+      for (const [name, state] of Object.entries(normalizedInput)) {
+        if (!allowedNames.has(name.toLowerCase())) continue;
+        normalizedForScene[name] = state;
+      }
+
+      const { error } = await supabase
+        .from("scenes")
+        .update({ character_states: normalizedForScene as Json })
+        .eq("id", sceneId);
+
+      if (error) throw error;
+
+      setScenes((prev) => prev.map((s) => (s.id === sceneId ? { ...s, character_states: normalizedForScene as Json } : s)));
+      if (selectedScene?.id === sceneId) {
+        setSelectedScene({ ...selectedScene, character_states: normalizedForScene as Json });
+      }
+
+      const { data: storyCharacters, error: charError } = await supabase
+        .from("characters")
+        .select("id, name")
+        .eq("story_id", storyId);
+      if (charError) throw charError;
+
+      const idByName = new Map<string, string>();
+      (storyCharacters || []).forEach((c) => {
+        const name = typeof c.name === "string" ? c.name : "";
+        const id = typeof c.id === "string" ? c.id : "";
+        if (name && id) idByName.set(name.toLowerCase(), id);
+      });
+
+      const storyContext = (sceneRow?.original_text || sceneRow?.summary || null) as string | null;
+
+      const upsertRows: Array<{
+        story_id: string;
+        scene_id: string;
+        character_id: string;
+        state: Json;
+        source: string;
+        story_context: string | null;
+      }> = [];
+
+      for (const [name, rawState] of Object.entries(normalizedForScene)) {
+        const characterId = idByName.get(name.toLowerCase());
+        if (!characterId) continue;
+        if (!rawState || typeof rawState !== "object" || Array.isArray(rawState)) continue;
+        upsertRows.push({
+          story_id: storyId,
+          scene_id: sceneId,
+          character_id: characterId,
+          state: rawState as Json,
+          source: "manual",
+          story_context: storyContext,
+        });
+      }
+
+      if (upsertRows.length > 0) {
+        const { error: stateError } = await supabase
+          .from("scene_character_states")
+          .upsert(upsertRows, { onConflict: "scene_id,character_id" });
+        if (stateError) throw stateError;
+      }
+
+      toast({
+        title: "Character states saved",
+        description: "Scene character appearance overrides have been updated",
+      });
+    } catch (error) {
+      console.error("Error saving character states:", error);
+      toast({
+        title: "Save failed",
+        description: "Failed to save character states",
+        variant: "destructive",
+      });
+    }
+  };
+
+  const handleModalRegenerate = async (sceneId: string) => {
+    await handleGenerateImage(sceneId);
+  };
+
+  const handleModalRegenerateStrictStyle = async (sceneId: string) => {
+    await handleGenerateImage(sceneId, { strictStyle: true, styleIntensity: 100 });
+  };
+
+  const handleReportStyleMismatch = async (sceneId: string, message: string) => {
+    const sceneRow = scenes.find((s) => s.id === sceneId);
+    if (!sceneRow) return;
+
+    const existing =
+      sceneRow.consistency_details && typeof sceneRow.consistency_details === "object" && !Array.isArray(sceneRow.consistency_details)
+        ? (sceneRow.consistency_details as Record<string, unknown>)
+        : {};
+
+    const existingFeedback = Array.isArray(existing.style_feedback) ? (existing.style_feedback as unknown[]) : [];
+    const nextFeedback = [
+      ...existingFeedback,
+      {
+        created_at: new Date().toISOString(),
+        message,
+        requested_style: selectedStyle,
+        style_intensity: styleIntensity,
+      },
+    ];
+
+    const nextDetails = { ...existing, style_feedback: nextFeedback };
+    await updateScene(sceneId, { consistency_details: nextDetails as Json, consistency_status: "warn" });
+  };
+
+  const illustratedCount = scenes.filter(s => s.generation_status === 'completed').length;
+  const hasAnyGeneratedImages = scenes.some((s) => Boolean(s.image_url));
+  const hasEligibleScenes = scenes.some(
+    (s) => s.generation_status === "pending" || s.generation_status === "error",
+  );
+
+  const waitForPrintAssets = async (w: Window, args: { timeoutMs: number; sampleMs: number }) => {
+    const startedAt = performance.now();
+    const doc = w.document;
+    const snapshotAt = args.sampleMs;
+    let imagesLoadedAtSnapshot: number | null = null;
+
+    const sample = async () => {
+      await new Promise<void>((resolve) => window.setTimeout(resolve, snapshotAt));
+      const imgs = Array.from(doc.images ?? []);
+      imagesLoadedAtSnapshot = imgs.filter((img) => img.complete && img.naturalWidth > 0).length;
+    };
+
+    const waitForLoad = new Promise<void>((resolve) => {
+      if (doc.readyState === "complete") resolve();
+      else w.addEventListener("load", () => resolve(), { once: true });
+    });
+
+    const waitForFonts =
+      doc.fonts && typeof doc.fonts.ready?.then === "function" ? doc.fonts.ready.catch((e) => void e) : Promise.resolve();
+
+    const waitForImages = async () => {
+      const imgs = Array.from(doc.images ?? []);
+      const total = imgs.length;
+      const done = (img: HTMLImageElement) => img.complete && img.naturalWidth > 0;
+
+      const promises = imgs.map(async (img) => {
+        if (done(img)) return;
+        const decode = (img as HTMLImageElement & { decode?: () => Promise<void> }).decode;
+        if (typeof decode === "function") {
+          try {
+            await decode.call(img);
+            return;
+          } catch (e) {
+            void e;
+          }
+        }
+        await new Promise<void>((resolve) => {
+          const finish = () => resolve();
+          img.addEventListener("load", finish, { once: true });
+          img.addEventListener("error", finish, { once: true });
+        });
+      });
+
+      const timeout = new Promise<void>((resolve) => window.setTimeout(resolve, args.timeoutMs));
+      await Promise.race([Promise.all(promises).then(() => undefined), timeout]);
+      const loaded = imgs.filter((img) => done(img)).length;
+      return { total, loaded };
+    };
+
+    const samplePromise = sample();
+    await waitForLoad;
+    await waitForFonts;
+    const imgResult = await waitForImages();
+    await samplePromise;
+
+    const elapsedMs = Math.round(performance.now() - startedAt);
+    return {
+      elapsedMs,
+      imagesTotal: imgResult.total,
+      imagesLoadedAtPrint: imgResult.loaded,
+      imagesLoadedAtSample: imagesLoadedAtSnapshot ?? 0,
+    };
+  };
+
+  const handleExportPDF = async () => {
+    if (!story) {
+      toast({ title: "Nothing to export", description: "Story is unavailable", variant: "destructive" });
+      return;
+    }
+    if (!story.original_content) {
+      toast({ title: "Nothing to export", description: "Story content is unavailable", variant: "destructive" });
+      return;
+    }
+
+    toast({ title: "Generating PDF...", description: "Please wait while we create your PDF" });
+
+    try {
+      const printContent = buildAnchoredStoryHtmlDocument({
+        title: story.title || "Story",
+        originalContent: story.original_content,
+        scenes: scenes.map((s) => ({
+          id: s.id,
+          scene_number: s.scene_number,
+          title: s.title,
+          original_text: s.original_text,
+          summary: s.summary,
+          image_url: s.image_url,
+        })),
+        sceneAnchors: storyAnchors,
+      });
+
+      const validation = validateStoryHtmlDocument(printContent);
+      if (validation.ok === false) {
+        toast({ title: "Export failed", description: validation.issues[0] ?? "Invalid export document.", variant: "destructive" });
+        return;
+      }
+
+      const coverage = validateStoryHtmlSceneCoverage({
+        html: printContent,
+        scenes: scenes.map((s) => ({ id: s.id, scene_number: s.scene_number })),
+      });
+      if (coverage.ok === false) {
+        toast({ title: "Export failed", description: `Missing scenes in export (${coverage.present}/${coverage.expected}, ${coverage.percentage}%).`, variant: "destructive" });
+        return;
+      }
+
+      const printWindow = window.open("", "_blank");
+      if (!printWindow) {
+        toast({ title: "Export failed", description: "Popup blocked. Allow popups to export PDF.", variant: "destructive" });
+        return;
+      }
+
+      printWindow.document.write(printContent);
+      printWindow.document.close();
+      printWindow.focus();
+
+      const assetMetrics = await waitForPrintAssets(printWindow, { timeoutMs: 15_000, sampleMs: 700 });
+      toast({
+        title: "PDF ready to print",
+        description: `Scenes: ${coverage.present}/${coverage.expected} (${coverage.percentage}%). Images: ${assetMetrics.imagesLoadedAtPrint}/${assetMetrics.imagesTotal} (was ${assetMetrics.imagesLoadedAtSample}/${assetMetrics.imagesTotal} at 0.7s).`,
+      });
+
+      try {
+        printWindow.print();
+      } catch (error) {
+        toast({ title: "Export failed", description: error instanceof Error ? error.message : "Failed to print PDF.", variant: "destructive" });
+      }
+    } catch (error) {
+      console.error("Error exporting PDF:", error);
+      toast({ title: "Export failed", description: "Failed to generate PDF", variant: "destructive" });
+    }
+  };
+
+  const handleExportZIP = async () => {
+    if (!story || scenes.length === 0) {
+      toast({ title: "Nothing to export", description: "No scenes available", variant: "destructive" });
+      return;
+    }
+
+    const scenesWithImages = scenes.filter(s => s.image_url);
+    if (scenesWithImages.length === 0) {
+      toast({ title: "No images to export", description: "Generate some images first", variant: "destructive" });
+      return;
+    }
+
+    toast({ title: "Downloading images...", description: `Downloading ${scenesWithImages.length} images` });
+
+    try {
+      // Download each image individually since we can't create ZIPs client-side without a library
+      for (const scene of scenesWithImages) {
+        if (scene.image_url) {
+          const response = await fetch(scene.image_url);
+          const blob = await response.blob();
+          const url = URL.createObjectURL(blob);
+          const link = document.createElement('a');
+          link.href = url;
+          link.download = `${story.title.replace(/[^a-z0-9]/gi, '_')}_scene_${scene.scene_number}.png`;
+          document.body.appendChild(link);
+          link.click();
+          document.body.removeChild(link);
+          URL.revokeObjectURL(url);
+          await new Promise(resolve => setTimeout(resolve, 300)); // Small delay between downloads
+        }
+      }
+      toast({ title: "Download complete", description: `Downloaded ${scenesWithImages.length} images` });
+    } catch (error) {
+      console.error("Error downloading images:", error);
+      toast({ title: "Download failed", description: "Failed to download images", variant: "destructive" });
+    }
+  };
+
+  const handleExportPrint = () => {
+    if (!story) {
+      toast({ title: "Nothing to export", description: "Story is unavailable", variant: "destructive" });
+      return;
+    }
+    if (!story.original_content) {
+      toast({ title: "Nothing to export", description: "Story content is unavailable", variant: "destructive" });
+      return;
+    }
+
+    const printContent = buildAnchoredStoryHtmlDocument({
+      title: `${story.title || "Story"} - Print`,
+      originalContent: story.original_content,
+      scenes: scenes.map((s) => ({
+        id: s.id,
+        scene_number: s.scene_number,
+        title: s.title,
+        original_text: s.original_text,
+        summary: s.summary,
+        image_url: s.image_url,
+      })),
+      sceneAnchors: storyAnchors,
+    });
+
+    const validation = validateStoryHtmlDocument(printContent);
+    if (validation.ok === false) {
+      toast({ title: "Export failed", description: validation.issues[0] ?? "Invalid export document.", variant: "destructive" });
+      return;
+    }
+
+    const coverage = validateStoryHtmlSceneCoverage({
+      html: printContent,
+      scenes: scenes.map((s) => ({ id: s.id, scene_number: s.scene_number })),
+    });
+    if (coverage.ok === false) {
+      toast({ title: "Export failed", description: `Missing scenes in export (${coverage.present}/${coverage.expected}, ${coverage.percentage}%).`, variant: "destructive" });
+      return;
+    }
+
+    const printWindow = window.open("", "_blank");
+    if (!printWindow) {
+      toast({ title: "Print failed", description: "Popup blocked. Allow popups to print.", variant: "destructive" });
+      return;
+    }
+
+    printWindow.document.write(printContent);
+    printWindow.document.close();
+    printWindow.focus();
+
+    waitForPrintAssets(printWindow, { timeoutMs: 15_000, sampleMs: 700 })
+      .then((assetMetrics) => {
+        toast({
+          title: "Print ready",
+          description: `Scenes: ${coverage.present}/${coverage.expected} (${coverage.percentage}%). Images: ${assetMetrics.imagesLoadedAtPrint}/${assetMetrics.imagesTotal} (was ${assetMetrics.imagesLoadedAtSample}/${assetMetrics.imagesTotal} at 0.7s).`,
+        });
+        try {
+          printWindow.print();
+        } catch (error) {
+          toast({ title: "Print failed", description: error instanceof Error ? error.message : "Printing failed.", variant: "destructive" });
+        }
+      })
+      .catch((error) => {
+        toast({ title: "Print failed", description: error instanceof Error ? error.message : "Printing failed.", variant: "destructive" });
+      });
+  };
+
+  const handlePreview = () => {
+    if (!story || scenes.length === 0) {
+      toast({ title: "Nothing to preview", description: "No scenes available", variant: "destructive" });
+      return;
+    }
+
+    const slidesHtml = scenes.map((scene, i) => {
+      const imageHtml = scene.image_url 
+        ? '<img src="' + scene.image_url + '" alt="Scene ' + scene.scene_number + '" />'
+        : '<div style="width:400px;height:300px;background:#222;display:flex;align-items:center;justify-content:center;border-radius:8px;">No image</div>';
+      
+      return '<div class="slide' + (i === 0 ? ' active' : '') + '" data-index="' + i + '">' +
+        imageHtml +
+        '<div class="slide-content">' +
+        '<p class="slide-number">Scene ' + scene.scene_number + ' of ' + scenes.length + '</p>' +
+        '<h2 class="slide-title">' + (scene.title || '') + '</h2>' +
+        '<p class="slide-summary">' + (scene.summary || '') + '</p>' +
+        '</div></div>';
+    }).join('');
+
+    const dotsHtml = scenes.map((_, i) => 
+      '<div class="dot' + (i === 0 ? ' active' : '') + '" onclick="goToSlide(' + i + ')"></div>'
+    ).join('');
+
+    const previewContent = '<!DOCTYPE html><html><head><title>' + story.title + ' - Preview</title>' +
+      '<style>' +
+      '* { box-sizing: border-box; margin: 0; padding: 0; }' +
+      'body { font-family: system-ui, sans-serif; background: #000; color: #fff; overflow: hidden; }' +
+      '.container { width: 100vw; height: 100vh; display: flex; flex-direction: column; }' +
+      '.main { flex: 1; display: flex; align-items: center; justify-content: center; position: relative; padding: 20px; }' +
+      '.slide { display: none; flex-direction: column; align-items: center; max-width: 100%; max-height: 100%; }' +
+      '.slide.active { display: flex; }' +
+      '.slide img { max-width: 90vw; max-height: 60vh; object-fit: contain; border-radius: 8px; }' +
+      '.slide-content { text-align: center; padding: 20px; max-width: 800px; }' +
+      '.slide-number { font-size: 12px; color: #888; margin-bottom: 8px; }' +
+      '.slide-title { font-size: 24px; font-weight: 600; margin-bottom: 10px; }' +
+      '.slide-summary { color: #aaa; line-height: 1.6; }' +
+      '.controls { display: flex; justify-content: center; gap: 10px; padding: 20px; }' +
+      'button { background: #333; color: #fff; border: none; padding: 12px 24px; border-radius: 8px; cursor: pointer; font-size: 14px; }' +
+      'button:hover { background: #444; }' +
+      '.nav-btn { position: absolute; top: 50%; transform: translateY(-50%); background: rgba(255,255,255,0.1); width: 50px; height: 50px; border-radius: 50%; display: flex; align-items: center; justify-content: center; }' +
+      '.nav-btn:hover { background: rgba(255,255,255,0.2); }' +
+      '.prev { left: 20px; }' +
+      '.next { right: 20px; }' +
+      '.close { position: absolute; top: 20px; right: 20px; background: rgba(255,255,255,0.1); width: 40px; height: 40px; border-radius: 50%; }' +
+      '.progress { display: flex; gap: 6px; justify-content: center; padding: 10px; }' +
+      '.dot { width: 8px; height: 8px; border-radius: 50%; background: #444; cursor: pointer; }' +
+      '.dot.active { background: #fff; }' +
+      '</style></head><body>' +
+      '<div class="container">' +
+      '<button class="close" onclick="window.close()">✕</button>' +
+      '<div class="main">' +
+      '<button class="nav-btn prev" onclick="changeSlide(-1)">◀</button>' +
+      slidesHtml +
+      '<button class="nav-btn next" onclick="changeSlide(1)">▶</button>' +
+      '</div>' +
+      '<div class="progress">' + dotsHtml + '</div>' +
+      '<div class="controls"><button onclick="toggleAutoplay()" id="autoplayBtn">▶ Autoplay</button></div>' +
+      '</div>' +
+      '<script>' +
+      'let current = 0; let autoplayInterval = null;' +
+      'const slides = document.querySelectorAll(".slide");' +
+      'const dots = document.querySelectorAll(".dot");' +
+      'function showSlide(index) { slides.forEach(s => s.classList.remove("active")); dots.forEach(d => d.classList.remove("active")); slides[index].classList.add("active"); dots[index].classList.add("active"); }' +
+      'function changeSlide(dir) { current = (current + dir + slides.length) % slides.length; showSlide(current); }' +
+      'function goToSlide(index) { current = index; showSlide(current); }' +
+      'function toggleAutoplay() { const btn = document.getElementById("autoplayBtn"); if (autoplayInterval) { clearInterval(autoplayInterval); autoplayInterval = null; btn.textContent = "▶ Autoplay"; } else { autoplayInterval = setInterval(() => changeSlide(1), 3000); btn.textContent = "⏸ Pause"; } }' +
+      'document.addEventListener("keydown", (e) => { if (e.key === "ArrowLeft") changeSlide(-1); if (e.key === "ArrowRight") changeSlide(1); if (e.key === "Escape") window.close(); });' +
+      '</script></body></html>';
+
+    const previewWindow = window.open('', '_blank');
+    if (previewWindow) {
+      previewWindow.document.write(previewContent);
+      previewWindow.document.close();
+    }
+  };
+
+  const openStoryInNewTab = () => {
+    if (!story) {
+      toast({ title: "Story unavailable", description: "No story is loaded", variant: "destructive" });
+      return;
+    }
+    if (!story.original_content) {
+      toast({ title: "Story content unavailable", description: "No imported text found for this story", variant: "destructive" });
+      return;
+    }
+
+    try {
+      const html = buildAnchoredStoryHtmlDocument({
+        title: story.title || "Story",
+        originalContent: story.original_content,
+        scenes: scenes.map((s) => ({
+          id: s.id,
+          scene_number: s.scene_number,
+          title: s.title,
+          original_text: s.original_text,
+          summary: s.summary,
+          image_url: s.image_url,
+        })),
+        sceneAnchors: storyAnchors,
+      });
+
+      const blob = new Blob([html], { type: "text/html;charset=utf-8" });
+      const url = URL.createObjectURL(blob);
+      const storyWindow = window.open(url, "_blank");
+
+      if (!storyWindow) {
+        URL.revokeObjectURL(url);
+        toast({ title: "Popup blocked", description: "Allow popups to open the story view", variant: "destructive" });
+        return;
+      }
+
+      setTimeout(() => URL.revokeObjectURL(url), 60_000);
+      storyWindow.focus();
+    } catch (error) {
+      console.error("Failed to open story view:", error);
+      toast({ title: "Open failed", description: "Could not open the story view", variant: "destructive" });
+    }
+  };
+
+  const handleStoryView = () => {
+    setIsStoryOpening(true);
+    try {
+      setIsStoryModalOpen(true);
+    } finally {
+      setTimeout(() => setIsStoryOpening(false), 150);
+    }
+  };
+
+  const clearStoryPrintResetTimer = () => {
+    const t = storyPrintResetTimerRef.current;
+    if (!t) return;
+    window.clearTimeout(t);
+    storyPrintResetTimerRef.current = null;
+  };
+
+  useEffect(() => {
+    return () => clearStoryPrintResetTimer();
+  }, []);
+
+  useEffect(() => {
+    if (!isStoryModalOpen) {
+      setIsStoryPrinting(false);
+      clearStoryPrintResetTimer();
+      return;
+    }
+
+    const handleAfterPrint = () => {
+      setIsStoryPrinting(false);
+      clearStoryPrintResetTimer();
+    };
+
+    window.addEventListener("afterprint", handleAfterPrint);
+
+    const mql = typeof window.matchMedia === "function" ? window.matchMedia("print") : null;
+    const handleMqlChange = (e: MediaQueryListEvent) => {
+      if (e.matches) return;
+      setIsStoryPrinting(false);
+      clearStoryPrintResetTimer();
+    };
+
+    if (mql) {
+      const anyMql = mql as MediaQueryList & {
+        addListener?: (listener: (e: MediaQueryListEvent) => void) => void;
+      };
+      if (typeof anyMql.addEventListener === "function") anyMql.addEventListener("change", handleMqlChange);
+      else if (typeof anyMql.addListener === "function") anyMql.addListener(handleMqlChange);
+    }
+
+    return () => {
+      window.removeEventListener("afterprint", handleAfterPrint);
+      if (mql) {
+        const anyMql = mql as MediaQueryList & {
+          removeListener?: (listener: (e: MediaQueryListEvent) => void) => void;
+        };
+        if (typeof anyMql.removeEventListener === "function") anyMql.removeEventListener("change", handleMqlChange);
+        else if (typeof anyMql.removeListener === "function") anyMql.removeListener(handleMqlChange);
+      }
+    };
+  }, [isStoryModalOpen]);
+
+  const handleStoryModalPrint = async () => {
+    if (isStoryPrinting) return;
+    if (!story) {
+      toast({ title: "Nothing to print", description: "Story is unavailable", variant: "destructive" });
+      return;
+    }
+    if (!story.original_content) {
+      toast({ title: "Nothing to print", description: "Story content is unavailable", variant: "destructive" });
+      return;
+    }
+    if (typeof window.print !== "function") {
+      toast({ title: "Print unavailable", description: "This browser does not support printing.", variant: "destructive" });
+      return;
+    }
+
+    setIsStoryPrinting(true);
+    clearStoryPrintResetTimer();
+    storyPrintResetTimerRef.current = window.setTimeout(() => {
+      setIsStoryPrinting(false);
+      storyPrintResetTimerRef.current = null;
+    }, 20_000);
+
+    const printWindow = window.open("", "_blank");
+    if (!printWindow) {
+      setIsStoryPrinting(false);
+      clearStoryPrintResetTimer();
+      toast({ title: "Popup blocked", description: "Allow popups to print the story.", variant: "destructive" });
+      return;
+    }
+
+    const html = buildAnchoredStoryHtmlDocument({
+      title: `${story.title || "Story"} - Print`,
+      originalContent: story.original_content,
+      scenes: scenes.map((s) => ({
+        id: s.id,
+        scene_number: s.scene_number,
+        title: s.title,
+        original_text: s.original_text,
+        summary: s.summary,
+        image_url: s.image_url,
+      })),
+      sceneAnchors: storyAnchors,
+    });
+
+    const validation = validateStoryHtmlDocument(html);
+    if (validation.ok === false) {
+      setIsStoryPrinting(false);
+      clearStoryPrintResetTimer();
+      toast({ title: "Print failed", description: validation.issues[0] ?? "Invalid print document.", variant: "destructive" });
+      try {
+        printWindow.close();
+      } catch (error) {
+        void error;
+      }
+      return;
+    }
+
+    const coverage = validateStoryHtmlSceneCoverage({
+      html,
+      scenes: scenes.map((s) => ({ id: s.id, scene_number: s.scene_number })),
+    });
+    if (coverage.ok === false) {
+      setIsStoryPrinting(false);
+      clearStoryPrintResetTimer();
+      toast({ title: "Print failed", description: `Missing scenes in print (${coverage.present}/${coverage.expected}, ${coverage.percentage}%).`, variant: "destructive" });
+      try {
+        printWindow.close();
+      } catch (error) {
+        void error;
+      }
+      return;
+    }
+
+    const handlePrinted = () => {
+      setIsStoryPrinting(false);
+      clearStoryPrintResetTimer();
+    };
+
+    try {
+      if (typeof printWindow.addEventListener === "function") printWindow.addEventListener("afterprint", handlePrinted);
+      printWindow.document.write(html);
+      printWindow.document.close();
+      printWindow.focus();
+      await waitForPrintAssets(printWindow, { timeoutMs: 15_000, sampleMs: 700 });
+      printWindow.print();
+    } catch (error) {
+      handlePrinted();
+      toast({ title: "Print failed", description: error instanceof Error ? error.message : "Printing failed.", variant: "destructive" });
+      try {
+        printWindow.close();
+      } catch (closeError) {
+        void closeError;
+      }
+    }
+  };
+
+  const sceneAnchorsKey = "scene_anchors_v1";
+
+  const storyAnchors = useMemo((): StorySceneAnchors => {
+    const base =
+      story?.consistency_settings && typeof story.consistency_settings === "object" && !Array.isArray(story.consistency_settings)
+        ? (story.consistency_settings as Record<string, unknown>)
+        : {};
+    const raw = base[sceneAnchorsKey];
+    if (!raw || typeof raw !== "object" || Array.isArray(raw)) return {};
+    const rec = raw as Record<string, unknown>;
+    const next: StorySceneAnchors = {};
+    for (const [k, v] of Object.entries(rec)) {
+      const n = typeof v === "number" ? v : typeof v === "string" ? Number(v) : NaN;
+      if (!Number.isFinite(n)) continue;
+      next[k] = Math.trunc(n);
+    }
+    return next;
+  }, [sceneAnchorsKey, story?.consistency_settings]);
+
+  const persistStoryAnchors = async (args: {
+    nextAnchors: StorySceneAnchors;
+    baseUpdatedAt: string | null | undefined;
+  }): Promise<{ ok: true; updatedAt: string | null } | { ok: false; reason: string; updatedAt?: string | null }> => {
+    if (!storyId) return { ok: false, reason: "Story unavailable" };
+
+    const base =
+      story?.consistency_settings && typeof story.consistency_settings === "object" && !Array.isArray(story.consistency_settings)
+        ? (story.consistency_settings as Record<string, unknown>)
+        : {};
+    const nextSettings = { ...base, [sceneAnchorsKey]: args.nextAnchors };
+
+    try {
+      let query = supabase
+        .from("stories")
+        .update({ consistency_settings: nextSettings as Json })
+        .eq("id", storyId);
+
+      if (args.baseUpdatedAt) query = query.eq("updated_at", args.baseUpdatedAt);
+
+      const { data, error } = await query.select("*").maybeSingle();
+      if (error) throw error;
+
+      if (!data) {
+        return {
+          ok: false,
+          reason: "This story changed elsewhere. Reopen the story view and try again.",
+          updatedAt: args.baseUpdatedAt ?? null,
+        };
+      }
+
+      setStory(data as Story);
+      await fetchStories();
+      return { ok: true, updatedAt: (data as Story).updated_at ?? null };
+    } catch (error) {
+      const message = error instanceof Error ? error.message : "Failed to save scene positions";
+      return { ok: false, reason: message, updatedAt: args.baseUpdatedAt ?? null };
+    }
+  };
+
+  if (!storyId) {
+    return (
+      <Layout>
+        <div className="container mx-auto px-6 py-12">
+          <div className="flex items-center justify-between mb-8">
+            <div>
+              <h1 className="font-display text-3xl font-bold text-foreground mb-2">
+                Your Storyboards
+              </h1>
+              <p className="text-muted-foreground">
+                Select a story to view its storyboard
+              </p>
+            </div>
+            <Button variant="hero" onClick={() => navigate('/import')}>
+              Import New Story
+            </Button>
+          </div>
+
+          {stories.length > 0 ? (
+            <div className="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-3 gap-6">
+              {stories.map((s) => (
+                <Card
+                  key={s.id}
+                  variant="interactive"
+                  className="cursor-pointer p-6 hover:border-primary/50 transition-colors relative group"
+                  onClick={() => navigate(`/storyboard/${s.id}`)}
+                >
+                  <Button
+                    variant="ghost"
+                    size="icon"
+                    className="absolute top-2 right-2 opacity-0 group-hover:opacity-100 transition-opacity h-8 w-8 text-destructive hover:text-destructive hover:bg-destructive/10"
+                    onClick={(e) => {
+                      e.stopPropagation();
+                      setStoryToDelete(s);
+                    }}
+                  >
+                    <Trash2 className="w-4 h-4" />
+                  </Button>
+                  <div className="flex items-start justify-between mb-3">
+                    <BookOpen className="w-8 h-8 text-primary" />
+                    <Badge 
+                      variant={s.status === 'analyzed' || s.status === 'completed' ? 'default' : 'outline'}
+                      className={s.status === 'analyzed' || s.status === 'completed' ? 'bg-green-500/20 text-green-400' : ''}
+                    >
+                      {s.status}
+                    </Badge>
+                  </div>
+                  <h3 className="font-semibold text-lg text-foreground mb-2 line-clamp-1">
+                    {s.title}
+                  </h3>
+                  <p className="text-sm text-muted-foreground mb-3 line-clamp-2">
+                    {s.description || 'No description'}
+                  </p>
+                  <div className="flex items-center gap-4 text-xs text-muted-foreground">
+                    <span>{s.word_count?.toLocaleString() || 0} words</span>
+                    <span>{s.scene_count || 0} scenes</span>
+                  </div>
+                  <p className="text-xs text-muted-foreground mt-2">
+                    Updated {new Date(s.updated_at).toLocaleDateString()}
+                  </p>
+                </Card>
+              ))}
+            </div>
+          ) : (
+            <div className="text-center py-16 bg-secondary/30 rounded-xl border border-border/50">
+              <BookOpen className="w-12 h-12 text-muted-foreground/50 mx-auto mb-4" />
+              <h2 className="text-xl font-semibold text-foreground mb-2">No Stories Yet</h2>
+              <p className="text-muted-foreground mb-6">
+                Import your first story to get started
+              </p>
+              <Button variant="hero" onClick={() => navigate('/import')}>
+                Import Story
+              </Button>
+            </div>
+          )}
+        </div>
+
+        {/* Delete Confirmation Dialog */}
+        <AlertDialog open={!!storyToDelete} onOpenChange={(open) => !open && setStoryToDelete(null)}>
+          <AlertDialogContent>
+            <AlertDialogHeader>
+              <AlertDialogTitle>Delete Story</AlertDialogTitle>
+              <AlertDialogDescription>
+                Are you sure you want to delete "{storyToDelete?.title}"? This will permanently remove the story and all its scenes. This action cannot be undone.
+              </AlertDialogDescription>
+            </AlertDialogHeader>
+            <AlertDialogFooter>
+              <AlertDialogCancel disabled={isDeleting}>Cancel</AlertDialogCancel>
+              <AlertDialogAction 
+                onClick={handleDeleteStory}
+                disabled={isDeleting}
+                className="bg-destructive text-destructive-foreground hover:bg-destructive/90"
+              >
+                {isDeleting ? "Deleting..." : "Delete"}
+              </AlertDialogAction>
+            </AlertDialogFooter>
+          </AlertDialogContent>
+        </AlertDialog>
+      </Layout>
+    );
+  }
+
+  return (
+    <Layout>
+      <div className="container mx-auto px-6 py-12">
+        {/* Header */}
+        <div className="flex flex-col lg:flex-row lg:items-start justify-between gap-6 mb-8">
+          <div>
+            <div className="flex items-center gap-3 mb-3">
+              <BookOpen className="w-6 h-6 text-primary" />
+              <Badge variant="outline" className="text-primary border-primary">
+                {scenes.length} Scenes
+              </Badge>
+              <Badge className="bg-green-500/20 text-green-400">
+                {illustratedCount} Illustrated
+              </Badge>
+            </div>
+            <h1 className="font-display text-4xl font-bold text-foreground mb-2">
+              {story?.title || "Loading..."}
+            </h1>
+            <p className="text-muted-foreground">
+              {story?.word_count?.toLocaleString()} words • Last edited {story ? new Date(story.updated_at).toLocaleDateString() : '...'}
+            </p>
+          </div>
+
+          <div className="flex flex-wrap gap-3">
+            <Button 
+              variant="hero" 
+              size="lg" 
+              className="gap-2"
+              onClick={handleGenerateAll}
+              disabled={isGenerating || scenes.length === 0}
+            >
+              <Wand2 className={`w-5 h-5 ${isGenerating ? "animate-spin" : ""}`} />
+              {isGenerating
+                ? batchSceneIds.length > 0
+                  ? `${batchMode === "regenerate" ? "Regenerating" : "Generating"} ${batchDoneCount}/${batchSceneIds.length}${batchFailedCount > 0 ? ` (${batchFailedCount} failed)` : ""}`
+                  : batchMode === "regenerate"
+                    ? "Regenerating..."
+                    : "Generating..."
+                : "Generate All"}
+            </Button>
+            {(isGenerating || scenes.some(s => s.generation_status === 'generating')) && (
+              <Button 
+                variant="destructive" 
+                size="lg" 
+                className="gap-2" 
+                onClick={handleStopGenerating}
+              >
+                <Square className="w-5 h-5 fill-current" />
+                Stop Generating
+              </Button>
+            )}
+            <Button variant="outline" size="lg" className="gap-2" onClick={handlePreview}>
+              <Play className="w-5 h-5" />
+              Preview
+            </Button>
+            <Button
+              variant="outline"
+              size="lg"
+              className="gap-2"
+              type="button"
+              onClick={handleStoryView}
+              aria-label="Open story view"
+            >
+              <BookOpen className="w-5 h-5" />
+              Story
+            </Button>
+            <DropdownMenu>
+              <DropdownMenuTrigger asChild>
+                <Button variant="outline" size="lg" className="gap-2">
+                  <Download className="w-5 h-5" />
+                  Export
+                  <ChevronDown className="w-4 h-4" />
+                </Button>
+              </DropdownMenuTrigger>
+              <DropdownMenuContent align="end">
+                <DropdownMenuItem onClick={handleExportPDF}>
+                  <FileText className="w-4 h-4 mr-2" />
+                  Export as PDF
+                </DropdownMenuItem>
+                <DropdownMenuItem onClick={handleExportZIP}>
+                  <FolderArchive className="w-4 h-4 mr-2" />
+                  Download Images
+                </DropdownMenuItem>
+                <DropdownMenuItem onClick={handleExportPrint}>
+                  <Printer className="w-4 h-4 mr-2" />
+                  Export for Print
+                </DropdownMenuItem>
+              </DropdownMenuContent>
+            </DropdownMenu>
+          </div>
+        </div>
+
+        {/* Model Selector */}
+        <div className="mb-10">
+          <ModelSelector 
+            selectedModel={selectedModel}
+            onModelChange={handleModelChange}
+          />
+        </div>
+
+        {/* Style Selector */}
+        <div className="mb-10">
+          <StyleSelector 
+            selectedStyle={selectedStyle}
+            onStyleChange={handleStyleChange}
+            styleIntensity={styleIntensity}
+            onStyleIntensityChange={handleStyleIntensityChange}
+            onDisabledStyleElementsChange={handleDisabledStyleElementsChange}
+          />
+        </div>
+
+        <Tabs value={activeTab} onValueChange={setActiveTab} className="w-full">
+          <TabsList className="mb-8 w-full justify-start border-b rounded-none h-auto p-0 bg-transparent">
+            <TabsTrigger 
+              value="scenes"
+              className="rounded-none border-b-2 border-transparent data-[state=active]:border-primary data-[state=active]:bg-transparent px-6 py-3"
+            >
+              Scenes
+            </TabsTrigger>
+            <TabsTrigger 
+              value="characters"
+              className="rounded-none border-b-2 border-transparent data-[state=active]:border-primary data-[state=active]:bg-transparent px-6 py-3"
+            >
+              Characters
+            </TabsTrigger>
+          </TabsList>
+
+          <TabsContent value="characters">
+            {storyId && <CharacterList storyId={storyId} />}
+          </TabsContent>
+
+          <TabsContent value="scenes">
+            {/* Scenes Grid */}
+            {scenesLoading ? (
+              <div className="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-3 gap-6">
+                {[1, 2, 3, 4, 5, 6].map((i) => (
+                  <Skeleton key={i} className="h-80 rounded-xl" />
+                ))}
+              </div>
+            ) : scenes.length > 0 ? (
+              <div className="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-3 gap-6">
+                {scenes.map((scene) => {
+                  const isSceneGenerating = scene.generation_status === "generating" || generatingSceneId === scene.id;
+                  const isSceneError = scene.generation_status === "error";
+
+                  return (
+                    <Card 
+                      key={scene.id} 
+                      variant="interactive" 
+                      className="overflow-hidden cursor-pointer"
+                      onClick={() => handleSceneClick(scene)}
+                    >
+                      {/* Image Area */}
+                      <div className="aspect-video bg-secondary relative overflow-hidden">
+                        {scene.image_url ? (
+                          <img 
+                            src={scene.image_url} 
+                            alt={scene.title || `Scene ${scene.scene_number}`}
+                            className="w-full h-full object-cover"
+                          />
+                        ) : (
+                          <div className="w-full h-full flex items-center justify-center">
+                            {isSceneGenerating ? (
+                              <div className="text-center">
+                                <Loader2 className="w-8 h-8 text-primary animate-spin mx-auto mb-2" />
+                                <p className="text-sm text-muted-foreground">Generating...</p>
+                              </div>
+                            ) : (
+                              <div className="text-center">
+                                <ImageIcon className="w-12 h-12 text-muted-foreground/50 mx-auto mb-2" />
+                                {isSceneError && (
+                                  <p className="text-sm text-destructive mb-2">Generation failed</p>
+                                )}
+                                <Button 
+                                  size="sm" 
+                                  variant="outline"
+                                  className={isSceneError ? "border-destructive/50 text-destructive hover:text-destructive" : undefined}
+                                  onClick={(e) => {
+                                    e.stopPropagation();
+                                    handleGenerateImage(scene.id);
+                                  }}
+                                >
+                                  <Wand2 className="w-4 h-4 mr-2" />
+                                  {isSceneError ? "Retry" : "Generate"}
+                                </Button>
+                              </div>
+                            )}
+                          </div>
+                        )}
+                      
+                        {/* Scene number badge */}
+                        <Badge className="absolute top-2 left-2 bg-black/60 backdrop-blur-sm text-white border-white/20 shadow-sm">
+                          Scene {scene.scene_number}
+                        </Badge>
+
+                        {scene.consistency_status && (
+                          <Badge
+                            className={`absolute bottom-2 left-2 bg-background/80 backdrop-blur-sm ${
+                              scene.consistency_status === "pass"
+                                ? "text-green-600"
+                                : scene.consistency_status === "warn"
+                                  ? "text-yellow-600"
+                                  : "text-red-600"
+                            }`}
+                          >
+                            Consistency{" "}
+                            {typeof scene.consistency_score === "number"
+                              ? Math.round(scene.consistency_score)
+                              : "--"}
+                          </Badge>
+                        )}
+                      
+                        {/* Regenerate button */}
+                        {scene.image_url && (
+                          <Button
+                            size="icon"
+                            variant="ghost"
+                            className="absolute top-2 right-2 bg-background/80 backdrop-blur-sm h-8 w-8"
+                            onClick={(e) => {
+                              e.stopPropagation();
+                              handleGenerateImage(scene.id);
+                            }}
+                            disabled={isSceneGenerating}
+                          >
+                            <RefreshCw className={`w-4 h-4 ${isSceneGenerating ? 'animate-spin' : ''}`} />
+                          </Button>
+                        )}
+                      </div>
+
+                      {/* Scene Info */}
+                      <div className="p-4">
+                        <h3 className="font-semibold text-foreground mb-1">
+                          {scene.title || `Scene ${scene.scene_number}`}
+                        </h3>
+                        <p className="text-sm text-muted-foreground line-clamp-2 mb-3">
+                          {scene.summary}
+                        </p>
+                      
+                        <div className="flex flex-wrap gap-2">
+                          {scene.emotional_tone && (
+                            <Badge variant="outline" className="text-xs">
+                              {scene.emotional_tone}
+                            </Badge>
+                          )}
+                          {scene.consistency_status && (
+                            <Badge variant="outline" className="text-xs">
+                              {scene.consistency_status.toUpperCase()}
+                            </Badge>
+                          )}
+                          {scene.characters?.slice(0, 2).map((char) => (
+                            <Badge key={char} variant="secondary" className="text-xs">
+                              {char}
+                            </Badge>
+                          ))}
+                        </div>
+                      </div>
+                    </Card>
+                  );
+                })}
+              </div>
+            ) : (
+              <div className="text-center py-16 bg-secondary/30 rounded-xl border border-border/50">
+                <p className="text-muted-foreground mb-4">No scenes found</p>
+                <p className="text-sm text-muted-foreground">
+                  This story hasn't been analyzed yet
+                </p>
+              </div>
+            )}
+          </TabsContent>
+        </Tabs>
+      </div>
+
+      <AlertDialog open={isRegenerateAllDialogOpen} onOpenChange={setIsRegenerateAllDialogOpen}>
+        <AlertDialogContent>
+          <AlertDialogHeader>
+            <AlertDialogTitle>
+              {hasEligibleScenes && hasAnyGeneratedImages
+                ? "Generate remaining scenes or regenerate all?"
+                : "Regenerate all scene images?"}
+            </AlertDialogTitle>
+            <AlertDialogDescription>
+              {hasEligibleScenes && hasAnyGeneratedImages
+                ? "Some scenes are still pending/failed. You can continue generating only the remaining scenes, or regenerate everything from scratch. Regenerating will clear all previously generated scene images for this story. This action cannot be undone."
+                : "This will clear all previously generated scene images for this story and regenerate them from scratch. This action cannot be undone."}
+            </AlertDialogDescription>
+          </AlertDialogHeader>
+          <AlertDialogFooter>
+            <AlertDialogCancel disabled={isGenerating}>Cancel</AlertDialogCancel>
+            {hasEligibleScenes && hasAnyGeneratedImages && (
+              <AlertDialogAction
+                onClick={handleGenerateRemainingFromDialog}
+                disabled={isGenerating}
+                className="bg-secondary text-foreground hover:bg-secondary/80"
+              >
+                Generate Remaining
+              </AlertDialogAction>
+            )}
+            <AlertDialogAction
+              onClick={handleConfirmRegenerateAll}
+              disabled={isGenerating}
+              className="bg-destructive text-destructive-foreground hover:bg-destructive/90"
+            >
+              Regenerate All
+            </AlertDialogAction>
+          </AlertDialogFooter>
+        </AlertDialogContent>
+      </AlertDialog>
+
+      {/* Scene Detail Modal */}
+      <SceneDetailModal
+        scene={scenes.find(s => s.id === selectedScene?.id) || selectedScene}
+        allScenes={scenes}
+        isOpen={isModalOpen}
+        onClose={() => {
+          setIsModalOpen(false);
+          setSelectedScene(null);
+        }}
+        onSavePrompt={handleSavePrompt}
+        onSaveCharacterStates={handleSaveCharacterStates}
+        onRegenerate={handleModalRegenerate}
+        onRegenerateStrictStyle={handleModalRegenerateStrictStyle}
+        onReportStyleMismatch={handleReportStyleMismatch}
+        isGenerating={
+          (selectedScene?.generation_status === "generating") || generatingSceneId === selectedScene?.id
+        }
+        debugInfo={selectedScene ? debugInfo[selectedScene.id] : undefined}
+      />
+
+      <Dialog open={isStoryModalOpen} onOpenChange={setIsStoryModalOpen}>
+        <DialogContent
+          id="story-modal-print-root"
+          className="w-[95vw] sm:w-[90vw] max-w-[78.5rem] max-h-[95vh] min-h-[60vh] sm:min-h-[70vh] lg:min-h-[80vh] overflow-y-auto"
+        >
+          <DialogHeader className="space-y-2">
+            <div className="flex items-center justify-between gap-4">
+              <DialogTitle className="font-display text-xl">{story?.title || "Story"}</DialogTitle>
+              <div className="flex items-center gap-2">
+                <Button
+                  variant="outline"
+                  size="sm"
+                  className="gap-2"
+                  type="button"
+                  onClick={handleStoryModalPrint}
+                  disabled={isStoryPrinting}
+                  aria-label="Print"
+                >
+                  {isStoryPrinting ? <Loader2 className="w-4 h-4 animate-spin" /> : <Printer className="w-4 h-4" />}
+                  Print
+                </Button>
+                <Button variant="outline" size="sm" className="gap-2" type="button" onClick={openStoryInNewTab}>
+                  <Play className="w-4 h-4" />
+                  Open in Tab
+                </Button>
+              </div>
+            </div>
+            {isStoryOpening && <div className="text-sm text-muted-foreground">Loading…</div>}
+            {isStoryPrinting && <div className="text-sm text-muted-foreground" aria-live="polite">Opening print dialog…</div>}
+          </DialogHeader>
+
+          {!story ? (
+            <div className="text-sm text-muted-foreground">Story unavailable</div>
+          ) : !story.original_content ? (
+            <div className="text-sm text-muted-foreground">Story content is unavailable</div>
+          ) : (
+            <StorySceneDragDropEditor
+              originalContent={story.original_content}
+              scenes={scenes.map((s) => ({
+                id: s.id,
+                scene_number: s.scene_number,
+                title: s.title,
+                summary: s.summary,
+                original_text: s.original_text,
+                image_url: s.image_url,
+              }))}
+              initialAnchors={storyAnchors}
+              updatedAt={story.updated_at}
+              onPersistAnchors={persistStoryAnchors}
+              onToast={(args) => toast(args)}
+            />
+          )}
+        </DialogContent>
+      </Dialog>
+    </Layout>
+  );
+}
