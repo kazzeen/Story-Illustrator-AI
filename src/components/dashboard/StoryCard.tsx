@@ -1,6 +1,7 @@
 import { Card, CardContent } from "@/components/ui/card";
 import { Badge } from "@/components/ui/badge";
 import { Button } from "@/components/ui/button";
+import { Tooltip, TooltipContent, TooltipTrigger } from "@/components/ui/tooltip";
 import { Clock, Image, MoreVertical, Play } from "lucide-react";
 
 interface StoryCardProps {
@@ -9,6 +10,7 @@ interface StoryCardProps {
   coverImage?: string;
   sceneCount: number;
   progress: number;
+  completedScenes?: number;
   lastEdited: string;
   status: "draft" | "processing" | "complete";
 }
@@ -19,6 +21,7 @@ export function StoryCard({
   coverImage,
   sceneCount,
   progress,
+  completedScenes,
   lastEdited,
   status,
 }: StoryCardProps) {
@@ -27,6 +30,15 @@ export function StoryCard({
     processing: "bg-primary/20 text-primary",
     complete: "bg-green-500/20 text-green-400",
   };
+
+  const clampedProgress = Number.isFinite(progress) ? Math.max(0, Math.min(100, Math.round(progress))) : 0;
+  const barColorClass =
+    clampedProgress >= 100 ? "bg-green-500" : clampedProgress > 0 ? "bg-yellow-500" : "bg-red-500";
+  const completed =
+    typeof completedScenes === "number"
+      ? Math.max(0, Math.min(sceneCount, Math.round(completedScenes)))
+      : Math.max(0, Math.min(sceneCount, Math.round((clampedProgress / 100) * sceneCount)));
+  const remaining = Math.max(0, sceneCount - completed);
 
   return (
     <Card variant="interactive" className="group overflow-hidden">
@@ -74,18 +86,37 @@ export function StoryCard({
         </div>
 
         {/* Progress Bar */}
-        <div className="mb-3">
-          <div className="flex items-center justify-between text-xs text-muted-foreground mb-1">
-            <span>{sceneCount} scenes</span>
-            <span>{progress}%</span>
-          </div>
-          <div className="h-1.5 bg-secondary rounded-full overflow-hidden">
-            <div
-              className="h-full gradient-primary rounded-full transition-all duration-500"
-              style={{ width: `${progress}%` }}
-            />
-          </div>
-        </div>
+        <Tooltip>
+          <TooltipTrigger asChild>
+            <div className="mb-3">
+              <div className="flex items-center justify-between text-xs text-muted-foreground mb-1">
+                <span>{sceneCount} scenes</span>
+                <span>{clampedProgress}%</span>
+              </div>
+              <div className="h-1.5 bg-secondary rounded-full overflow-hidden">
+                <div
+                  className={`h-full ${barColorClass} rounded-full transition-all duration-500`}
+                  style={{ width: `${clampedProgress}%` }}
+                />
+              </div>
+            </div>
+          </TooltipTrigger>
+          <TooltipContent>
+            <div className="space-y-1">
+              <div className="font-medium">Progress</div>
+              {sceneCount > 0 ? (
+                <>
+                  <div className="text-xs text-muted-foreground">
+                    Completed: {completed}/{sceneCount} scenes
+                  </div>
+                  <div className="text-xs text-muted-foreground">Remaining: {remaining}</div>
+                </>
+              ) : (
+                <div className="text-xs text-muted-foreground">No scenes yet</div>
+              )}
+            </div>
+          </TooltipContent>
+        </Tooltip>
 
         {/* Footer */}
         <div className="flex items-center justify-between">

@@ -1,4 +1,4 @@
-import { useState, useEffect, useMemo, useRef } from "react";
+import { useState, useEffect, useMemo, useRef, useCallback } from "react";
 import { useParams, useNavigate } from "react-router-dom";
 import { Layout } from "@/components/layout/Layout";
 import { StyleSelector } from "@/components/storyboard/StyleSelector";
@@ -50,6 +50,7 @@ import { StorySceneDragDropEditor, type StorySceneAnchors } from "@/components/s
 
 import { Tabs, TabsContent, TabsList, TabsTrigger } from "@/components/ui/tabs";
 import { CharacterList } from "@/components/storyboard/CharacterList";
+import { Tooltip, TooltipContent, TooltipTrigger } from "@/components/ui/tooltip";
 
 export default function Storyboard() {
   const { storyId } = useParams();
@@ -94,6 +95,12 @@ export default function Storyboard() {
     statusText?: string;
     reasons?: string[];
     upstreamError?: string;
+    model?: string;
+    modelConfig?: unknown;
+    preprocessingSteps?: string[];
+    prompt?: string;
+    promptFull?: string;
+    promptHash?: string;
     requestParams?: {
       model?: string;
       artStyle?: string;
@@ -314,13 +321,22 @@ export default function Storyboard() {
     return null;
   };
 
-  const recordSceneDebugInfo = (sceneId: string, next: Partial<SceneGenerationDebugInfo>) => {
+  const recordSceneDebugInfo = useCallback((sceneId: string, next: Partial<SceneGenerationDebugInfo>) => {
     setDebugInfo((prev) => {
       const prevEntry = prev[sceneId];
       const mergedHeaders =
         next.headers
           ? { ...(prevEntry?.headers ?? {}), ...normalizeHeaderRecord(next.headers) }
           : prevEntry?.headers;
+      const prompt = typeof next.prompt === "string" ? next.prompt : prevEntry?.prompt;
+      const promptFull = typeof next.promptFull === "string" ? next.promptFull : prevEntry?.promptFull;
+      const promptHash = typeof next.promptHash === "string" ? next.promptHash : prevEntry?.promptHash;
+      const model = typeof next.model === "string" ? next.model : prevEntry?.model;
+      const modelConfig = next.modelConfig !== undefined ? next.modelConfig : prevEntry?.modelConfig;
+      const preprocessingSteps =
+        Array.isArray(next.preprocessingSteps)
+          ? next.preprocessingSteps.filter((v): v is string => typeof v === "string")
+          : prevEntry?.preprocessingSteps;
       return {
         ...prev,
         [sceneId]: {
@@ -336,17 +352,130 @@ export default function Storyboard() {
           statusText: next.statusText ?? prevEntry?.statusText,
           reasons: next.reasons ?? prevEntry?.reasons,
           upstreamError: next.upstreamError ?? prevEntry?.upstreamError,
+          model,
+          modelConfig,
+          preprocessingSteps,
+          prompt,
+          promptFull,
+          promptHash,
+          requestParams: next.requestParams ?? prevEntry?.requestParams,
         },
       };
     });
-  };
+  }, []);
+
+  const hydrateSceneDebugFromDb = useCallback(async (sceneId: string) => {
+    try {
+      const { data, error } = await supabase
+        .from("scenes")
+        .select("id, generation_status, image_url, consistency_status, consistency_score, consistency_details, updated_at")
+        .eq("id", sceneId)
+        .single();
+
+      if (error || !data) {
+        if (error) {
+          recordSceneDebugInfo(sceneId, {
+            timestamp: new Date(),
+            stage: "db_hydrate",
+            suggestion: `Failed to load persisted prompt: ${error.message}`,
+          });
+        }
+        return;
+      }
+
+      const patch = data as unknown as Partial<Scene>;
+      setScenes((prev) => prev.map((s) => (s.id === sceneId ? { ...s, ...patch } : s)));
+      setSelectedScene((prev) => (prev?.id === sceneId ? { ...prev, ...patch } : prev));
+
+      const parseJsonIfString = (value: unknown) => {
+        if (typeof value !== "string") return value;
+        try {
+          const parsed = JSON.parse(value);
+          return typeof parsed === "object" && parsed !== null ? parsed : value;
+        } catch {
+          return value;
+        }
+      };
+
+      const rawDetails = parseJsonIfString(data.consistency_details);
+      const details =
+        rawDetails && typeof rawDetails === "object" && !Array.isArray(rawDetails)
+          ? (rawDetails as Record<string, unknown>)
+          : null;
+      
+      const rawGen = details?.generation_debug;
+      const parsedGen = parseJsonIfString(rawGen);
+      const gen =
+        parsedGen && typeof parsedGen === "object" && !Array.isArray(parsedGen)
+          ? (parsedGen as Record<string, unknown>)
+          : null;
+
+      // Also try to read from root if generation_debug is missing/incomplete
+      const rootDetails = details;
+
+      if (!gen && !rootDetails) {
+        if (data.generation_status !== "pending") {
+          recordSceneDebugInfo(sceneId, {
+            timestamp: new Date(),
+            stage: "db_hydrate",
+            suggestion: "No persisted generation_debug found for this scene.",
+          });
+        }
+        return;
+      }
+
+      const prompt = 
+        typeof gen?.prompt === "string" ? gen.prompt : 
+        typeof gen?.prompt_used === "string" ? gen.prompt_used : 
+        typeof rootDetails?.prompt === "string" ? rootDetails.prompt :
+        typeof rootDetails?.prompt_used === "string" ? rootDetails.prompt_used :
+        undefined;
+        
+      const promptFull =
+        typeof gen?.prompt_full === "string" ? gen.prompt_full : 
+        typeof gen?.promptFull === "string" ? gen.promptFull : 
+        typeof rootDetails?.prompt_full === "string" ? rootDetails.prompt_full :
+        typeof rootDetails?.promptFull === "string" ? rootDetails.promptFull :
+        undefined;
+
+      const preprocessingSteps = Array.isArray(gen?.preprocessingSteps)
+        ? (gen!.preprocessingSteps as unknown[]).filter((v): v is string => typeof v === "string")
+        : undefined;
+      
+      const promptHash = 
+        typeof gen?.prompt_hash === "string" ? gen.prompt_hash : 
+        typeof gen?.promptHash === "string" ? gen.promptHash : 
+        undefined;
+        
+      const model = typeof gen?.model === "string" ? gen.model : undefined;
+      const requestId = typeof gen?.requestId === "string" ? gen.requestId : undefined;
+      const stage = typeof gen?.stage === "string" ? gen.stage : undefined;
+
+      recordSceneDebugInfo(sceneId, {
+        prompt,
+        promptFull,
+        preprocessingSteps,
+        promptHash,
+        model,
+        requestId,
+        stage,
+      });
+    } catch {
+      return;
+    }
+  }, [recordSceneDebugInfo, setScenes, setSelectedScene]);
 
   useEffect(() => {
     if (!selectedScene?.id) return;
     const updated = scenes.find((s) => s.id === selectedScene.id);
     if (!updated) return;
-    if (updated.updated_at !== selectedScene.updated_at) setSelectedScene(updated);
+    if (updated !== selectedScene) setSelectedScene(updated);
   }, [scenes, selectedScene]);
+
+  useEffect(() => {
+    if (!isModalOpen || !selectedScene?.id) return;
+    void hydrateSceneDebugFromDb(selectedScene.id);
+  }, [hydrateSceneDebugFromDb, isModalOpen, selectedScene?.id]);
 
   const validateGeneratedImage = async (url: string) => {
     try {
@@ -499,6 +628,7 @@ export default function Storyboard() {
     }
 
     setGeneratingSceneId(sceneId);
+    let requestParams: Record<string, unknown> | undefined;
 
     try {
       type GenerateSceneImageResponse = {
@@ -510,6 +640,12 @@ export default function Storyboard() {
         redactedHeaders?: string[];
         requestId?: string;
         stage?: string;
+        model?: string;
+        prompt?: string;
+        promptFull?: string;
+        preprocessingSteps?: string[];
+        promptHash?: string;
+        modelConfig?: unknown;
         error?: string;
         message?: string;
         details?: string;
@@ -530,7 +666,7 @@ export default function Storyboard() {
       const strictStyle = opts?.strictStyle ?? false;
       const disabledStyleElements = disabledStyleElementsByStyle[artStyle] ?? [];
 
-      const requestParams = {
+      requestParams = {
         model: selectedModel,
         artStyle,
         styleIntensity: intensity,
@@ -599,6 +735,41 @@ export default function Storyboard() {
         const reasons = Array.isArray(detailsObj?.reasons) ? detailsObj.reasons as string[] : undefined;
         const upstreamError = detailsObj?.upstream_error as string | undefined;
         const redactedHeaders = Array.isArray(detailsObj?.redactedHeaders) ? detailsObj.redactedHeaders as string[] : undefined;
+        const prompt =
+          typeof detailsObj?.prompt === "string"
+            ? detailsObj.prompt
+            : typeof (detailsObj as Record<string, unknown> | undefined)?.prompt_used === "string"
+              ? ((detailsObj as Record<string, unknown>).prompt_used as string)
+              : typeof bodyObj?.prompt === "string"
+                ? (bodyObj.prompt as string)
+                : typeof (bodyObj as Record<string, unknown> | null)?.prompt_used === "string"
+                  ? ((bodyObj as Record<string, unknown>).prompt_used as string)
+                  : undefined;
+        const promptFull =
+          typeof (detailsObj as Record<string, unknown> | undefined)?.prompt_full === "string"
+            ? ((detailsObj as Record<string, unknown>).prompt_full as string)
+            : typeof (detailsObj as Record<string, unknown> | undefined)?.promptFull === "string"
+              ? ((detailsObj as Record<string, unknown>).promptFull as string)
+              : typeof (bodyObj as Record<string, unknown> | null)?.promptFull === "string"
+                ? ((bodyObj as Record<string, unknown>).promptFull as string)
+                : typeof (bodyObj as Record<string, unknown> | null)?.prompt_full === "string"
+                  ? ((bodyObj as Record<string, unknown>).prompt_full as string)
+                  : undefined;
+        const preprocessingSteps =
+          Array.isArray((detailsObj as Record<string, unknown> | undefined)?.preprocessingSteps)
+            ? ((detailsObj as Record<string, unknown>).preprocessingSteps as unknown[]).filter((v): v is string => typeof v === "string")
+            : Array.isArray((bodyObj as Record<string, unknown> | null)?.preprocessingSteps)
+              ? (((bodyObj as Record<string, unknown>).preprocessingSteps as unknown[]) || []).filter((v): v is string => typeof v === "string")
+              : undefined;
+        const model = typeof bodyObj?.model === "string" ? (bodyObj.model as string) : undefined;
+        const promptHash =
+          typeof (detailsObj as Record<string, unknown> | undefined)?.prompt_hash === "string"
+            ? ((detailsObj as Record<string, unknown>).prompt_hash as string)
+            : typeof (bodyObj as Record<string, unknown> | null)?.promptHash === "string"
+              ? ((bodyObj as Record<string, unknown>).promptHash as string)
+              : typeof (bodyObj as Record<string, unknown> | null)?.prompt_hash === "string"
+                ? ((bodyObj as Record<string, unknown>).prompt_hash as string)
+                : undefined;
         
         const errorMsg = String(bodyObj?.error || `HTTP ${responseStatus} ${responseStatusText}`);
 
@@ -612,6 +783,11 @@ export default function Storyboard() {
           reasons,
           upstreamError,
           requestId: (bodyObj?.requestId as string) || responseHeaders["x-request-id"],
+          model,
+          prompt,
+          promptFull,
+          preprocessingSteps,
+          promptHash,
           requestParams
         });
 
@@ -620,6 +796,7 @@ export default function Storyboard() {
             s.id === sceneId
               ? {
                   ...s,
+                  updated_at: new Date().toISOString(),
                   generation_status: "error",
                   consistency_details: {
                     ...(s.consistency_details && typeof s.consistency_details === "object" && !Array.isArray(s.consistency_details)
@@ -635,6 +812,11 @@ export default function Storyboard() {
                       reasons,
                       upstream_error: upstreamError,
                       requestId: (bodyObj?.requestId as string) || responseHeaders["x-request-id"],
+                      model,
+                      prompt,
+                      prompt_full: promptFull,
+                      preprocessingSteps,
+                      prompt_hash: promptHash,
                       requestParams
                     },
                   } as Json,
@@ -647,6 +829,27 @@ export default function Storyboard() {
 
       const response = responseBody as GenerateSceneImageResponse | null;
       console.log("[Storyboard] Generation response:", response);
+
+      const responsePromptFull =
+        typeof (response as Record<string, unknown> | null)?.promptFull === "string"
+          ? ((response as Record<string, unknown>).promptFull as string)
+          : typeof (response as Record<string, unknown> | null)?.prompt_full === "string"
+            ? ((response as Record<string, unknown>).prompt_full as string)
+            : undefined;
+
+      const responsePrompt =
+        typeof (response as Record<string, unknown> | null)?.prompt === "string"
+          ? ((response as Record<string, unknown>).prompt as string)
+          : typeof (response as Record<string, unknown> | null)?.prompt_used === "string"
+            ? ((response as Record<string, unknown>).prompt_used as string)
+            : undefined;
+
+      const responsePromptHash =
+        typeof (response as Record<string, unknown> | null)?.promptHash === "string"
+          ? ((response as Record<string, unknown>).promptHash as string)
+          : typeof (response as Record<string, unknown> | null)?.prompt_hash === "string"
+            ? ((response as Record<string, unknown>).prompt_hash as string)
+            : undefined;
 
       const ok = response?.success === true || Boolean(response?.imageUrl);
       if (!ok) {
@@ -669,6 +872,11 @@ export default function Storyboard() {
           requestId: response?.requestId,
           stage: response?.stage,
           error: errorMessage,
+          model: response?.model,
+          prompt: responsePrompt ?? response?.prompt,
+          promptFull: responsePromptFull,
+          preprocessingSteps: response?.preprocessingSteps,
+          promptHash: responsePromptHash ?? response?.promptHash,
           requestParams
         });
         setScenes((prev) =>
@@ -676,6 +884,7 @@ export default function Storyboard() {
             s.id === sceneId
               ? {
                   ...s,
+                  updated_at: new Date().toISOString(),
                   generation_status: "error",
                   consistency_details: {
                     ...(s.consistency_details && typeof s.consistency_details === "object" && !Array.isArray(s.consistency_details)
@@ -688,6 +897,11 @@ export default function Storyboard() {
                       requestId: response?.requestId,
                       stage: response?.stage,
                       error: errorMessage,
+                      model: response?.model,
+                      prompt: responsePrompt ?? response?.prompt,
+                      prompt_full: responsePromptFull,
+                      preprocessingSteps: response?.preprocessingSteps,
+                      prompt_hash: responsePromptHash ?? response?.promptHash,
                       requestParams
                     },
                   } as Json,
@@ -717,6 +931,7 @@ export default function Storyboard() {
               s.id === sceneId
                 ? {
                     ...s,
+                    updated_at: new Date().toISOString(),
                     image_url: null,
                     generation_status: "error",
                     consistency_status: "fail",
@@ -725,6 +940,14 @@ export default function Storyboard() {
                         ? (s.consistency_details as Record<string, unknown>)
                         : {}),
                       generation_debug: {
+                        ...(s.consistency_details &&
+                        typeof s.consistency_details === "object" &&
+                        !Array.isArray(s.consistency_details) &&
+                        (s.consistency_details as Record<string, unknown>).generation_debug &&
+                        typeof (s.consistency_details as Record<string, unknown>).generation_debug === "object" &&
+                        !Array.isArray((s.consistency_details as Record<string, unknown>).generation_debug)
+                          ? ((s.consistency_details as Record<string, unknown>).generation_debug as Record<string, unknown>)
+                          : {}),
                         timestamp: new Date().toISOString(),
                         headers: normalizeHeaderRecord(response?.headers),
                         redactedHeaders: response?.redactedHeaders,
@@ -732,6 +955,11 @@ export default function Storyboard() {
                         stage: "client_image_validation",
                         error: reason,
                         size: validation.size,
+                        model: response?.model,
+                        prompt: responsePrompt ?? response?.prompt,
+                        prompt_full: responsePromptFull,
+                        preprocessingSteps: response?.preprocessingSteps,
+                        prompt_hash: responsePromptHash ?? response?.promptHash,
                       },
                     } as Json,
                   }
@@ -752,6 +980,11 @@ export default function Storyboard() {
                 stage: "client_image_validation",
                 error: reason,
                 size: validation.size,
+                model: response?.model,
+                prompt: responsePrompt ?? response?.prompt,
+                prompt_full: responsePromptFull,
+                preprocessingSteps: response?.preprocessingSteps,
+                prompt_hash: responsePromptHash ?? response?.promptHash,
               },
             } as Json,
           });
@@ -768,25 +1001,26 @@ export default function Storyboard() {
       const bodyHeaders = response?.headers as Record<string, string> | undefined;
       const finalHeaders = { ...responseHeaders, ...(bodyHeaders || {}) };
 
-      if (Object.keys(finalHeaders).length > 0) {
-        console.log("[Storyboard] Setting debug info headers:", finalHeaders);
-        recordSceneDebugInfo(sceneId, {
-          timestamp: new Date(),
-          headers: finalHeaders,
-          redactedHeaders: response?.redactedHeaders,
-          requestId: response?.requestId,
-          stage: response?.stage,
-          requestParams
-        });
-      } else {
-        console.warn("[Storyboard] No headers in response");
-      }
+      recordSceneDebugInfo(sceneId, {
+        timestamp: new Date(),
+        headers: Object.keys(finalHeaders).length > 0 ? finalHeaders : undefined,
+        redactedHeaders: response?.redactedHeaders,
+        requestId: response?.requestId,
+        stage: response?.stage,
+        model: response?.model,
+        prompt: responsePrompt ?? response?.prompt,
+        promptFull: responsePromptFull,
+        preprocessingSteps: response?.preprocessingSteps,
+        promptHash: responsePromptHash ?? response?.promptHash,
+        requestParams,
+      });
 
       setScenes((prev) =>
         prev.map((s) =>
           s.id === sceneId
             ? {
                 ...s,
+                updated_at: new Date().toISOString(),
                 image_url: response?.imageUrl ?? s.image_url,
                 generation_status: "completed",
                 consistency_details: {
@@ -794,10 +1028,43 @@ export default function Storyboard() {
                     ? (s.consistency_details as Record<string, unknown>)
                     : {}),
                   generation_debug: {
+                    ...(() => {
+                      const details =
+                        s.consistency_details && typeof s.consistency_details === "object" && !Array.isArray(s.consistency_details)
+                          ? (s.consistency_details as Record<string, unknown>)
+                          : null;
+                      const gen =
+                        details?.generation_debug && typeof details.generation_debug === "object" && !Array.isArray(details.generation_debug)
+                          ? (details.generation_debug as Record<string, unknown>)
+                          : null;
+                      return gen && Object.keys(gen).length > 0 ? gen : {};
+                    })(),
                     timestamp: new Date().toISOString(),
                     headers: normalizeHeaderRecord(finalHeaders),
                     requestId: response?.requestId,
                     stage: response?.stage,
+                    model: response?.model,
+                    prompt: responsePrompt ?? response?.prompt,
+                    prompt_full:
+                      typeof responsePromptFull === "string"
+                        ? responsePromptFull
+                        : (() => {
+                            const details =
+                              s.consistency_details && typeof s.consistency_details === "object" && !Array.isArray(s.consistency_details)
+                                ? (s.consistency_details as Record<string, unknown>)
+                                : null;
+                            const gen =
+                              details?.generation_debug && typeof details.generation_debug === "object" && !Array.isArray(details.generation_debug)
+                                ? (details.generation_debug as Record<string, unknown>)
+                                : null;
+                            return typeof gen?.prompt_full === "string"
+                              ? (gen.prompt_full as string)
+                              : typeof gen?.promptFull === "string"
+                                ? (gen.promptFull as string)
+                                : undefined;
+                          })(),
+                    preprocessingSteps: response?.preprocessingSteps,
+                    prompt_hash: responsePromptHash ?? response?.promptHash,
                     requestParams
                   },
                 } as Json,
@@ -812,21 +1079,35 @@ export default function Storyboard() {
         title: "Image generated!",
         description: "Scene illustration has been created",
       });
+
+      window.setTimeout(() => {
+        void hydrateSceneDebugFromDb(sceneId);
+      }, 600);
     } catch (error) {
       console.error("Error generating image:", error);
       const message = error instanceof Error ? error.message : "Failed to generate image";
-      recordSceneDebugInfo(sceneId, { timestamp: new Date(), error: message });
+      recordSceneDebugInfo(sceneId, { timestamp: new Date(), error: message, requestParams });
+      await hydrateSceneDebugFromDb(sceneId);
       setScenes((prev) =>
         prev.map((s) =>
           s.id === sceneId
             ? {
                 ...s,
+                updated_at: new Date().toISOString(),
                 generation_status: "error",
                 consistency_details: {
                   ...(s.consistency_details && typeof s.consistency_details === "object" && !Array.isArray(s.consistency_details)
                     ? (s.consistency_details as Record<string, unknown>)
                     : {}),
                   generation_debug: {
+                    ...(s.consistency_details &&
+                    typeof s.consistency_details === "object" &&
+                    !Array.isArray(s.consistency_details) &&
+                    (s.consistency_details as Record<string, unknown>).generation_debug &&
+                    typeof (s.consistency_details as Record<string, unknown>).generation_debug === "object" &&
+                    !Array.isArray((s.consistency_details as Record<string, unknown>).generation_debug)
+                      ? ((s.consistency_details as Record<string, unknown>).generation_debug as Record<string, unknown>)
+                      : {}),
                     timestamp: new Date().toISOString(),
                     error: message,
                   },
@@ -866,6 +1147,12 @@ export default function Storyboard() {
           redactedHeaders?: string[];
           requestId?: string;
           stage?: string;
+          model?: string;
+          prompt?: string;
+          promptFull?: string;
+          preprocessingSteps?: string[];
+          promptHash?: string;
+          modelConfig?: unknown;
           error?: string;
           message?: string;
           details?: string;
@@ -895,11 +1182,12 @@ export default function Storyboard() {
           ),
         );
 
+        let requestParams: Record<string, unknown> | undefined;
         try {
           // Use direct fetch to bypass supabase-js error wrapping that might obscure headers
           const functionUrl = `${import.meta.env.VITE_SUPABASE_URL ?? "https://placeholder.supabase.co"}/functions/v1/generate-scene-image`;
           
-          const requestParams = {
+          requestParams = {
             model: selectedModel,
             artStyle: selectedStyle,
             styleIntensity,
@@ -961,6 +1249,41 @@ export default function Storyboard() {
             const reasons = Array.isArray(detailsObj?.reasons) ? detailsObj.reasons as string[] : undefined;
             const upstreamError = detailsObj?.upstream_error as string | undefined;
             const redactedHeaders = Array.isArray(detailsObj?.redactedHeaders) ? detailsObj.redactedHeaders as string[] : undefined;
+            const prompt =
+              typeof detailsObj?.prompt === "string"
+                ? detailsObj.prompt
+                : typeof (detailsObj as Record<string, unknown> | undefined)?.prompt_used === "string"
+                  ? ((detailsObj as Record<string, unknown>).prompt_used as string)
+                  : typeof bodyObj?.prompt === "string"
+                    ? (bodyObj.prompt as string)
+                    : typeof (bodyObj as Record<string, unknown> | null)?.prompt_used === "string"
+                      ? ((bodyObj as Record<string, unknown>).prompt_used as string)
+                      : undefined;
+            const promptFull =
+              typeof (detailsObj as Record<string, unknown> | undefined)?.prompt_full === "string"
+                ? ((detailsObj as Record<string, unknown>).prompt_full as string)
+                : typeof (detailsObj as Record<string, unknown> | undefined)?.promptFull === "string"
+                  ? ((detailsObj as Record<string, unknown>).promptFull as string)
+                  : typeof (bodyObj as Record<string, unknown> | null)?.promptFull === "string"
+                    ? ((bodyObj as Record<string, unknown>).promptFull as string)
+                    : typeof (bodyObj as Record<string, unknown> | null)?.prompt_full === "string"
+                      ? ((bodyObj as Record<string, unknown>).prompt_full as string)
+                      : undefined;
+            const preprocessingSteps =
+              Array.isArray((detailsObj as Record<string, unknown> | undefined)?.preprocessingSteps)
+                ? ((detailsObj as Record<string, unknown>).preprocessingSteps as unknown[]).filter((v): v is string => typeof v === "string")
+                : Array.isArray((bodyObj as Record<string, unknown> | null)?.preprocessingSteps)
+                  ? (((bodyObj as Record<string, unknown>).preprocessingSteps as unknown[]) || []).filter((v): v is string => typeof v === "string")
+                  : undefined;
+            const model = typeof bodyObj?.model === "string" ? (bodyObj.model as string) : undefined;
+            const promptHash =
+              typeof (detailsObj as Record<string, unknown> | undefined)?.prompt_hash === "string"
+                ? ((detailsObj as Record<string, unknown>).prompt_hash as string)
+                : typeof (bodyObj as Record<string, unknown> | null)?.promptHash === "string"
+                  ? ((bodyObj as Record<string, unknown>).promptHash as string)
+                  : typeof (bodyObj as Record<string, unknown> | null)?.prompt_hash === "string"
+                    ? ((bodyObj as Record<string, unknown>).prompt_hash as string)
+                    : undefined;
             
             const errorMsg = String(bodyObj?.error || `HTTP ${responseStatus} ${responseStatusText}`);
 
@@ -974,6 +1297,11 @@ export default function Storyboard() {
               reasons,
               upstreamError,
               requestId: (bodyObj?.requestId as string) || responseHeaders["x-request-id"],
+              model,
+              prompt,
+              promptFull,
+              preprocessingSteps,
+              promptHash,
               requestParams
             });
 
@@ -1006,6 +1334,11 @@ export default function Storyboard() {
                           reasons,
                           upstream_error: upstreamError,
                           requestId: (bodyObj?.requestId as string) || responseHeaders["x-request-id"],
+                          model,
+                          prompt,
+                          prompt_full: promptFull,
+                          preprocessingSteps,
+                          prompt_hash: promptHash,
                           requestParams
                         },
                       } as Json,
@@ -1038,6 +1371,11 @@ export default function Storyboard() {
               stage: response?.stage,
               headers: finalHeaders,
               redactedHeaders: response?.redactedHeaders,
+              model: response?.model,
+              prompt: response?.prompt,
+              promptFull: response?.promptFull,
+              preprocessingSteps: response?.preprocessingSteps,
+              promptHash: response?.promptHash,
               requestParams
             });
             failedCount += 1;
@@ -1058,6 +1396,11 @@ export default function Storyboard() {
                           requestId: response?.requestId,
                           stage: response?.stage,
                           error: errorMessage,
+                          model: response?.model,
+                          prompt: response?.prompt,
+                          prompt_full: response?.promptFull,
+                          preprocessingSteps: response?.preprocessingSteps,
+                          prompt_hash: response?.promptHash,
                           requestParams
                         },
                       } as Json,
@@ -1080,6 +1423,12 @@ export default function Storyboard() {
                 headers: response?.headers,
                 redactedHeaders: response?.redactedHeaders,
                 size: validation.size,
+                model: response?.model,
+                prompt: response?.prompt,
+                promptFull: response?.promptFull,
+                preprocessingSteps: response?.preprocessingSteps,
+                promptHash: response?.promptHash,
+                requestParams
               });
               failedCount += 1;
               setScenes((prev) =>
@@ -1095,6 +1444,14 @@ export default function Storyboard() {
                             ? (s.consistency_details as Record<string, unknown>)
                             : {}),
                           generation_debug: {
+                            ...(s.consistency_details &&
+                            typeof s.consistency_details === "object" &&
+                            !Array.isArray(s.consistency_details) &&
+                            (s.consistency_details as Record<string, unknown>).generation_debug &&
+                            typeof (s.consistency_details as Record<string, unknown>).generation_debug === "object" &&
+                            !Array.isArray((s.consistency_details as Record<string, unknown>).generation_debug)
+                              ? ((s.consistency_details as Record<string, unknown>).generation_debug as Record<string, unknown>)
+                              : {}),
                             timestamp: new Date().toISOString(),
                             headers: normalizeHeaderRecord(response?.headers),
                             redactedHeaders: response?.redactedHeaders,
@@ -1102,6 +1459,12 @@ export default function Storyboard() {
                             stage: "client_image_validation",
                             error: reason,
                             size: validation.size,
+                            model: response?.model,
+                            prompt: response?.prompt,
+                            prompt_full: response?.promptFull,
+                            preprocessingSteps: response?.preprocessingSteps,
+                            prompt_hash: response?.promptHash,
+                            requestParams,
                           },
                         } as Json,
                       }
@@ -1121,6 +1484,12 @@ export default function Storyboard() {
                     stage: "client_image_validation",
                     error: reason,
                     size: validation.size,
+                    model: response?.model,
+                    prompt: response?.prompt,
+                    prompt_full: response?.promptFull,
+                    preprocessingSteps: response?.preprocessingSteps,
+                    prompt_hash: response?.promptHash,
+                    requestParams,
                   },
                 } as Json,
               });
@@ -1136,6 +1505,11 @@ export default function Storyboard() {
             redactedHeaders: response?.redactedHeaders,
             requestId: response?.requestId,
             stage: response?.stage,
+            model: response?.model,
+            prompt: response?.prompt,
+            promptFull: response?.promptFull,
+            preprocessingSteps: response?.preprocessingSteps,
+            promptHash: response?.promptHash,
             requestParams
           });
           setScenes((prev) =>
@@ -1155,6 +1529,11 @@ export default function Storyboard() {
                         redactedHeaders: response?.redactedHeaders,
                         requestId: response?.requestId,
                         stage: response?.stage,
+                        model: response?.model,
+                        prompt: response?.prompt,
+                        prompt_full: response?.promptFull,
+                        preprocessingSteps: response?.preprocessingSteps,
+                        prompt_hash: response?.promptHash,
                         requestParams
                       },
                     } as Json,
@@ -1164,7 +1543,8 @@ export default function Storyboard() {
           );
         } catch (error) {
           const message = error instanceof Error ? error.message : "Failed to generate image";
-          recordSceneDebugInfo(scene.id, { timestamp: new Date(), error: message });
+          recordSceneDebugInfo(scene.id, { timestamp: new Date(), error: message, requestParams });
+          await hydrateSceneDebugFromDb(scene.id);
           console.error(`Error generating scene ${scene.id}:`, message);
           failedCount += 1;
           setScenes((prev) =>
@@ -1172,17 +1552,25 @@ export default function Storyboard() {
               s.id === scene.id
                 ? {
                     ...s,
-                    generation_status: "error",
-                    consistency_details: {
-                      ...(s.consistency_details && typeof s.consistency_details === "object" && !Array.isArray(s.consistency_details)
-                        ? (s.consistency_details as Record<string, unknown>)
+                  generation_status: "error",
+                  consistency_details: {
+                    ...(s.consistency_details && typeof s.consistency_details === "object" && !Array.isArray(s.consistency_details)
+                      ? (s.consistency_details as Record<string, unknown>)
+                      : {}),
+                    generation_debug: {
+                      ...(s.consistency_details &&
+                      typeof s.consistency_details === "object" &&
+                      !Array.isArray(s.consistency_details) &&
+                      (s.consistency_details as Record<string, unknown>).generation_debug &&
+                      typeof (s.consistency_details as Record<string, unknown>).generation_debug === "object" &&
+                      !Array.isArray((s.consistency_details as Record<string, unknown>).generation_debug)
+                        ? ((s.consistency_details as Record<string, unknown>).generation_debug as Record<string, unknown>)
                         : {}),
-                      generation_debug: {
-                        timestamp: new Date().toISOString(),
-                        error: message,
-                      },
-                    } as Json,
-                  }
+                      timestamp: new Date().toISOString(),
+                      error: message,
+                    },
+                  } as Json,
+                }
                 : s,
             ),
           );
@@ -2099,7 +2487,15 @@ export default function Storyboard() {
 
           {stories.length > 0 ? (
             <div className="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-3 gap-6">
-              {stories.map((s) => (
+              {stories.map((s) => {
+                const sceneCount = s.scene_count || 0;
+                const completed = s.completed_scenes || 0;
+                const progress =
+                  sceneCount > 0 ? Math.max(0, Math.min(100, Math.round((completed / sceneCount) * 100))) : 0;
+                const barColorClass = progress >= 100 ? "bg-green-500" : progress > 0 ? "bg-yellow-500" : "bg-red-500";
+                const remaining = Math.max(0, sceneCount - completed);
+
+                return (
                 <Card
                   key={s.id}
                   variant="interactive"
@@ -2136,11 +2532,45 @@ export default function Storyboard() {
                     <span>{s.word_count?.toLocaleString() || 0} words</span>
                     <span>{s.scene_count || 0} scenes</span>
                   </div>
+
+                  <Tooltip>
+                    <TooltipTrigger asChild>
+                      <div className="mt-3">
+                        <div className="flex items-center justify-between text-xs text-muted-foreground mb-1">
+                          <span>{sceneCount} scenes</span>
+                          <span>{progress}%</span>
+                        </div>
+                        <div className="h-1.5 bg-secondary rounded-full overflow-hidden">
+                          <div
+                            className={`h-full ${barColorClass} rounded-full transition-all duration-500`}
+                            style={{ width: `${progress}%` }}
+                          />
+                        </div>
+                      </div>
+                    </TooltipTrigger>
+                    <TooltipContent>
+                      <div className="space-y-1">
+                        <div className="font-medium">Progress</div>
+                        {sceneCount > 0 ? (
+                          <>
+                            <div className="text-xs text-muted-foreground">
+                              Completed: {completed}/{sceneCount} scenes
+                            </div>
+                            <div className="text-xs text-muted-foreground">Remaining: {remaining}</div>
+                          </>
+                        ) : (
+                          <div className="text-xs text-muted-foreground">No scenes yet</div>
+                        )}
+                      </div>
+                    </TooltipContent>
+                  </Tooltip>
+
                   <p className="text-xs text-muted-foreground mt-2">
                     Updated {new Date(s.updated_at).toLocaleDateString()}
                   </p>
                 </Card>
-              ))}
+                );
+              })}
             </div>
           ) : (
             <div className="text-center py-16 bg-secondary/30 rounded-xl border border-border/50">
@@ -2503,6 +2933,11 @@ export default function Storyboard() {
         onRegenerate={handleModalRegenerate}
         onRegenerateStrictStyle={handleModalRegenerateStrictStyle}
         onReportStyleMismatch={handleReportStyleMismatch}
+        onImageEdited={(sceneId, imageUrl) => {
+          setScenes((prev) => prev.map((s) => (s.id === sceneId ? { ...s, image_url: imageUrl } : s)));
+          setSelectedScene((prev) => (prev?.id === sceneId ? { ...prev, image_url: imageUrl } : prev));
+          void fetchScenes();
+        }}
         isGenerating={
           (selectedScene?.generation_status === "generating") || generatingSceneId === selectedScene?.id
         }

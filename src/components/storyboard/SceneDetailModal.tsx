@@ -1,4 +1,4 @@
-import { useMemo, useState, useEffect } from "react";
+import { useMemo, useState, useEffect, useRef, useCallback, type PointerEvent as ReactPointerEvent, type WheelEvent as ReactWheelEvent, type DragEvent as ReactDragEvent } from "react";
 import {
   Dialog,
   DialogContent,
@@ -9,10 +9,31 @@ import { Button } from "@/components/ui/button";
 import { Textarea } from "@/components/ui/textarea";
 import { Label } from "@/components/ui/label";
 import { Badge } from "@/components/ui/badge";
-import { Save, X, RefreshCw, Wand2, AlertTriangle, Copy, Download } from "lucide-react";
+import { Input } from "@/components/ui/input";
+import { Slider } from "@/components/ui/slider";
+import { Tabs, TabsContent, TabsList, TabsTrigger } from "@/components/ui/tabs";
+import { Progress } from "@/components/ui/progress";
+import { cn } from "@/lib/utils";
+import { validateSceneReferenceImageCandidate } from "@/lib/reference-images";
+import { supabase } from "@/integrations/supabase/client";
+import { buildVeniceEditPrompt, type ImageEditTool, inferImageMimeFromUrl, normalizeImageMime, type NormalizedRect, validateVeniceImageConstraints } from "@/lib/venice-image-edit";
+import { Save, X, RefreshCw, Wand2, AlertTriangle, Copy, Download, Edit3, Undo2, Redo2, Check, Square, Loader2, Upload, Trash2, ZoomIn, ZoomOut, RotateCcw, ChevronDown } from "lucide-react";
 import { Scene } from "@/hooks/useStories";
 import { extractDetailedError, DetailedError } from "@/lib/error-reporting";
 import { useToast } from "@/hooks/use-toast";
+import { applyClothingColorsToCharacterStates } from "@/lib/scene-character-appearance";
+import { ensureClothingColors, validateClothingColorCoverage } from "@/lib/clothing-colors";
+import { readBooleanPreference, writeBooleanPreference } from "@/lib/ui-preferences";
+
+interface PromptOptimization {
+  id: string;
+  created_at: string | null;
+  final_prompt_text: string | null;
+  optimized_prompt: Record<string, unknown> | null;
+  original_input: string | null;
+  model_used: string | null;
+  framework_version: string | null;
+}
 
 interface SceneDetailModalProps {
   scene: Scene | null;
@@ -24,6 +45,7 @@ interface SceneDetailModalProps {
   onRegenerate: (sceneId: string) => Promise<void>;
   onRegenerateStrictStyle?: (sceneId: string) => Promise<void>;
   onReportStyleMismatch?: (sceneId: string, message: string) => Promise<void>;
+  onImageEdited?: (sceneId: string, imageUrl: string) => void;
   isGenerating?: boolean;
   debugInfo?: {
     headers?: Record<string, string>;
@@ -39,8 +61,33 @@ interface SceneDetailModalProps {
     reasons?: string[];
     upstreamError?: string;
     prompt?: string;
+    promptFull?: string;
+    preprocessingSteps?: string[];
+    model?: string;
+    modelConfig?: unknown;
+    promptHash?: string;
   };
 }
+
+type ReferenceImageItem = {
+  id: string;
+  fileName: string;
+  status: "uploading" | "ready" | "error";
+  progress: number;
+  error?: string;
+  url?: string;
+  thumbUrl?: string;
+  bucket?: string;
+  objectPath?: string;
+  thumbPath?: string;
+  width?: number | null;
+  height?: number | null;
+  selected: boolean;
+  zoom: number;
+  panX: number;
+  panY: number;
+  localThumbUrl?: string;
+};
 
 const isPlainObject = (value: unknown): value is Record<string, unknown> =>
   typeof value === "object" && value !== null && !Array.isArray(value);
@@ -82,6 +129,26 @@ const safeDate = (val: unknown): Date | undefined => {
   return undefined;
 };
 
+const nonEmptyString = (val: unknown): string | undefined =>
+  typeof val === "string" && val.trim().length > 0 ? val : undefined;
+
+const pickGenerationDebug = (details: Record<string, unknown> | null | undefined): Record<string, unknown> | null => {
+  if (!details) return null;
+  const raw = details.generation_debug ?? details.generationDebug;
+  if (isPlainObject(raw)) return raw;
+  if (typeof raw === "string") {
+    try {
+      const parsed = JSON.parse(raw) as unknown;
+      return isPlainObject(parsed) ? parsed : null;
+    } catch {
+      return null;
+    }
+  }
+  return null;
+};
+
+const DEBUG_PREF_KEY = "scene_modal_debug_expanded";
+
 export function SceneDetailModal({
   scene,
   allScenes,
@@ -92,10 +159,18 @@ export function SceneDetailModal({
   onRegenerate,
   onRegenerateStrictStyle,
   onReportStyleMismatch,
+  onImageEdited,
   isGenerating = false,
   debugInfo,
 }: SceneDetailModalProps) {
   const { toast } = useToast();
+  const [isDebugExpanded, setIsDebugExpanded] = useState(() =>
+    readBooleanPreference({
+      storage: typeof window !== "undefined" ? window.localStorage : null,
+      key: DEBUG_PREF_KEY,
+      defaultValue: false,
+    }),
+  );
   const [editedPrompt, setEditedPrompt] = useState("");
   const [isSaving, setIsSaving] = useState(false);
   const [hasChanges, setHasChanges] = useState(false);
@@ -104,12 +179,85 @@ export function SceneDetailModal({
   const [characterStatesDraft, setCharacterStatesDraft] = useState<Record<string, Record<string, string>>>({});
   const [originalCharacterStates, setOriginalCharacterStates] = useState<Record<string, Record<string, string>>>({});
   const [hasCharacterStateChanges, setHasCharacterStateChanges] = useState(false);
+  const [isImageEditorOpen, setIsImageEditorOpen] = useState(false);
+  const [editTool, setEditTool] = useState<ImageEditTool>("inpaint");
+  const [inpaintText, setInpaintText] = useState("");
+  const [removeObjectText, setRemoveObjectText] = useState("");
+  const [colorTargetText, setColorTargetText] = useState("");
+  const [colorValueText, setColorValueText] = useState("");
+  const [toneTargetText, setToneTargetText] = useState("");
+  const [brightness, setBrightness] = useState(0);
+  const [contrast, setContrast] = useState(0);
+  const [selection, setSelection] = useState<NormalizedRect | null>(null);
+  const [isSelecting, setIsSelecting] = useState(false);
+  const imageContainerRef = useRef<HTMLDivElement | null>(null);
+  const imageRef = useRef<HTMLImageElement | null>(null);
+  const selectionStartRef = useRef<{ x: number; y: number } | null>(null);
+  const [naturalSize, setNaturalSize] = useState<{ w: number; h: number } | null>(null);
+  const [imageHistory, setImageHistory] = useState<string[]>([]);
+  const [historyIndex, setHistoryIndex] = useState(0);
+  const [previewMode, setPreviewMode] = useState<"current" | "original">("current");
+  const [isPreparingEditor, setIsPreparingEditor] = useState(false);
+  const [isPreviewingEdit, setIsPreviewingEdit] = useState(false);
+  const [isApplyingEdit, setIsApplyingEdit] = useState(false);
+  const [referenceImages, setReferenceImages] = useState<ReferenceImageItem[]>([]);
+  const [isReferenceDragging, setIsReferenceDragging] = useState(false);
+  const [activeReferenceId, setActiveReferenceId] = useState<string | null>(null);
+  const referencePointersRef = useRef<Map<number, { x: number; y: number }>>(new Map());
+  const referencePanStartRef = useRef<{ panX: number; panY: number; startX: number; startY: number; dist?: number; zoom?: number } | null>(null);
+  const lastPersistedReferencesRef = useRef<string | null>(null);
+  const referenceFileInputRef = useRef<HTMLInputElement | null>(null);
+
+  const [failedPromptEdit, setFailedPromptEdit] = useState("");
+  const [showRawPrompt, setShowRawPrompt] = useState(false);
+  const [promptTextView, setPromptTextView] = useState<"sent" | "full">("full");
+  const [promptHashState, setPromptHashState] = useState<"unavailable" | "match" | "mismatch">("unavailable");
+  const [refreshTrigger, setRefreshTrigger] = useState(0);
+  const [directSceneDetails, setDirectSceneDetails] = useState<Record<string, unknown> | null>(null);
+  const [promptOptimizationsUnavailable, setPromptOptimizationsUnavailable] = useState(false);
+  // Added to fix ReferenceError
+  const [promptFromDebugHistory, setPromptFromDebugHistory] = useState<{ used?: string; full?: string }>({});
+  const [promptFromHistory, setPromptFromHistory] = useState<{ used?: string; full?: string; raw?: string }>({});
+
+  const [promptOptimizations, setPromptOptimizations] = useState<PromptOptimization[]>([]);
+  const [promptOptimizationError, setPromptOptimizationError] = useState<string | null>(null);
+  const [isLoadingPromptOptimizations, setIsLoadingPromptOptimizations] = useState(false);
+  const promptFetchSeqRef = useRef(0);
+  const directFetchSeqRef = useRef(0);
+  const refreshBurstSeqRef = useRef(0);
+  const lastKnownPromptTsRef = useRef<number>(0);
+
+
 
   useEffect(() => {
     if (scene) {
       setEditedPrompt(scene.image_prompt || "");
       setHasChanges(false);
       setStyleFeedback("");
+      setIsImageEditorOpen(false);
+      setEditTool("inpaint");
+      setInpaintText("");
+      setRemoveObjectText("");
+      setColorTargetText("");
+      setColorValueText("");
+      setToneTargetText("");
+      setBrightness(0);
+      setContrast(0);
+      setSelection(null);
+      setIsSelecting(false);
+      selectionStartRef.current = null;
+      setNaturalSize(null);
+      setImageHistory([]);
+      setHistoryIndex(0);
+      setPreviewMode("current");
+      setIsPreparingEditor(false);
+      setIsPreviewingEdit(false);
+      setIsApplyingEdit(false);
+      setReferenceImages([]);
+      setIsReferenceDragging(false);
+      setActiveReferenceId(null);
+      referencePointersRef.current.clear();
+      referencePanStartRef.current = null;
 
       const raw = scene.character_states;
       const rawObj = raw && typeof raw === "object" && !Array.isArray(raw) ? (raw as Record<string, unknown>) : {};
@@ -134,16 +282,162 @@ export function SceneDetailModal({
         };
       });
 
-      setCharacterStatesDraft(next);
-      setOriginalCharacterStates(next);
+      const sceneText = [
+        typeof scene.setting === "string" ? scene.setting : "",
+        typeof scene.emotional_tone === "string" ? scene.emotional_tone : "",
+        typeof scene.summary === "string" ? scene.summary : "",
+        typeof scene.original_text === "string" ? scene.original_text : "",
+      ]
+        .filter(Boolean)
+        .join(" • ");
+
+      const colored = applyClothingColorsToCharacterStates({
+        storyId: scene.story_id,
+        sceneId: scene.id,
+        sceneText,
+        characterStates: next as Record<string, { clothing: string; state: string; physical_attributes: string }>,
+      });
+
+      setCharacterStatesDraft(colored);
+      setOriginalCharacterStates(colored);
       setHasCharacterStateChanges(false);
     }
   }, [scene]);
 
+  useEffect(() => {
+    setDirectSceneDetails(null);
+    setPromptOptimizationsUnavailable(false);
+  }, [scene?.id]);
+
+  const lastPromptRefreshKeyRef = useRef<string | null>(null);
+  useEffect(() => {
+    if (!scene?.id) return;
+    if (scene.generation_status !== "completed" && scene.generation_status !== "error") return;
+
+    const key = `${scene.id}:${scene.generation_status}:${scene.image_url ?? ""}`;
+    if (lastPromptRefreshKeyRef.current === key) return;
+    lastPromptRefreshKeyRef.current = key;
+
+    const t0 = window.setTimeout(() => setRefreshTrigger((v) => v + 1), 0);
+    const t1 = window.setTimeout(() => setRefreshTrigger((v) => v + 1), 1200);
+    return () => {
+      window.clearTimeout(t0);
+      window.clearTimeout(t1);
+    };
+  }, [scene?.id, scene?.generation_status, scene?.image_url]);
+
+  useEffect(() => {
+    if (!isOpen) refreshBurstSeqRef.current += 1;
+  }, [isOpen]);
+
+  useEffect(() => {
+    writeBooleanPreference({
+      storage: typeof window !== "undefined" ? window.localStorage : null,
+      key: DEBUG_PREF_KEY,
+      value: isDebugExpanded,
+    });
+  }, [isDebugExpanded]);
+
+  const PROMPT_CHAR_LIMIT = 500;
+
   const handlePromptChange = (value: string) => {
-    setEditedPrompt(value);
-    setHasChanges(value !== (scene?.image_prompt || ""));
+    const next = value.length > PROMPT_CHAR_LIMIT ? value.slice(0, PROMPT_CHAR_LIMIT) : value;
+    setEditedPrompt(next);
+    setHasChanges(next !== (scene?.image_prompt || ""));
   };
+
+  const fetchLatestSceneDetails = useCallback(
+    async (sceneId: string) => {
+      const seq = (directFetchSeqRef.current += 1);
+      try {
+        const { data, error } = await supabase.from("scenes").select("consistency_details").eq("id", sceneId).single();
+        if (directFetchSeqRef.current !== seq || error || !data) return null;
+
+        const raw = data.consistency_details;
+        const parsed = isPlainObject(raw) ? raw : typeof raw === "string" ? (JSON.parse(raw) as unknown) : null;
+        if (!isPlainObject(parsed)) return null;
+
+        setDirectSceneDetails(parsed);
+        const gen = pickGenerationDebug(parsed);
+        const ts = safeDate(gen?.timestamp)?.getTime();
+        return typeof ts === "number" ? ts : null;
+      } catch {
+        if (directFetchSeqRef.current === seq) return null;
+        return null;
+      }
+    },
+    [],
+  );
+
+  const fetchLatestPromptOptimizations = useCallback(
+    async (sceneId: string) => {
+      if (promptOptimizationsUnavailable) {
+        setIsLoadingPromptOptimizations(false);
+        return;
+      }
+      const seq = (promptFetchSeqRef.current += 1);
+      setIsLoadingPromptOptimizations(true);
+      try {
+        setPromptOptimizationError(null);
+        const { data, error } = await supabase
+          .from("prompt_optimizations")
+          .select("id, created_at, final_prompt_text, optimized_prompt, original_input, model_used, framework_version")
+          .eq("scene_id", sceneId)
+          .order("created_at", { ascending: false })
+          .limit(12);
+
+        if (promptFetchSeqRef.current !== seq) return;
+        if (error) {
+          const message = error.message || "Failed to load prompt history";
+          const missingTable =
+            message.toLowerCase().includes("schema cache") &&
+            message.toLowerCase().includes("prompt_optimizations") &&
+            (message.toLowerCase().includes("could not find the table") ||
+              message.toLowerCase().includes("relation") ||
+              message.toLowerCase().includes("does not exist"));
+          setPromptOptimizations([]);
+          if (missingTable) {
+            setPromptOptimizationsUnavailable(true);
+            setPromptOptimizationError("Prompt history unavailable (prompt_optimizations table is missing)");
+          } else {
+            setPromptOptimizationError(message);
+          }
+          return;
+        }
+
+        setPromptOptimizations(
+          (data || []).map((row) => ({
+            id: String((row as Record<string, unknown>).id),
+            created_at: typeof (row as Record<string, unknown>).created_at === "string" ? ((row as Record<string, unknown>).created_at as string) : null,
+            final_prompt_text:
+              typeof (row as Record<string, unknown>).final_prompt_text === "string"
+                ? ((row as Record<string, unknown>).final_prompt_text as string)
+                : null,
+            optimized_prompt:
+              (row as Record<string, unknown>).optimized_prompt && typeof (row as Record<string, unknown>).optimized_prompt === "object"
+                ? ((row as Record<string, unknown>).optimized_prompt as Record<string, unknown>)
+                : null,
+            original_input:
+              typeof (row as Record<string, unknown>).original_input === "string"
+                ? ((row as Record<string, unknown>).original_input as string)
+                : null,
+            model_used: typeof (row as Record<string, unknown>).model_used === "string" ? ((row as Record<string, unknown>).model_used as string) : null,
+            framework_version:
+              typeof (row as Record<string, unknown>).framework_version === "string"
+                ? ((row as Record<string, unknown>).framework_version as string)
+                : null,
+          })),
+        );
+      } catch (e) {
+        if (promptFetchSeqRef.current !== seq) return;
+        setPromptOptimizations([]);
+        setPromptOptimizationError(e instanceof Error ? e.message : "Failed to load prompt history");
+      } finally {
+        if (promptFetchSeqRef.current === seq) setIsLoadingPromptOptimizations(false);
+      }
+    },
+    [promptOptimizationsUnavailable],
+  );
 
   const handleSave = async () => {
     if (!scene || (!hasChanges && !hasCharacterStateChanges)) return;
@@ -159,18 +453,45 @@ export function SceneDetailModal({
         const toSave: Record<string, unknown> = {};
         const normalizedDraft: Record<string, Record<string, string>> = {};
         for (const [name, state] of Object.entries(characterStatesDraft)) {
-          const clothing = normalizeField(state.clothing || "", 400);
+          const clothingRaw = normalizeField(state.clothing || "", 400);
+          const sceneText = [
+            typeof scene.setting === "string" ? scene.setting : "",
+            typeof scene.emotional_tone === "string" ? scene.emotional_tone : "",
+            typeof scene.summary === "string" ? scene.summary : "",
+            typeof scene.original_text === "string" ? scene.original_text : "",
+          ]
+            .filter(Boolean)
+            .join(" • ");
+          const clothingColored =
+            clothingRaw.trim().length > 0
+              ? ensureClothingColors(clothingRaw, {
+                  seed: `${scene.story_id}:${scene.id}:${name}:save`,
+                  scene_text: sceneText,
+                  force_if_no_keywords: true,
+                }).text || clothingRaw
+              : "";
+          const clothingValidation = validateClothingColorCoverage(clothingColored);
+          if (!clothingValidation.ok) {
+            toast({
+              title: "Missing clothing colors",
+              description: `${name}: add a color to each clothing item.`,
+              variant: "destructive",
+            });
+            setIsSaving(false);
+            return;
+          }
+
           const condition = normalizeField(state.state || "", 400);
           const physicalAttributes = normalizeField(state.physical_attributes || "", 600);
 
           normalizedDraft[name] = {
-            clothing,
+            clothing: clothingColored,
             state: condition,
             physical_attributes: physicalAttributes,
           };
 
           const nextState: Record<string, string> = {};
-          if (clothing) nextState.clothing = clothing;
+          if (clothingColored) nextState.clothing = clothingColored;
           if (condition) nextState.state = condition;
           if (physicalAttributes) nextState.physical_attributes = physicalAttributes;
           if (Object.keys(nextState).length > 0) toSave[name] = nextState;
@@ -188,22 +509,44 @@ export function SceneDetailModal({
 
   const handleRegenerate = async () => {
     if (!scene) return;
+
+    const hasSelectedReference = referenceImages.some((r) => r.status === "ready" && r.selected);
+    if (editedPrompt.trim().length === 0 && !hasSelectedReference) {
+      toast({
+        title: "Prompt required",
+        description: "Add an image prompt or select a reference image.",
+        variant: "destructive",
+      });
+      return;
+    }
     
     if (hasChanges || hasCharacterStateChanges) {
       await handleSave();
     }
     
     await onRegenerate(scene.id);
+    startPromptRefreshBurst(scene.id);
   };
 
   const handleRegenerateStrictStyle = async () => {
     if (!scene || !onRegenerateStrictStyle) return;
+
+    const hasSelectedReference = referenceImages.some((r) => r.status === "ready" && r.selected);
+    if (editedPrompt.trim().length === 0 && !hasSelectedReference) {
+      toast({
+        title: "Prompt required",
+        description: "Add an image prompt or select a reference image.",
+        variant: "destructive",
+      });
+      return;
+    }
 
     if (hasChanges || hasCharacterStateChanges) {
       await handleSave();
     }
 
     await onRegenerateStrictStyle(scene.id);
+    startPromptRefreshBurst(scene.id);
   };
 
   const handleSubmitStyleMismatch = async () => {
@@ -220,8 +563,93 @@ export function SceneDetailModal({
     }
   };
 
-  const persistedDetails = isPlainObject(scene?.consistency_details) ? scene.consistency_details : null;
-  const persistedDebugRaw = isPlainObject(persistedDetails?.generation_debug) ? persistedDetails.generation_debug : null;
+  useEffect(() => {
+    if (!scene?.id || !isOpen) return;
+    
+    let cancelled = false;
+    void (async () => {
+      const ts = await fetchLatestSceneDetails(scene.id);
+      if (!cancelled && typeof ts === "number") lastKnownPromptTsRef.current = ts;
+    })();
+    return () => {
+      cancelled = true;
+    };
+  }, [scene?.id, isOpen, refreshTrigger, fetchLatestSceneDetails]);
+
+  const sceneDetails = (() => {
+    const raw = scene?.consistency_details;
+    if (isPlainObject(raw)) return raw;
+    if (typeof raw === "string") {
+      try {
+        const parsed = JSON.parse(raw) as unknown;
+        return isPlainObject(parsed) ? parsed : null;
+      } catch {
+        return null;
+      }
+    }
+    return null;
+  })();
+
+  const persistedDetails = (() => {
+    const direct = directSceneDetails;
+    const fromScene = sceneDetails;
+    if (!direct) return fromScene;
+    if (!fromScene) return direct;
+
+    const directGen = pickGenerationDebug(direct);
+    const sceneGen = pickGenerationDebug(fromScene);
+
+    const meaningful = (value: unknown) => {
+      if (typeof value === "string") return value.trim().length > 0;
+      if (typeof value === "number") return Number.isFinite(value);
+      if (typeof value === "boolean") return true;
+      if (Array.isArray(value)) return value.length > 0;
+      if (isPlainObject(value)) return Object.keys(value).length > 0;
+      return false;
+    };
+
+    const mergedGen = (() => {
+      if (!directGen && !sceneGen) return null;
+      const out: Record<string, unknown> = { ...(sceneGen ?? {}) };
+      for (const [k, v] of Object.entries(directGen ?? {})) {
+        if (meaningful(v)) out[k] = v;
+      }
+
+      const outPromptFull =
+        nonEmptyString(out.prompt_full) ?? nonEmptyString(out.promptFull);
+      const scenePromptFull =
+        nonEmptyString(sceneGen?.prompt_full) ?? nonEmptyString(sceneGen?.promptFull);
+      const directPromptFull =
+        nonEmptyString(directGen?.prompt_full) ?? nonEmptyString(directGen?.promptFull);
+
+      if (!scenePromptFull && directPromptFull) {
+        if (directGen?.timestamp !== undefined) out.timestamp = directGen.timestamp;
+      } else {
+        const directTs = safeDate(directGen?.timestamp)?.getTime();
+        const sceneTs = safeDate(sceneGen?.timestamp)?.getTime();
+        if (typeof directTs === "number" && typeof sceneTs === "number") {
+          out.timestamp = directTs >= sceneTs ? directGen?.timestamp : sceneGen?.timestamp;
+        } else if (typeof directTs === "number") {
+          out.timestamp = directGen?.timestamp;
+        } else if (typeof sceneTs === "number") {
+          out.timestamp = sceneGen?.timestamp;
+        }
+      }
+
+      if (!outPromptFull && directPromptFull) {
+        out.prompt_full = directPromptFull;
+      }
+
+      return out;
+    })();
+
+    const merged: Record<string, unknown> = { ...fromScene, ...direct };
+    if (mergedGen) merged.generation_debug = mergedGen;
+    return merged;
+  })();
+  const persistedDebugRaw = (() => {
+    return pickGenerationDebug(persistedDetails ?? undefined);
+  })();
 
   const debugInfoRequestParams =
     debugInfo && "requestParams" in debugInfo && isPlainObject((debugInfo as Record<string, unknown>).requestParams)
@@ -230,6 +658,30 @@ export function SceneDetailModal({
 
   const requestParams =
     debugInfoRequestParams ?? (isPlainObject(persistedDebugRaw?.requestParams) ? persistedDebugRaw.requestParams : undefined);
+
+  const promptFromHistory = (() => {
+    const latest = promptOptimizations[0];
+    if (!latest) return { used: undefined, full: undefined, raw: undefined };
+
+    const opt = latest.optimized_prompt as Record<string, unknown> | null;
+    const app = opt?.app_prompt as Record<string, unknown> | undefined;
+
+    return {
+      used: typeof app?.used === "string" ? app.used : undefined,
+      full: typeof app?.full === "string" ? app.full : undefined,
+      raw: typeof app?.raw === "string" ? app.raw : undefined,
+    };
+  })();
+
+  const promptFromDebugHistory = (() => {
+    const params = requestParams as Record<string, unknown> | undefined;
+    const prompt = params?.prompt;
+
+    return {
+      used: typeof prompt === "string" ? prompt : undefined,
+      full: undefined,
+    };
+  })();
 
   const debug = {
     headers:
@@ -295,19 +747,199 @@ export function SceneDetailModal({
       (typeof persistedDetails?.upstream_error === "string" ? persistedDetails.upstream_error : undefined) ??
       (typeof persistedDetails?.upstreamError === "string" ? persistedDetails.upstreamError : undefined),
     prompt:
-      (debugInfo && 'prompt' in debugInfo && typeof debugInfo.prompt === "string" ? debugInfo.prompt : undefined) ??
-      (typeof persistedDebugRaw?.prompt === "string" ? persistedDebugRaw.prompt : undefined) ??
-      (typeof persistedDebugRaw?.prompt_used === "string" ? persistedDebugRaw.prompt_used : undefined) ??
-      (typeof persistedDetails?.prompt === "string" ? persistedDetails.prompt : undefined),
+      nonEmptyString(debugInfo?.prompt) ??
+      nonEmptyString(persistedDebugRaw?.prompt) ??
+      nonEmptyString(persistedDebugRaw?.prompt_used) ??
+      nonEmptyString(persistedDetails?.prompt) ??
+      promptFromDebugHistory.used ??
+      promptFromHistory.used ??
+      promptFromHistory.full,
+    promptFull:
+      (() => {
+        const used =
+          nonEmptyString(debugInfo?.prompt) ??
+          nonEmptyString(persistedDebugRaw?.prompt) ??
+          nonEmptyString(persistedDebugRaw?.prompt_used) ??
+          nonEmptyString(persistedDetails?.prompt) ??
+          promptFromDebugHistory.used ??
+          promptFromHistory.used ??
+          promptFromHistory.full;
+
+        const fromDebug =
+          nonEmptyString(debugInfo?.promptFull) ??
+          nonEmptyString((debugInfo as Record<string, unknown> | undefined)?.prompt_full) ??
+          nonEmptyString((persistedDebugRaw as Record<string, unknown> | null)?.prompt_full) ??
+          nonEmptyString((persistedDebugRaw as Record<string, unknown> | null)?.promptFull) ??
+          nonEmptyString(persistedDetails?.prompt_full) ??
+          nonEmptyString(persistedDetails?.promptFull) ??
+          promptFromDebugHistory.full;
+
+        if (promptFromHistory.raw && (!fromDebug || (used && fromDebug === used))) return promptFromHistory.raw;
+        return fromDebug ?? promptFromHistory.raw ?? promptFromHistory.full;
+      })(),
+    preprocessingSteps:
+      (debugInfo && "preprocessingSteps" in debugInfo && Array.isArray(debugInfo.preprocessingSteps)
+        ? debugInfo.preprocessingSteps.filter((v): v is string => typeof v === "string")
+        : undefined) ??
+      (Array.isArray((persistedDebugRaw as Record<string, unknown> | null)?.preprocessingSteps)
+        ? (((persistedDebugRaw as Record<string, unknown>).preprocessingSteps as unknown[]) || []).filter(
+            (v): v is string => typeof v === "string",
+          )
+        : undefined),
+    model:
+      (debugInfo && "model" in debugInfo && typeof debugInfo.model === "string" ? debugInfo.model : undefined) ??
+      (typeof (persistedDebugRaw as Record<string, unknown> | null)?.model === "string"
+        ? ((persistedDebugRaw as Record<string, unknown>).model as string)
+        : undefined),
+    modelConfig:
+      (debugInfo && "modelConfig" in debugInfo ? debugInfo.modelConfig : undefined) ??
+      ((persistedDebugRaw as Record<string, unknown> | null)?.model_config ??
+        (persistedDebugRaw as Record<string, unknown> | null)?.modelConfig),
+    promptHash:
+      (debugInfo && "promptHash" in debugInfo && typeof debugInfo.promptHash === "string" ? debugInfo.promptHash : undefined) ??
+      (typeof (persistedDebugRaw as Record<string, unknown> | null)?.prompt_hash === "string"
+        ? ((persistedDebugRaw as Record<string, unknown>).prompt_hash as string)
+        : undefined),
+    promptHistory: debugInfo && "promptHistory" in debugInfo ? (debugInfo as Record<string, unknown>).promptHistory : undefined,
   };
 
-  const [failedPromptEdit, setFailedPromptEdit] = useState("");
-  
   useEffect(() => {
-    if (debug.prompt) {
-      setFailedPromptEdit(debug.prompt);
+    const t = debug.timestamp?.getTime();
+    if (typeof t === "number") lastKnownPromptTsRef.current = t;
+  }, [debug.timestamp]);
+
+  const startPromptRefreshBurst = useCallback(
+    (sceneId: string) => {
+      const seq = (refreshBurstSeqRef.current += 1);
+      const baseline = lastKnownPromptTsRef.current;
+      const deadline = Date.now() + 45_000;
+      setRefreshTrigger((v) => v + 1);
+
+      void (async () => {
+        while (refreshBurstSeqRef.current === seq && isOpen && Date.now() < deadline) {
+          const ts = await fetchLatestSceneDetails(sceneId);
+          if (!promptOptimizationsUnavailable) await fetchLatestPromptOptimizations(sceneId);
+          if (typeof ts === "number") lastKnownPromptTsRef.current = ts;
+          if (typeof ts === "number" && ts > baseline) break;
+          await new Promise<void>((resolve) => window.setTimeout(resolve, 1500));
+        }
+      })();
+    },
+    [fetchLatestPromptOptimizations, fetchLatestSceneDetails, isOpen, promptOptimizationsUnavailable],
+  );
+
+  useEffect(() => {
+    if (!scene?.id || !isOpen) return;
+
+    const channel = supabase.channel(`scene_modal_prompt_${scene.id}`);
+    const bump = () => setRefreshTrigger((v) => v + 1);
+
+    channel.on(
+      "postgres_changes",
+      { event: "UPDATE", schema: "public", table: "scenes", filter: `id=eq.${scene.id}` },
+      () => bump(),
+    );
+    if (!promptOptimizationsUnavailable) {
+      channel.on(
+        "postgres_changes",
+        { event: "INSERT", schema: "public", table: "prompt_optimizations", filter: `scene_id=eq.${scene.id}` },
+        () => bump(),
+      );
+      channel.on(
+        "postgres_changes",
+        { event: "UPDATE", schema: "public", table: "prompt_optimizations", filter: `scene_id=eq.${scene.id}` },
+        () => bump(),
+      );
     }
-  }, [debug.prompt]);
+
+    channel.subscribe();
+    return () => {
+      void supabase.removeChannel(channel);
+    };
+  }, [scene?.id, isOpen, promptOptimizationsUnavailable]);
+
+  useEffect(() => {
+    if (!scene?.id || !isOpen) return;
+    if (!isGenerating) return;
+    startPromptRefreshBurst(scene.id);
+  }, [isGenerating, isOpen, scene?.id, startPromptRefreshBurst]);
+
+  const userChangedPromptViewRef = useRef(false);
+  const lastAutoExpandKeyRef = useRef<string | null>(null);
+  useEffect(() => {
+    if (!scene?.id) return;
+    const ts = debug.timestamp?.toISOString();
+    if (!ts) return;
+    const key = `${scene.id}:${ts}`;
+    if (lastAutoExpandKeyRef.current === key) return;
+    lastAutoExpandKeyRef.current = key;
+
+    const hasAnyPrompt = Boolean(nonEmptyString(debug.promptFull) ?? nonEmptyString(debug.prompt));
+    if (!hasAnyPrompt) return;
+    if (scene.generation_status !== "completed" && scene.generation_status !== "error") return;
+
+    setIsDebugExpanded(true);
+  }, [scene?.id, scene?.generation_status, debug.prompt, debug.promptFull, debug.timestamp]);
+
+  useEffect(() => {
+    if (!scene?.id) return;
+    userChangedPromptViewRef.current = false;
+    setPromptTextView("full");
+  }, [scene?.id]);
+
+  useEffect(() => {
+    const fullCandidate = nonEmptyString(debug.promptFull) ?? promptFromHistory.raw ?? promptFromHistory.full;
+    const sentCandidate = nonEmptyString(debug.prompt) ?? promptFromHistory.used;
+    const next =
+      promptTextView === "full"
+        ? (fullCandidate ?? sentCandidate ?? "")
+        : (sentCandidate ?? fullCandidate ?? "");
+    setFailedPromptEdit(next);
+  }, [debug.prompt, debug.promptFull, promptTextView, promptFromHistory.full, promptFromHistory.raw, promptFromHistory.used]);
+
+  useEffect(() => {
+    let cancelled = false;
+    const run = async () => {
+      if (!debug.prompt || !debug.promptHash || !window.crypto?.subtle) {
+        if (!cancelled) setPromptHashState("unavailable");
+        return;
+      }
+      try {
+        const bytes = new TextEncoder().encode(debug.prompt);
+        const hash = await window.crypto.subtle.digest("SHA-256", bytes);
+        const hex = Array.from(new Uint8Array(hash))
+          .map((b) => b.toString(16).padStart(2, "0"))
+          .join("");
+        if (!cancelled) setPromptHashState(hex === debug.promptHash ? "match" : "mismatch");
+      } catch {
+        if (!cancelled) setPromptHashState("unavailable");
+      }
+    };
+    void run();
+    return () => {
+      cancelled = true;
+    };
+  }, [debug.prompt, debug.promptHash]);
+
+  useEffect(() => {
+    if (!scene?.id || !isOpen) return;
+    if (promptOptimizationsUnavailable) return;
+    
+    let cancelled = false;
+    const run = async () => {
+      try {
+        await fetchLatestPromptOptimizations(scene.id);
+      } catch (e) {
+        if (cancelled) return;
+        setPromptOptimizations([]);
+        setPromptOptimizationError(e instanceof Error ? e.message : "Failed to load prompt history");
+      }
+    };
+    void run();
+    return () => {
+      cancelled = true;
+    };
+  }, [scene?.id, isOpen, refreshTrigger, fetchLatestPromptOptimizations, promptOptimizationsUnavailable]);
 
   let detailedError: DetailedError | null = null;
   try {
@@ -424,6 +1056,804 @@ export function SceneDetailModal({
     }
   };
 
+  const referencePersistKey = scene?.id ? `reference-images:${scene.id}` : null;
+
+  useEffect(() => {
+    if (!referencePersistKey) return;
+    try {
+      const raw = sessionStorage.getItem(referencePersistKey);
+      if (!raw) return;
+      const parsed = JSON.parse(raw) as unknown;
+      if (!Array.isArray(parsed)) return;
+      const next: ReferenceImageItem[] = parsed
+        .filter((v) => typeof v === "object" && v !== null)
+        .map((v) => v as Partial<ReferenceImageItem>)
+        .filter((v) => typeof v.id === "string" && typeof v.fileName === "string")
+        .map((v) => ({
+          id: String(v.id),
+          fileName: String(v.fileName),
+          status: "ready",
+          progress: 100,
+          url: typeof v.url === "string" ? v.url : undefined,
+          thumbUrl: typeof v.thumbUrl === "string" ? v.thumbUrl : undefined,
+          bucket: typeof v.bucket === "string" ? v.bucket : undefined,
+          objectPath: typeof v.objectPath === "string" ? v.objectPath : undefined,
+          thumbPath: typeof v.thumbPath === "string" ? v.thumbPath : undefined,
+          width: typeof v.width === "number" ? v.width : null,
+          height: typeof v.height === "number" ? v.height : null,
+          selected: typeof v.selected === "boolean" ? v.selected : false,
+          zoom: typeof v.zoom === "number" ? v.zoom : 1,
+          panX: typeof v.panX === "number" ? v.panX : 0,
+          panY: typeof v.panY === "number" ? v.panY : 0,
+        }));
+      setReferenceImages(next);
+      const firstSelected = next.find((r) => r.selected)?.id ?? next[0]?.id ?? null;
+      setActiveReferenceId(firstSelected);
+    } catch {
+      sessionStorage.removeItem(referencePersistKey);
+    }
+  }, [referencePersistKey]);
+
+  useEffect(() => {
+    if (!referencePersistKey) return;
+    const toSave = referenceImages
+      .filter((r) => r.status === "ready")
+      .map((r) => ({
+        id: r.id,
+        fileName: r.fileName,
+        url: r.url,
+        thumbUrl: r.thumbUrl,
+        bucket: r.bucket,
+        objectPath: r.objectPath,
+        thumbPath: r.thumbPath,
+        width: r.width ?? null,
+        height: r.height ?? null,
+        selected: r.selected,
+        zoom: r.zoom,
+        panX: r.panX,
+        panY: r.panY,
+      }));
+    sessionStorage.setItem(referencePersistKey, JSON.stringify(toSave));
+  }, [referenceImages, referencePersistKey]);
+
+  useEffect(() => {
+    if (!scene?.id) return;
+    const details = isPlainObject(scene?.consistency_details) ? scene?.consistency_details : null;
+    const refsRaw = details && "reference_images" in details ? (details as Record<string, unknown>).reference_images : null;
+    const sceneRefs =
+      Array.isArray(refsRaw)
+        ? refsRaw
+            .filter((v) => typeof v === "object" && v !== null)
+            .map((v) => v as Record<string, unknown>)
+            .filter((v) => typeof v.id === "string" && typeof v.fileName === "string")
+            .map((v) => ({
+              id: String(v.id),
+              fileName: String(v.fileName),
+              bucket: typeof v.bucket === "string" ? v.bucket : undefined,
+              objectPath: typeof v.objectPath === "string" ? v.objectPath : undefined,
+              thumbPath: typeof v.thumbPath === "string" ? v.thumbPath : undefined,
+              width: typeof v.width === "number" ? v.width : null,
+              height: typeof v.height === "number" ? v.height : null,
+              selected: typeof v.selected === "boolean" ? v.selected : false,
+            }))
+        : [];
+    if (sceneRefs.length === 0) return;
+
+    const next: ReferenceImageItem[] = sceneRefs.map((v) => ({
+      id: v.id,
+      fileName: v.fileName,
+      status: "ready",
+      progress: 100,
+      url: undefined,
+      thumbUrl: undefined,
+      bucket: v.bucket,
+      objectPath: v.objectPath,
+      thumbPath: v.thumbPath,
+      width: v.width ?? null,
+      height: v.height ?? null,
+      selected: v.selected,
+      zoom: 1,
+      panX: 0,
+      panY: 0,
+    }));
+
+    setReferenceImages((prev) => {
+      const prevUploading = prev.filter((r) => r.status === "uploading");
+      return [...next, ...prevUploading];
+    });
+    setActiveReferenceId((curr) => curr ?? next.find((r) => r.selected)?.id ?? next[0]?.id ?? null);
+    lastPersistedReferencesRef.current = JSON.stringify(
+      sceneRefs.map((r) => ({
+        id: r.id,
+        fileName: r.fileName,
+        bucket: r.bucket,
+        objectPath: r.objectPath,
+        thumbPath: r.thumbPath,
+        width: r.width ?? null,
+        height: r.height ?? null,
+        selected: r.selected,
+      })),
+    );
+
+    const refresh = async () => {
+      const toSign = sceneRefs.filter((r) => r.objectPath && r.thumbPath);
+      if (toSign.length === 0) return;
+      const { data: sessionData } = await supabase.auth.getSession();
+      const session = sessionData.session;
+      if (!session) return;
+
+      const { data, error } = await supabase.functions.invoke("upload-reference-image", {
+        body: {
+          action: "sign",
+          items: toSign.map((r) => ({
+            id: r.id,
+            bucket: r.bucket,
+            objectPath: r.objectPath,
+            thumbPath: r.thumbPath,
+          })),
+        },
+        headers: { Authorization: `Bearer ${session.access_token}` },
+      });
+
+      if (error) return;
+      const resp = data as { success?: boolean; items?: Array<{ id: string; url?: string; thumbUrl?: string }> } | null;
+      const signed = resp?.items ?? [];
+      if (!Array.isArray(signed) || signed.length === 0) return;
+
+      const byId = new Map(signed.filter((v) => v && typeof v.id === "string").map((v) => [v.id, v]));
+      setReferenceImages((prev) =>
+        prev.map((r) => {
+          const nextItem = byId.get(r.id);
+          if (!nextItem) return r;
+          return {
+            ...r,
+            url: typeof nextItem.url === "string" ? nextItem.url : r.url,
+            thumbUrl: typeof nextItem.thumbUrl === "string" ? nextItem.thumbUrl : r.thumbUrl,
+          };
+        }),
+      );
+    };
+    void refresh();
+  }, [scene?.id, scene?.consistency_details]);
+
+  useEffect(() => {
+    if (!scene?.id) return;
+    const ready = referenceImages
+      .filter((r) => r.status === "ready" && r.objectPath && r.thumbPath)
+      .map((r) => ({
+        id: r.id,
+        fileName: r.fileName,
+        bucket: r.bucket,
+        objectPath: r.objectPath,
+        thumbPath: r.thumbPath,
+        width: r.width ?? null,
+        height: r.height ?? null,
+        selected: r.selected,
+      }));
+    const nextStr = JSON.stringify(ready);
+    if (nextStr === lastPersistedReferencesRef.current) return;
+
+    const timer = window.setTimeout(async () => {
+      const existingFromState = persistedDetails;
+      const existing =
+        existingFromState ??
+        (await (async () => {
+          try {
+            const { data } = await supabase.from("scenes").select("consistency_details").eq("id", scene.id).single();
+            const raw = data?.consistency_details;
+            if (isPlainObject(raw)) return raw;
+            if (typeof raw === "string") {
+              const parsed = JSON.parse(raw) as unknown;
+              return isPlainObject(parsed) ? parsed : null;
+            }
+            return null;
+          } catch {
+            return null;
+          }
+        })());
+
+      if (!existing) return;
+      const merged = { ...existing, reference_images: ready };
+      const { error } = await supabase.from("scenes").update({ consistency_details: merged }).eq("id", scene.id);
+      if (error) return;
+      lastPersistedReferencesRef.current = nextStr;
+    }, 800);
+
+    return () => window.clearTimeout(timer);
+  }, [referenceImages, scene?.id, persistedDetails]);
+
+  const updateReference = (id: string, patch: Partial<ReferenceImageItem>) => {
+    setReferenceImages((prev) => prev.map((r) => (r.id === id ? { ...r, ...patch } : r)));
+  };
+
+  const addReference = (item: ReferenceImageItem) => {
+    setReferenceImages((prev) => [...prev, item]);
+  };
+
+  const removeReferenceLocal = (id: string) => {
+    setReferenceImages((prev) => {
+      const toRemove = prev.find((r) => r.id === id);
+      if (toRemove?.localThumbUrl) URL.revokeObjectURL(toRemove.localThumbUrl);
+      const next = prev.filter((r) => r.id !== id);
+      setActiveReferenceId((curr) => (curr === id ? next.find((r) => r.selected)?.id ?? next[0]?.id ?? null : curr));
+      return next;
+    });
+  };
+
+  const uploadReferenceFile = async (sceneId: string, file: File, onProgress?: (pct: number) => void) => {
+    const { data: sessionData } = await supabase.auth.getSession();
+    const session = sessionData.session;
+    if (!session) throw new Error("Not authenticated");
+
+    const supabaseUrl = import.meta.env.VITE_SUPABASE_URL as string | undefined;
+    const supabaseAnonKey = import.meta.env.VITE_SUPABASE_ANON_KEY as string | undefined;
+    if (!supabaseUrl || !supabaseAnonKey) throw new Error("Missing Supabase configuration");
+
+    const endpoint = `${supabaseUrl.replace(/\/$/, "")}/functions/v1/upload-reference-image`;
+    const form = new FormData();
+    form.append("action", "upload");
+    form.append("sceneId", sceneId);
+    form.append("file", file);
+
+    return await new Promise<{
+      success: boolean;
+      id: string;
+      bucket: string;
+      objectPath: string;
+      thumbPath: string;
+      url: string;
+      thumbUrl: string;
+      width: number | null;
+      height: number | null;
+      originalName: string;
+    }>((resolve, reject) => {
+      const xhr = new XMLHttpRequest();
+      xhr.open("POST", endpoint);
+      xhr.setRequestHeader("Authorization", `Bearer ${session.access_token}`);
+      xhr.setRequestHeader("apikey", supabaseAnonKey);
+      xhr.responseType = "json";
+      xhr.upload.onprogress = (e) => {
+        if (!e.lengthComputable) return;
+        const pct = Math.max(0, Math.min(100, Math.round((e.loaded / e.total) * 100)));
+        onProgress?.(pct);
+      };
+      xhr.onload = () => {
+        const status = xhr.status;
+        const body = xhr.response as unknown;
+        if (status >= 200 && status < 300 && body && typeof body === "object") {
+          resolve(body as {
+            success: boolean;
+            id: string;
+            bucket: string;
+            objectPath: string;
+            thumbPath: string;
+            url: string;
+            thumbUrl: string;
+            width: number | null;
+            height: number | null;
+            originalName: string;
+          });
+          return;
+        }
+        const errMsg = (() => {
+          if (body && typeof body === "object" && "error" in body) {
+            const msg = (body as { error?: unknown }).error;
+            if (typeof msg === "string" && msg.trim()) return msg;
+          }
+          return `Upload failed (HTTP ${status})`;
+        })();
+        reject(new Error(errMsg));
+      };
+      xhr.onerror = () => reject(new Error("Network error during upload"));
+      xhr.send(form);
+    });
+  };
+
+  const handleReferenceFiles = async (files: File[]) => {
+    if (!scene?.id) return;
+    for (const file of files) {
+      const validation = validateSceneReferenceImageCandidate({ name: file.name, size: file.size, type: file.type });
+      if (validation.ok === false) {
+        toast({ title: validation.error, description: file.name, variant: "destructive" });
+        continue;
+      }
+
+      const id = crypto.randomUUID();
+      const localThumbUrl = URL.createObjectURL(file);
+      addReference({
+        id,
+        fileName: file.name,
+        status: "uploading",
+        progress: 0,
+        selected: true,
+        zoom: 1,
+        panX: 0,
+        panY: 0,
+        localThumbUrl,
+      });
+      setActiveReferenceId(id);
+
+      try {
+        const resp = await uploadReferenceFile(scene.id, file, (pct) => updateReference(id, { progress: pct }));
+        updateReference(id, {
+          status: "ready",
+          progress: 100,
+          url: resp.url,
+          thumbUrl: resp.thumbUrl,
+          bucket: resp.bucket,
+          objectPath: resp.objectPath,
+          thumbPath: resp.thumbPath,
+          width: resp.width,
+          height: resp.height,
+          fileName: resp.originalName || file.name,
+        });
+      } catch (e) {
+        updateReference(id, {
+          status: "error",
+          error: e instanceof Error ? e.message : "Upload failed",
+          progress: 0,
+        });
+      }
+    }
+  };
+
+  const deleteReferenceOnServer = async (item: ReferenceImageItem) => {
+    if (!item.objectPath || !scene?.id) return;
+    const { data: sessionData } = await supabase.auth.getSession();
+    const session = sessionData.session;
+    if (!session) throw new Error("Not authenticated");
+
+    const supabaseUrl = import.meta.env.VITE_SUPABASE_URL as string | undefined;
+    const supabaseAnonKey = import.meta.env.VITE_SUPABASE_ANON_KEY as string | undefined;
+    if (!supabaseUrl || !supabaseAnonKey) throw new Error("Missing Supabase configuration");
+
+    const endpoint = `${supabaseUrl.replace(/\/$/, "")}/functions/v1/upload-reference-image`;
+    const form = new FormData();
+    form.append("action", "delete");
+    form.append("bucket", item.bucket || "reference-images");
+    form.append("objectPath", item.objectPath);
+    if (item.thumbPath) form.append("thumbPath", item.thumbPath);
+    await new Promise<void>((resolve, reject) => {
+      const xhr = new XMLHttpRequest();
+      xhr.open("POST", endpoint);
+      xhr.setRequestHeader("Authorization", `Bearer ${session.access_token}`);
+      xhr.setRequestHeader("apikey", supabaseAnonKey);
+      xhr.responseType = "json";
+      xhr.onload = () => {
+        if (xhr.status >= 200 && xhr.status < 300) {
+          resolve();
+          return;
+        }
+        const body = xhr.response as unknown;
+        const msg =
+          body && typeof body === "object" && body !== null && "error" in body && typeof (body as { error?: unknown }).error === "string"
+            ? String((body as { error?: unknown }).error)
+            : `Delete failed (HTTP ${xhr.status})`;
+        reject(new Error(msg));
+      };
+      xhr.onerror = () => reject(new Error("Network error during delete"));
+      xhr.send(form);
+    });
+  };
+
+  const toggleReferenceSelected = (id: string) => {
+    setReferenceImages((prev) =>
+      prev.map((r) => (r.id === id ? { ...r, selected: !r.selected } : r)),
+    );
+    setActiveReferenceId(id);
+  };
+
+  const zoomReference = (id: string, delta: number) => {
+    setReferenceImages((prev) =>
+      prev.map((r) => {
+        if (r.id !== id) return r;
+        const nextZoom = Math.max(1, Math.min(6, Number.isFinite(r.zoom + delta) ? r.zoom + delta : r.zoom));
+        return { ...r, zoom: nextZoom };
+      }),
+    );
+  };
+
+  const resetReferenceTransform = (id: string) => {
+    updateReference(id, { zoom: 1, panX: 0, panY: 0 });
+  };
+
+  const onReferencePointerDown = (e: ReactPointerEvent<HTMLDivElement>, id: string) => {
+    const pt = { x: e.clientX, y: e.clientY };
+    referencePointersRef.current.set(e.pointerId, pt);
+    (e.currentTarget as HTMLElement).setPointerCapture(e.pointerId);
+    const pointers = Array.from(referencePointersRef.current.values());
+    const item = referenceImages.find((r) => r.id === id);
+    if (!item) return;
+    if (pointers.length === 2) {
+      const [a, b] = pointers;
+      const dist = Math.hypot(b.x - a.x, b.y - a.y);
+      referencePanStartRef.current = { panX: item.panX, panY: item.panY, startX: e.clientX, startY: e.clientY, dist, zoom: item.zoom };
+    } else {
+      referencePanStartRef.current = { panX: item.panX, panY: item.panY, startX: e.clientX, startY: e.clientY };
+    }
+  };
+
+  const onReferencePointerMove = (e: ReactPointerEvent<HTMLDivElement>, id: string) => {
+    if (!referencePointersRef.current.has(e.pointerId)) return;
+    referencePointersRef.current.set(e.pointerId, { x: e.clientX, y: e.clientY });
+    const pointers = Array.from(referencePointersRef.current.values());
+    const start = referencePanStartRef.current;
+    const item = referenceImages.find((r) => r.id === id);
+    if (!start || !item) return;
+
+    if (pointers.length === 2 && typeof start.dist === "number" && typeof start.zoom === "number") {
+      const [a, b] = pointers;
+      const dist = Math.max(1, Math.hypot(b.x - a.x, b.y - a.y));
+      const ratio = dist / Math.max(1, start.dist);
+      const nextZoom = Math.max(1, Math.min(6, start.zoom * ratio));
+      updateReference(id, { zoom: nextZoom });
+      return;
+    }
+
+    if (pointers.length === 1) {
+      const dx = e.clientX - start.startX;
+      const dy = e.clientY - start.startY;
+      updateReference(id, { panX: start.panX + dx, panY: start.panY + dy });
+    }
+  };
+
+  const onReferencePointerUp = (e: ReactPointerEvent<HTMLDivElement>) => {
+    referencePointersRef.current.delete(e.pointerId);
+    if (referencePointersRef.current.size === 0) {
+      referencePanStartRef.current = null;
+      return;
+    }
+    if (referencePointersRef.current.size === 1) {
+      const remaining = Array.from(referencePointersRef.current.values())[0]!;
+      const item = referenceImages.find((r) => r.id === activeReferenceId);
+      if (item) {
+        referencePanStartRef.current = { panX: item.panX, panY: item.panY, startX: remaining.x, startY: remaining.y };
+      }
+    }
+  };
+
+  const onReferenceWheel = (e: ReactWheelEvent<HTMLDivElement>, id: string) => {
+    e.preventDefault();
+    const dir = e.deltaY > 0 ? -1 : 1;
+    zoomReference(id, dir * 0.25);
+  };
+
+  const handleReferenceDrag = (e: ReactDragEvent) => {
+    e.preventDefault();
+    e.stopPropagation();
+    if (e.type === "dragenter" || e.type === "dragover") setIsReferenceDragging(true);
+    if (e.type === "dragleave") setIsReferenceDragging(false);
+  };
+
+  const handleReferenceDrop = (e: ReactDragEvent) => {
+    e.preventDefault();
+    e.stopPropagation();
+    setIsReferenceDragging(false);
+    const dropped = Array.from(e.dataTransfer.files || []);
+    void handleReferenceFiles(dropped);
+  };
+
+  const parseDataUrl = (dataUrl: string) => {
+    const match = dataUrl.match(/^data:([^;]+);base64,(.*)$/);
+    if (!match) return null;
+    return { mime: match[1], base64: match[2] };
+  };
+
+  const reencodeDataUrl = async (args: { dataUrl: string; targetMime: string; width?: number | null; height?: number | null }) => {
+    const img = new Image();
+    await new Promise<void>((resolve, reject) => {
+      img.onload = () => resolve();
+      img.onerror = () => reject(new Error("Failed to load image"));
+      img.src = args.dataUrl;
+    });
+
+    const width = typeof args.width === "number" && args.width > 0 ? Math.floor(args.width) : img.naturalWidth;
+    const height = typeof args.height === "number" && args.height > 0 ? Math.floor(args.height) : img.naturalHeight;
+
+    const canvas = document.createElement("canvas");
+    canvas.width = width;
+    canvas.height = height;
+    const ctx = canvas.getContext("2d");
+    if (!ctx) throw new Error("Canvas not supported");
+    ctx.drawImage(img, 0, 0, width, height);
+
+    const blob = await new Promise<Blob>((resolve, reject) => {
+      const quality = args.targetMime === "image/jpeg" ? 0.92 : undefined;
+      canvas.toBlob(
+        (b) => (b ? resolve(b) : reject(new Error("Failed to encode image"))),
+        args.targetMime,
+        quality,
+      );
+    });
+
+    const bytes = new Uint8Array(await blob.arrayBuffer());
+    const chunkSize = 0x8000;
+    let binary = "";
+    for (let i = 0; i < bytes.length; i += chunkSize) {
+      const chunk = bytes.subarray(i, i + chunkSize);
+      binary += String.fromCharCode(...chunk);
+    }
+    const base64 = btoa(binary);
+    return { base64, mime: args.targetMime, byteSize: blob.size };
+  };
+
+  const blobToDataUrl = async (blob: Blob) => {
+    const bytes = new Uint8Array(await blob.arrayBuffer());
+    const chunkSize = 0x8000;
+    let binary = "";
+    for (let i = 0; i < bytes.length; i += chunkSize) {
+      const chunk = bytes.subarray(i, i + chunkSize);
+      binary += String.fromCharCode(...chunk);
+    }
+    const base64 = btoa(binary);
+    const mime = blob.type || "image/png";
+    return { dataUrl: `data:${mime};base64,${base64}`, byteSize: blob.size, mime };
+  };
+
+  const fetchImageAsDataUrl = async (url: string) => {
+    const res = await fetch(url, { mode: "cors" });
+    if (!res.ok) throw new Error(`Failed to load image (HTTP ${res.status})`);
+    const blob = await res.blob();
+    return blobToDataUrl(blob);
+  };
+
+  const getDisplayedImageRect = () => {
+    const container = imageContainerRef.current;
+    const nat = naturalSize;
+    if (!container || !nat) return null;
+    const rect = container.getBoundingClientRect();
+    const cw = rect.width;
+    const ch = rect.height;
+    if (cw <= 0 || ch <= 0) return null;
+    const ir = nat.w / nat.h;
+    const cr = cw / ch;
+    let dw = cw;
+    let dh = ch;
+    let dx = 0;
+    let dy = 0;
+    if (ir > cr) {
+      dw = cw;
+      dh = cw / ir;
+      dy = (ch - dh) / 2;
+    } else {
+      dh = ch;
+      dw = ch * ir;
+      dx = (cw - dw) / 2;
+    }
+    return { left: rect.left + dx, top: rect.top + dy, width: dw, height: dh };
+  };
+
+  const clientToNormalized = (clientX: number, clientY: number) => {
+    const r = getDisplayedImageRect();
+    if (!r) return null;
+    const x = (clientX - r.left) / r.width;
+    const y = (clientY - r.top) / r.height;
+    const clamp01 = (n: number) => Math.max(0, Math.min(1, n));
+    return { x: clamp01(x), y: clamp01(y) };
+  };
+
+  const startSelection = (e: ReactPointerEvent<HTMLDivElement>) => {
+    if (!isSelecting) return;
+    const pt = clientToNormalized(e.clientX, e.clientY);
+    if (!pt) return;
+    selectionStartRef.current = pt;
+    setSelection({ x: pt.x, y: pt.y, w: 0, h: 0 });
+    (e.currentTarget as HTMLElement).setPointerCapture(e.pointerId);
+  };
+
+  const moveSelection = (e: ReactPointerEvent<HTMLDivElement>) => {
+    const start = selectionStartRef.current;
+    if (!isSelecting || !start) return;
+    const pt = clientToNormalized(e.clientX, e.clientY);
+    if (!pt) return;
+    setSelection({
+      x: Math.min(start.x, pt.x),
+      y: Math.min(start.y, pt.y),
+      w: Math.abs(pt.x - start.x),
+      h: Math.abs(pt.y - start.y),
+    });
+  };
+
+  const endSelection = () => {
+    selectionStartRef.current = null;
+    setSelection((prev) => {
+      if (!prev) return prev;
+      if (prev.w <= 0.01 || prev.h <= 0.01) return null;
+      return prev;
+    });
+  };
+
+  const openImageEditor = async () => {
+    if (!scene?.image_url) return;
+    setIsImageEditorOpen(true);
+    setPreviewMode("current");
+    if (imageHistory.length > 0) return;
+    setIsPreparingEditor(true);
+    try {
+      const { dataUrl, byteSize } = await fetchImageAsDataUrl(scene.image_url);
+      const nat = naturalSize ?? (imageRef.current ? { w: imageRef.current.naturalWidth, h: imageRef.current.naturalHeight } : null);
+      if (nat) {
+        const check = validateVeniceImageConstraints({ width: nat.w, height: nat.h, byteSize });
+        if (check.ok === false) {
+          toast({ title: "Image cannot be edited", description: check.reason, variant: "destructive" });
+          setIsImageEditorOpen(false);
+          return;
+        }
+      }
+      setImageHistory([dataUrl]);
+      setHistoryIndex(0);
+    } catch (e) {
+      toast({ title: "Failed to load image", description: e instanceof Error ? e.message : "Could not prepare editor", variant: "destructive" });
+      setIsImageEditorOpen(false);
+    } finally {
+      setIsPreparingEditor(false);
+    }
+  };
+
+  const closeImageEditor = () => {
+    setIsImageEditorOpen(false);
+    setIsSelecting(false);
+    selectionStartRef.current = null;
+    setSelection(null);
+    setPreviewMode("current");
+    setImageHistory([]);
+    setHistoryIndex(0);
+  };
+
+  const undoEdit = () => {
+    setHistoryIndex((idx) => Math.max(0, idx - 1));
+    setPreviewMode("current");
+  };
+
+  const redoEdit = () => {
+    setHistoryIndex((idx) => Math.min(imageHistory.length - 1, idx + 1));
+    setPreviewMode("current");
+  };
+
+  const generatePreview = async () => {
+    if (!scene?.id || !scene.image_url) return;
+    const baseDataUrl = imageHistory[historyIndex];
+    if (!baseDataUrl) return;
+
+    const prompt = buildVeniceEditPrompt({
+      tool: editTool,
+      selection,
+      freeform: inpaintText,
+      objectToRemove: removeObjectText,
+      colorTarget: colorTargetText,
+      newColor: colorValueText,
+      toneTarget: toneTargetText,
+      brightness,
+      contrast,
+    });
+
+    if (!prompt.trim()) {
+      toast({ title: "Missing instructions", description: "Add edit instructions before previewing", variant: "destructive" });
+      return;
+    }
+
+    const parsed = parseDataUrl(baseDataUrl);
+    if (!parsed) {
+      toast({ title: "Invalid image", description: "Could not prepare image for editing", variant: "destructive" });
+      return;
+    }
+
+    const { data: sessionData } = await supabase.auth.getSession();
+    const session = sessionData.session;
+    if (!session) {
+      toast({ title: "Sign in required", description: "Please sign in to edit images", variant: "destructive" });
+      return;
+    }
+
+    setIsPreviewingEdit(true);
+    try {
+      const { data, error } = await supabase.functions.invoke("edit-scene-image", {
+        body: { mode: "preview", prompt, image_base64: parsed.base64 },
+        headers: { Authorization: `Bearer ${session.access_token}` },
+      });
+
+      if (error) {
+        toast({ title: "Edit failed", description: error.message || "Failed to preview edit", variant: "destructive" });
+        return;
+      }
+
+      const resp = data as { edited_image_base64?: string; mime?: string; upstreamError?: string; error?: string } | null;
+      if (!resp?.edited_image_base64 || !resp.mime) {
+        toast({ title: "Edit failed", description: resp?.error || resp?.upstreamError || "Invalid edit response", variant: "destructive" });
+        return;
+      }
+
+      const nextDataUrl = `data:${resp.mime};base64,${resp.edited_image_base64}`;
+      setImageHistory((prev) => {
+        const base = prev.slice(0, historyIndex + 1);
+        return [...base, nextDataUrl];
+      });
+      setHistoryIndex((idx) => idx + 1);
+      setPreviewMode("current");
+    } catch (e) {
+      toast({ title: "Edit failed", description: e instanceof Error ? e.message : "Failed to preview edit", variant: "destructive" });
+    } finally {
+      setIsPreviewingEdit(false);
+    }
+  };
+
+  const applyEdit = async () => {
+    if (!scene?.id) return;
+    if (historyIndex === 0) return;
+    const current = imageHistory[historyIndex];
+    const parsed = current ? parseDataUrl(current) : null;
+    if (!parsed) return;
+
+    const { data: sessionData } = await supabase.auth.getSession();
+    const session = sessionData.session;
+    if (!session) {
+      toast({ title: "Sign in required", description: "Please sign in to edit images", variant: "destructive" });
+      return;
+    }
+
+    setIsApplyingEdit(true);
+    try {
+      const originalParsed = imageHistory[0] ? parseDataUrl(imageHistory[0]) : null;
+      const targetMime =
+        normalizeImageMime(originalParsed?.mime ?? "") ??
+        inferImageMimeFromUrl(scene.image_url) ??
+        normalizeImageMime(parsed.mime) ??
+        "image/png";
+
+      const currentMime = normalizeImageMime(parsed.mime) ?? parsed.mime;
+      let commitBase64 = parsed.base64;
+      let commitMime = currentMime;
+
+      if (targetMime && targetMime !== currentMime) {
+        try {
+          const encoded = await reencodeDataUrl({
+            dataUrl: current,
+            targetMime,
+            width: naturalSize?.w,
+            height: naturalSize?.h,
+          });
+          commitBase64 = encoded.base64;
+          commitMime = encoded.mime;
+        } catch (e) {
+          console.warn("[SceneDetailModal] Failed to re-encode edited image:", e);
+        }
+      }
+
+      console.log("[SceneDetailModal] Applying edit", {
+        sceneId: scene.id,
+        historyIndex,
+        currentMime,
+        targetMime,
+        commitMime,
+        byteLen: commitBase64.length,
+      });
+
+      const { data, error } = await supabase.functions.invoke("edit-scene-image", {
+        body: { mode: "commit", sceneId: scene.id, edited_image_base64: commitBase64, edited_mime: commitMime },
+        headers: { Authorization: `Bearer ${session.access_token}` },
+      });
+
+      if (error) {
+        toast({ title: "Apply failed", description: error.message || "Failed to apply edit", variant: "destructive" });
+        return;
+      }
+
+      const resp = data as { imageUrl?: string; success?: boolean } | null;
+      if (!resp?.imageUrl) {
+        toast({ title: "Apply failed", description: "No image URL returned", variant: "destructive" });
+        return;
+      }
+
+      onImageEdited?.(scene.id, resp.imageUrl);
+      toast({ title: "Image updated", description: "Edits applied to the scene image" });
+      closeImageEditor();
+    } catch (e) {
+      toast({ title: "Apply failed", description: e instanceof Error ? e.message : "Failed to apply edit", variant: "destructive" });
+    } finally {
+      setIsApplyingEdit(false);
+    }
+  };
+
   const characterStateHistory = useMemo(() => {
     if (!scene) return {};
     const list = (allScenes || []).slice().sort((a, b) => a.scene_number - b.scene_number);
@@ -493,7 +1923,50 @@ export function SceneDetailModal({
     return out;
   }, [allScenes, characterStatesDraft, scene]);
 
+  const editorOriginal = imageHistory.length > 0 ? imageHistory[0] : null;
+  const editorCurrent = imageHistory.length > 0 ? imageHistory[historyIndex] : null;
+  const displayedImageSrc =
+    !isImageEditorOpen
+      ? scene?.image_url
+      : (previewMode === "original" ? editorOriginal : editorCurrent) ?? editorOriginal ?? scene?.image_url;
+
+  const selectionBoxStyle = useMemo(() => {
+    if (!isImageEditorOpen || !selection || !naturalSize) return null;
+    const container = imageContainerRef.current;
+    if (!container) return null;
+
+    const rect = container.getBoundingClientRect();
+    const cw = rect.width;
+    const ch = rect.height;
+    if (cw <= 0 || ch <= 0) return null;
+
+    const ir = naturalSize.w / naturalSize.h;
+    const cr = cw / ch;
+    let dw = cw;
+    let dh = ch;
+    let dx = 0;
+    let dy = 0;
+    if (ir > cr) {
+      dw = cw;
+      dh = cw / ir;
+      dy = (ch - dh) / 2;
+    } else {
+      dh = ch;
+      dw = ch * ir;
+      dx = (cw - dw) / 2;
+    }
+
+    return {
+      left: dx + selection.x * dw,
+      top: dy + selection.y * dh,
+      width: selection.w * dw,
+      height: selection.h * dh,
+    } as const;
+  }, [isImageEditorOpen, selection, naturalSize]);
+
   if (!scene) return null;
+
+  const activeReference = referenceImages.find((r) => r.id === activeReferenceId) ?? null;
 
   return (
     <Dialog open={isOpen} onOpenChange={(open) => !open && onClose()}>
@@ -512,12 +1985,65 @@ export function SceneDetailModal({
         <div className="grid gap-6 mt-4">
           {/* Image Section */}
           <div className="relative aspect-video rounded-lg overflow-hidden bg-secondary">
-            {scene.image_url ? (
-              <img
-                src={scene.image_url}
-                alt={scene.title || `Scene ${scene.scene_number}`}
-                className="w-full h-full object-contain"
-              />
+            {displayedImageSrc ? (
+              <div ref={imageContainerRef} className="absolute inset-0">
+                <img
+                  ref={imageRef}
+                  src={displayedImageSrc}
+                  alt={scene.title || `Scene ${scene.scene_number}`}
+                  className="w-full h-full object-contain"
+                  draggable={false}
+                  onLoad={() => {
+                    const img = imageRef.current;
+                    if (!img || !img.naturalWidth || !img.naturalHeight) return;
+                    setNaturalSize({ w: img.naturalWidth, h: img.naturalHeight });
+                  }}
+                />
+                {isImageEditorOpen && isSelecting && (
+                  <div
+                    className="absolute inset-0 z-10 cursor-crosshair"
+                    onPointerDown={startSelection}
+                    onPointerMove={moveSelection}
+                    onPointerUp={endSelection}
+                    onPointerCancel={endSelection}
+                    onPointerLeave={endSelection}
+                  />
+                )}
+                {isImageEditorOpen && selectionBoxStyle && (
+                  <div
+                    className="absolute z-20 rounded-sm border border-primary bg-primary/10"
+                    style={selectionBoxStyle}
+                  />
+                )}
+
+                {scene.image_url && (
+                  <div className="absolute top-2 right-2 z-30 flex items-center gap-2">
+                    {!isImageEditorOpen ? (
+                      <Button
+                        type="button"
+                        size="sm"
+                        variant="secondary"
+                        onClick={() => void openImageEditor()}
+                        disabled={isGenerating || isPreparingEditor}
+                      >
+                        {isPreparingEditor ? <Loader2 className="w-4 h-4 mr-2 animate-spin" /> : <Edit3 className="w-4 h-4 mr-2" />}
+                        Edit
+                      </Button>
+                    ) : (
+                      <Button
+                        type="button"
+                        size="sm"
+                        variant="secondary"
+                        onClick={closeImageEditor}
+                        disabled={isPreviewingEdit || isApplyingEdit}
+                      >
+                        <X className="w-4 h-4 mr-2" />
+                        Exit
+                      </Button>
+                    )}
+                  </div>
+                )}
+              </div>
             ) : (
               <div className="w-full h-full flex items-center justify-center">
                 <div className="text-center">
@@ -535,7 +2061,225 @@ export function SceneDetailModal({
                 </div>
               </div>
             )}
+
+            {isPreparingEditor && !isGenerating && (
+              <div className="absolute inset-0 bg-background/70 backdrop-blur-sm flex items-center justify-center">
+                <div className="text-center">
+                  <Loader2 className="w-8 h-8 text-primary animate-spin mx-auto mb-2" />
+                  <p className="text-sm text-muted-foreground">Preparing editor...</p>
+                </div>
+              </div>
+            )}
           </div>
+
+          {isImageEditorOpen && (
+            <div className="rounded-lg border border-border/60 bg-secondary/10 p-4">
+              <div className="flex flex-wrap items-center justify-between gap-3">
+                <div className="flex items-center gap-2">
+                  <Badge variant="outline" className="text-xs">
+                    Image Editor
+                  </Badge>
+                  {selection ? (
+                    <Badge variant="secondary" className="text-xs">
+                      Selection {Math.round(selection.w * 100)}% × {Math.round(selection.h * 100)}%
+                    </Badge>
+                  ) : (
+                    <Badge variant="secondary" className="text-xs">
+                      No selection
+                    </Badge>
+                  )}
+                </div>
+                <div className="flex flex-wrap items-center gap-2">
+                  <Button
+                    type="button"
+                    size="sm"
+                    variant="outline"
+                    onClick={undoEdit}
+                    disabled={historyIndex <= 0 || isPreviewingEdit || isApplyingEdit}
+                  >
+                    <Undo2 className="w-4 h-4 mr-2" />
+                    Undo
+                  </Button>
+                  <Button
+                    type="button"
+                    size="sm"
+                    variant="outline"
+                    onClick={redoEdit}
+                    disabled={historyIndex >= imageHistory.length - 1 || isPreviewingEdit || isApplyingEdit}
+                  >
+                    <Redo2 className="w-4 h-4 mr-2" />
+                    Redo
+                  </Button>
+                  <Button
+                    type="button"
+                    size="sm"
+                    variant="outline"
+                    onClick={() => setPreviewMode((p) => (p === "original" ? "current" : "original"))}
+                    disabled={!editorOriginal}
+                  >
+                    {previewMode === "original" ? (
+                      <>
+                        <Check className="w-4 h-4 mr-2" />
+                        Original
+                      </>
+                    ) : (
+                      <>
+                        <Square className="w-4 h-4 mr-2" />
+                        Original
+                      </>
+                    )}
+                  </Button>
+                  <Button
+                    type="button"
+                    size="sm"
+                    variant={isSelecting ? "secondary" : "outline"}
+                    onClick={() => setIsSelecting((v) => !v)}
+                    disabled={isPreviewingEdit || isApplyingEdit}
+                  >
+                    <Square className="w-4 h-4 mr-2" />
+                    {isSelecting ? "Selecting" : "Select area"}
+                  </Button>
+                  <Button
+                    type="button"
+                    size="sm"
+                    variant="outline"
+                    onClick={() => setSelection(null)}
+                    disabled={!selection || isPreviewingEdit || isApplyingEdit}
+                  >
+                    Clear selection
+                  </Button>
+                </div>
+              </div>
+
+              <div className="mt-4">
+                <Tabs value={editTool} onValueChange={(v) => setEditTool(v as ImageEditTool)}>
+                  <TabsList className="flex flex-wrap">
+                    <TabsTrigger value="inpaint">Inpaint</TabsTrigger>
+                    <TabsTrigger value="remove">Remove</TabsTrigger>
+                    <TabsTrigger value="color">Color</TabsTrigger>
+                    <TabsTrigger value="tone">Tone</TabsTrigger>
+                  </TabsList>
+
+                  <TabsContent value="inpaint" className="mt-4 space-y-2">
+                    <Label className="text-sm">Inpaint instructions</Label>
+                    <Textarea
+                      value={inpaintText}
+                      onChange={(e) => setInpaintText(e.target.value)}
+                      placeholder="Describe what to add/change in the selected area"
+                      className="min-h-[90px] resize-none"
+                      disabled={isPreviewingEdit || isApplyingEdit}
+                    />
+                  </TabsContent>
+
+                  <TabsContent value="remove" className="mt-4 space-y-2">
+                    <Label className="text-sm">Object to remove</Label>
+                    <Input
+                      value={removeObjectText}
+                      onChange={(e) => setRemoveObjectText(e.target.value)}
+                      placeholder="e.g., sign, person, watermark"
+                      disabled={isPreviewingEdit || isApplyingEdit}
+                    />
+                  </TabsContent>
+
+                  <TabsContent value="color" className="mt-4 space-y-3">
+                    <div className="grid gap-2">
+                      <Label className="text-sm">Target</Label>
+                      <Input
+                        value={colorTargetText}
+                        onChange={(e) => setColorTargetText(e.target.value)}
+                        placeholder="e.g., jacket, sky, neon sign"
+                        disabled={isPreviewingEdit || isApplyingEdit}
+                      />
+                    </div>
+                    <div className="grid gap-2">
+                      <Label className="text-sm">New color</Label>
+                      <Input
+                        value={colorValueText}
+                        onChange={(e) => setColorValueText(e.target.value)}
+                        placeholder="e.g., deep red, pastel blue"
+                        disabled={isPreviewingEdit || isApplyingEdit}
+                      />
+                    </div>
+                  </TabsContent>
+
+                  <TabsContent value="tone" className="mt-4 space-y-4">
+                    <div className="grid gap-2">
+                      <Label className="text-sm">Target area (optional)</Label>
+                      <Input
+                        value={toneTargetText}
+                        onChange={(e) => setToneTargetText(e.target.value)}
+                        placeholder="e.g., foreground, subject face, background"
+                        disabled={isPreviewingEdit || isApplyingEdit}
+                      />
+                    </div>
+
+                    <div className="grid gap-2">
+                      <div className="flex items-center justify-between gap-3">
+                        <Label className="text-sm">Brightness</Label>
+                        <Badge variant="secondary" className="text-xs">
+                          {brightness}
+                        </Badge>
+                      </div>
+                      <Slider
+                        value={[brightness]}
+                        onValueChange={(v) => setBrightness(v[0] ?? 0)}
+                        min={-100}
+                        max={100}
+                        step={1}
+                        disabled={isPreviewingEdit || isApplyingEdit}
+                      />
+                    </div>
+
+                    <div className="grid gap-2">
+                      <div className="flex items-center justify-between gap-3">
+                        <Label className="text-sm">Contrast</Label>
+                        <Badge variant="secondary" className="text-xs">
+                          {contrast}
+                        </Badge>
+                      </div>
+                      <Slider
+                        value={[contrast]}
+                        onValueChange={(v) => setContrast(v[0] ?? 0)}
+                        min={-100}
+                        max={100}
+                        step={1}
+                        disabled={isPreviewingEdit || isApplyingEdit}
+                      />
+                    </div>
+                  </TabsContent>
+                </Tabs>
+              </div>
+
+              <div className="mt-4 flex flex-wrap items-center justify-end gap-2">
+                <Button
+                  type="button"
+                  variant="outline"
+                  onClick={closeImageEditor}
+                  disabled={isPreviewingEdit || isApplyingEdit}
+                >
+                  Cancel
+                </Button>
+                <Button
+                  type="button"
+                  variant="outline"
+                  onClick={() => void generatePreview()}
+                  disabled={isPreviewingEdit || isApplyingEdit || isPreparingEditor}
+                >
+                  {isPreviewingEdit ? <Loader2 className="w-4 h-4 mr-2 animate-spin" /> : <Wand2 className="w-4 h-4 mr-2" />}
+                  Preview
+                </Button>
+                <Button
+                  type="button"
+                  variant="hero"
+                  onClick={() => void applyEdit()}
+                  disabled={historyIndex === 0 || isPreviewingEdit || isApplyingEdit}
+                >
+                  {isApplyingEdit ? <Loader2 className="w-4 h-4 mr-2 animate-spin" /> : <Check className="w-4 h-4 mr-2" />}
+                  Apply
+                </Button>
+              </div>
+            </div>
+          )}
 
           {/* Scene Details */}
           <div className="grid gap-4">
@@ -780,202 +2524,620 @@ export function SceneDetailModal({
               </div>
             )}
 
-            {/* Debug Information */}
-            <div className="space-y-2 border-t pt-4 mt-2">
-              <Label className="text-muted-foreground text-sm flex items-center gap-2">
-                Debug Information
-                {debug.timestamp && (
-                  <Badge variant="outline" className="text-xs font-mono">
-                    {debug.timestamp.toLocaleTimeString()}
-                  </Badge>
-                )}
-              </Label>
+            <div className="border-t pt-4 mt-2">
+              <div className="scene-debug-panel rounded-lg border border-border/60 bg-secondary/10">
+                <button
+                  type="button"
+                  className="scene-debug-toggle w-full flex items-center justify-between gap-3 px-3 py-2 text-left rounded-lg focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring"
+                  aria-expanded={isDebugExpanded}
+                  aria-controls={`scene-debug-panel-${scene.id}`}
+                  onClick={() => setIsDebugExpanded((v) => !v)}
+                >
+                  <div className="flex items-center gap-2">
+                    <span className="text-sm font-medium text-muted-foreground">Debug Info</span>
+                    {debug.timestamp && (
+                      <Badge variant="outline" className="text-xs font-mono">
+                        {debug.timestamp.toLocaleTimeString()}
+                      </Badge>
+                    )}
+                  </div>
+                  <ChevronDown className={cn("h-4 w-4 text-muted-foreground transition-transform duration-200", isDebugExpanded && "rotate-180")} />
+                </button>
 
-              <div className="space-y-2">
-                <div className="flex flex-wrap gap-2">
-                  <Badge variant={scene.generation_status === "error" ? "destructive" : "secondary"}>
-                    Status: {scene.generation_status}
-                  </Badge>
-                  {debug.status !== undefined && (
-                    <Badge variant="outline" className="text-xs font-mono">
-                      HTTP {debug.status}
-                      {debug.statusText ? ` ${debug.statusText}` : ""}
-                    </Badge>
+                <div
+                  id={`scene-debug-panel-${scene.id}`}
+                  className={cn(
+                    "grid transition-[grid-template-rows] duration-300 ease-in-out",
+                    isDebugExpanded ? "grid-rows-[1fr]" : "grid-rows-[0fr]",
                   )}
-                  {debug.stage && (
-                    <Badge variant="outline" className="text-xs font-mono">
-                      stage={debug.stage}
-                    </Badge>
-                  )}
-                  {debug.requestId && (
-                    <Badge variant="outline" className="text-xs font-mono">
-                      requestId={debug.requestId}
-                    </Badge>
-                  )}
-                  {debug.size !== undefined && (
-                    <Badge variant="outline" className="text-xs font-mono">
-                      size={debug.size}
-                    </Badge>
-                  )}
-                  {debug.headers?.["content-type"] && (
-                    <Badge variant="outline" className="text-xs font-mono">
-                      content-type={debug.headers["content-type"]}
-                    </Badge>
-                  )}
-                  {debug.headers?.["content-length"] && (
-                    <Badge variant="outline" className="text-xs font-mono">
-                      content-length={debug.headers["content-length"]}
-                    </Badge>
-                  )}
-                  {debug.headers?.["x-venice-is-content-violation"] && (
-                    <Badge
-                      variant={
-                        String(debug.headers["x-venice-is-content-violation"]).toLowerCase() === "true"
-                          ? "destructive"
-                          : "secondary"
-                      }
-                    >
-                      Content Violation: {debug.headers["x-venice-is-content-violation"]}
-                    </Badge>
-                  )}
-                  {debug.headers?.["x-venice-contains-minor"] && (
-                    <Badge
-                      variant={
-                        String(debug.headers["x-venice-contains-minor"]).toLowerCase() === "true"
-                          ? "destructive"
-                          : "secondary"
-                      }
-                    >
-                      Contains Minor: {debug.headers["x-venice-contains-minor"]}
-                    </Badge>
-                  )}
-                </div>
-
-                {detailedError && (
-                  <div className={`rounded-md p-3 text-sm border ${
-                    detailedError.category === 'validation' || detailedError.category === 'authentication' 
-                      ? 'bg-red-500/10 border-red-500/20 text-red-600 dark:text-red-400' 
-                      : 'bg-secondary/50 border-border'
-                  }`}>
-                    <div className="flex items-center gap-2 font-semibold mb-1">
-                      <span>{detailedError.title}</span>
-                      {detailedError.code && (
-                        <Badge variant="outline" className="font-mono text-[10px] h-5">
-                          {detailedError.code}
-                        </Badge>
-                      )}
-                    </div>
-                    <p className="mb-2">{detailedError.description}</p>
-                    
-                    {detailedError.violationHeaders && detailedError.violationHeaders.length > 0 && (
-                      <div className="mt-3 mb-2 bg-red-500/20 border border-red-500/30 rounded p-2">
-                        <div className="text-xs font-bold text-red-600 dark:text-red-400 mb-1 uppercase tracking-wider">
-                          Relevant Error Headers
+                >
+                  <div className="overflow-hidden px-3 pb-3">
+                    <div className={cn("space-y-3 pt-1 transition-opacity duration-200", isDebugExpanded ? "opacity-100" : "opacity-0")}>
+                      <div className="space-y-2">
+                        <div className="flex flex-wrap gap-2">
+                          <Badge variant={scene.generation_status === "error" ? "destructive" : "secondary"}>
+                            Status: {scene.generation_status}
+                          </Badge>
+                          {debug.status !== undefined && (
+                            <Badge variant="outline" className="text-xs font-mono">
+                              HTTP {debug.status}
+                              {debug.statusText ? ` ${debug.statusText}` : ""}
+                            </Badge>
+                          )}
+                          {debug.stage && (
+                            <Badge variant="outline" className="text-xs font-mono">
+                              stage={debug.stage}
+                            </Badge>
+                          )}
+                          {debug.requestId && (
+                            <Badge variant="outline" className="text-xs font-mono">
+                              requestId={debug.requestId}
+                            </Badge>
+                          )}
+                          {debug.size !== undefined && (
+                            <Badge variant="outline" className="text-xs font-mono">
+                              size={debug.size}
+                            </Badge>
+                          )}
+                          {debug.headers?.["content-type"] && (
+                            <Badge variant="outline" className="text-xs font-mono">
+                              content-type={debug.headers["content-type"]}
+                            </Badge>
+                          )}
+                          {debug.headers?.["content-length"] && (
+                            <Badge variant="outline" className="text-xs font-mono">
+                              content-length={debug.headers["content-length"]}
+                            </Badge>
+                          )}
+                          {debug.headers?.["x-venice-is-content-violation"] && (
+                            <Badge
+                              variant={
+                                String(debug.headers["x-venice-is-content-violation"]).toLowerCase() === "true"
+                                  ? "destructive"
+                                  : "secondary"
+                              }
+                            >
+                              Content Violation: {debug.headers["x-venice-is-content-violation"]}
+                            </Badge>
+                          )}
+                          {debug.headers?.["x-venice-contains-minor"] && (
+                            <Badge
+                              variant={
+                                String(debug.headers["x-venice-contains-minor"]).toLowerCase() === "true"
+                                  ? "destructive"
+                                  : "secondary"
+                              }
+                            >
+                              Contains Minor: {debug.headers["x-venice-contains-minor"]}
+                            </Badge>
+                          )}
                         </div>
-                        <ul className="list-disc list-inside text-xs font-mono text-red-700 dark:text-red-300">
-                          {detailedError.violationHeaders.map((header) => (
-                            <li key={header}>{header}</li>
-                          ))}
-                        </ul>
-                      </div>
-                    )}
 
-                    {detailedError.failureReason && (
-                       <div className="mt-2 text-xs">
-                         <span className="font-semibold">Reason: </span>
-                         <span className="font-mono">{detailedError.failureReason}</span>
-                       </div>
-                    )}
-                    
-                    {detailedError.technicalDetails && (
-                       <div className="mt-2 text-xs opacity-80">
-                         <span className="font-semibold">Technical: </span>
-                         <span className="font-mono break-all whitespace-pre-wrap">{detailedError.technicalDetails}</span>
-                       </div>
-                    )}
-                  </div>
-                )}
-                
-                {requestParams && (
-                  <div className="bg-secondary/30 rounded-md p-2 text-xs mt-2">
-                     <div className="font-semibold mb-1">Request Parameters</div>
-                     <div className="grid grid-cols-2 gap-x-4 gap-y-1 font-mono">
-                        {Object.entries(requestParams).map(([k, v]) => (
-                           <div key={k} className="flex justify-between border-b border-border/50 last:border-0 py-0.5">
-                              <span className="opacity-70">{k}:</span>
-                              <span>{String(v)}</span>
-                           </div>
-                        ))}
-                     </div>
-                  </div>
-                )}
+                        {detailedError && (
+                          <div className={`rounded-md p-3 text-sm border ${
+                            detailedError.category === 'validation' || detailedError.category === 'authentication' 
+                              ? 'bg-red-500/10 border-red-500/20 text-red-600 dark:text-red-400' 
+                              : 'bg-secondary/50 border-border'
+                          }`}>
+                            <div className="flex items-center gap-2 font-semibold mb-1">
+                              <span>{detailedError.title}</span>
+                              {detailedError.code && (
+                                <Badge variant="outline" className="font-mono text-[10px] h-5">
+                                  {detailedError.code}
+                                </Badge>
+                              )}
+                            </div>
+                            <p className="mb-2">{detailedError.description}</p>
+                            
+                            {detailedError.violationHeaders && detailedError.violationHeaders.length > 0 && (
+                              <div className="mt-3 mb-2 bg-red-500/20 border border-red-500/30 rounded p-2">
+                                <div className="text-xs font-bold text-red-600 dark:text-red-400 mb-1 uppercase tracking-wider">
+                                  Relevant Error Headers
+                                </div>
+                                <ul className="list-disc list-inside text-xs font-mono text-red-700 dark:text-red-300">
+                                  {detailedError.violationHeaders.map((header) => (
+                                    <li key={header}>{header}</li>
+                                  ))}
+                                </ul>
+                              </div>
+                            )}
 
-                {/* Legacy debug info fallback */}
-                {!detailedError && debug.error && (
-                  <div className="bg-secondary/50 rounded-md p-2 text-xs">
-                    <div className="font-semibold">Failure Reason</div>
-                    <div className="font-mono break-words">{debug.error}</div>
-                  </div>
-                )}
+                            {detailedError.failureReason && (
+                               <div className="mt-2 text-xs">
+                                 <span className="font-semibold">Reason: </span>
+                                 <span className="font-mono">{detailedError.failureReason}</span>
+                               </div>
+                            )}
+                            
+                            {detailedError.technicalDetails && (
+                               <div className="mt-2 text-xs opacity-80">
+                                 <span className="font-semibold">Technical: </span>
+                                 <span className="font-mono break-all whitespace-pre-wrap">{detailedError.technicalDetails}</span>
+                               </div>
+                            )}
+                          </div>
+                        )}
+                        
+                        {requestParams && (
+                          <div className="bg-secondary/30 rounded-md p-2 text-xs mt-2">
+                             <div className="font-semibold mb-1">Request Parameters</div>
+                             <div className="grid grid-cols-2 gap-x-4 gap-y-1 font-mono">
+                                {Object.entries(requestParams).map(([k, v]) => (
+                                   <div key={k} className="flex justify-between border-b border-border/50 last:border-0 py-0.5">
+                                      <span className="opacity-70">{k}:</span>
+                                      <span>{String(v)}</span>
+                                   </div>
+                                ))}
+                             </div>
+                          </div>
+                        )}
 
-                {!detailedError && debug.upstreamError && (
-                  <div className="bg-secondary/50 rounded-md p-2 text-xs">
-                    <div className="font-semibold">Upstream Diagnostic</div>
-                    <div className="font-mono break-words whitespace-pre-wrap">{debug.upstreamError}</div>
-                  </div>
-                )}
+                        {!detailedError && debug.error && (
+                          <div className="bg-secondary/50 rounded-md p-2 text-xs">
+                            <div className="font-semibold">Failure Reason</div>
+                            <div className="font-mono break-words">{debug.error}</div>
+                          </div>
+                        )}
 
-                {Array.isArray(debug.redactedHeaders) && debug.redactedHeaders.length > 0 && (
-                  <div className="bg-secondary/50 rounded-md p-2 text-xs">
-                    <div className="font-semibold">Redacted Headers</div>
-                    <div className="font-mono break-words">{debug.redactedHeaders.join(", ")}</div>
-                  </div>
-                )}
+                        {!detailedError && debug.upstreamError && (
+                          <div className="bg-secondary/50 rounded-md p-2 text-xs">
+                            <div className="font-semibold">Upstream Diagnostic</div>
+                            <div className="font-mono break-words whitespace-pre-wrap">{debug.upstreamError}</div>
+                          </div>
+                        )}
 
-                {debug.suggestion && (
-                  <div className="bg-secondary/50 rounded-md p-2 text-xs">
-                    <div className="font-semibold">Suggestion</div>
-                    <div className="break-words">{debug.suggestion}</div>
-                  </div>
-                )}
+                        {Array.isArray(debug.redactedHeaders) && debug.redactedHeaders.length > 0 && (
+                          <div className="bg-secondary/50 rounded-md p-2 text-xs">
+                            <div className="font-semibold">Redacted Headers</div>
+                            <div className="font-mono break-words">{debug.redactedHeaders.join(", ")}</div>
+                          </div>
+                        )}
 
-                <div className="bg-secondary/50 rounded-md p-2 text-xs font-mono overflow-auto max-h-[300px]">
-                  <pre>
-                    {`[DEBUG] Image Generation Failure Headers:
+                        {debug.suggestion && (
+                          <div className="bg-secondary/50 rounded-md p-2 text-xs">
+                            <div className="font-semibold">Suggestion</div>
+                            <div className="break-words">{debug.suggestion}</div>
+                          </div>
+                        )}
+
+                        <div className="bg-secondary/50 rounded-md p-2 text-xs font-mono overflow-auto max-h-[300px]">
+                          <pre>
+                            {`[DEBUG] Image Generation Failure Headers:
 ${Object.entries(debug.headers ?? {})
   .map(([k, v]) => `- ${k}: ${v}`)
   .join("\n")}
 ${debug.reasons && debug.reasons.length > 0 ? `\n[DEBUG] Failure Reasons:\n${debug.reasons.map(r => `- ${r}`).join("\n")}` : ""}
 ${debug.upstreamError ? `\n[DEBUG] Upstream Diagnostic:\n${debug.upstreamError}` : ""}
 [Timestamp: ${debug.timestamp?.toISOString() ?? "N/A"}]`}
-                  </pre>
+                          </pre>
+                        </div>
+                      </div>
+
+                      {(debug.prompt ||
+                        debug.promptFull ||
+                        promptFromHistory.used ||
+                        promptFromHistory.full ||
+                        isLoadingPromptOptimizations ||
+                        !!promptOptimizationError) && (
+                        <div
+                          className={cn(
+                            "space-y-2 rounded-md p-3 border",
+                            scene.generation_status === "error"
+                              ? "border-red-200 dark:border-red-900/50 bg-red-50/50 dark:bg-red-900/10"
+                              : "border-blue-200 dark:border-blue-900/50 bg-blue-50/50 dark:bg-blue-900/10",
+                          )}
+                        >
+                          <div className="flex items-center justify-between gap-2">
+                            <Label
+                              className={cn(
+                                "text-sm font-medium flex items-center gap-2",
+                                scene.generation_status === "error"
+                                  ? "text-red-700 dark:text-red-400"
+                                  : "text-blue-700 dark:text-blue-400",
+                              )}
+                            >
+                              <AlertTriangle className="w-4 h-4" />
+                              Generation Prompt ({promptTextView === "full" ? "Full" : "Sent"})
+                            </Label>
+                            <div className="flex items-center gap-2">
+                              {debug.timestamp && (
+                                <Badge variant="outline" className="text-[10px] font-mono">
+                                  {debug.timestamp.toISOString()}
+                                </Badge>
+                              )}
+                              {promptHashState !== "unavailable" && (
+                                <Badge variant={promptHashState === "match" ? "secondary" : "destructive"} className="text-[10px] font-mono">
+                                  {promptHashState === "match" ? "hash=ok" : "hash=mismatch"}
+                                </Badge>
+                              )}
+                              {(() => {
+                                const fullCandidate =
+                                  typeof debug.promptFull === "string" && debug.promptFull.length > 0 ? debug.promptFull : promptFromHistory.full;
+                                return (
+                                  typeof fullCandidate === "string" &&
+                                  fullCandidate.length > 0 &&
+                                  typeof debug.prompt === "string" &&
+                                  debug.prompt.length > 0 &&
+                                  fullCandidate !== debug.prompt
+                                );
+                              })() && (
+                                <Button
+                                  size="sm"
+                                  variant="ghost"
+                                  className="h-7 text-xs"
+                                  onClick={() => {
+                                    userChangedPromptViewRef.current = true;
+                                    setPromptTextView((v) => (v === "full" ? "sent" : "full"));
+                                  }}
+                                >
+                                  {promptTextView === "full" ? "Sent" : "Full"}
+                                </Button>
+                              )}
+                              <Button
+                                size="sm"
+                                variant="ghost"
+                                className="h-7 text-xs"
+                                onClick={() => copyText("Prompt copied to clipboard", failedPromptEdit)}
+                              >
+                                <Copy className="w-3.5 h-3.5 mr-1" />
+                                Copy
+                              </Button>
+                              <Button
+                                size="sm"
+                                variant="ghost"
+                                className="h-7 text-xs"
+                                onClick={() => setShowRawPrompt((v) => !v)}
+                              >
+                                {showRawPrompt ? "Formatted" : "Raw"}
+                              </Button>
+                              <Button size="sm" variant="ghost" className="h-7 text-xs" onClick={handleApplyFailedPrompt}>
+                                Copy to Editor
+                              </Button>
+                            </div>
+                          </div>
+
+                          {!failedPromptEdit ? (
+                            <div className="rounded-md border border-border/60 bg-secondary/10 p-2 text-xs text-muted-foreground">
+                              {isLoadingPromptOptimizations
+                                ? "Loading prompt..."
+                                : scene.generation_status === "completed"
+                                  ? "Generation prompt not found."
+                                  : "No generation prompt is available for this scene yet."}
+                            </div>
+                          ) : showRawPrompt ? (
+                            <pre className="min-h-[100px] max-h-[300px] overflow-auto whitespace-pre-wrap break-words rounded-md bg-transparent p-2 font-mono text-xs border border-border/50">
+                              {failedPromptEdit}
+                            </pre>
+                          ) : (
+                            <Textarea
+                              value={failedPromptEdit}
+                              readOnly={scene.generation_status !== "error"}
+                              onChange={(e) => setFailedPromptEdit(e.target.value)}
+                              className={cn(
+                                "min-h-[100px] resize-none font-mono text-xs bg-transparent",
+                                scene.generation_status === "error"
+                                  ? "border-red-200 dark:border-red-900/30 focus-visible:ring-red-500"
+                                  : "border-blue-200 dark:border-blue-900/30 focus-visible:ring-blue-500",
+                              )}
+                            />
+                          )}
+
+                          <div className="flex flex-wrap gap-2 text-[10px] text-muted-foreground">
+                            {debug.timestamp && <span className="font-mono">ts={debug.timestamp.toISOString()}</span>}
+                            {debug.model && <span className="font-mono">model={debug.model}</span>}
+                            <span className="font-mono">view={promptTextView}</span>
+                            <span className="font-mono">len={failedPromptEdit.length}</span>
+                            {Array.isArray(debug.preprocessingSteps) && debug.preprocessingSteps.length > 0 && (
+                              <span className="font-mono">steps={debug.preprocessingSteps.join(",")}</span>
+                            )}
+                            {(() => {
+                              const fullCandidate =
+                                typeof debug.promptFull === "string" && debug.promptFull.length > 0 ? debug.promptFull : promptFromHistory.full;
+                              return typeof fullCandidate === "string" && fullCandidate.length > 0 && fullCandidate !== failedPromptEdit ? (
+                                <span className="font-mono">fullLen={fullCandidate.length}</span>
+                              ) : null;
+                            })()}
+                          </div>
+
+                          {(isLoadingPromptOptimizations || promptOptimizationError || promptOptimizations.length > 0) && (
+                            <div className="mt-2 space-y-2">
+                              <div className="flex items-center justify-between">
+                                <div className="text-xs font-semibold text-muted-foreground">Prompt History</div>
+                                {isLoadingPromptOptimizations && (
+                                  <Badge variant="outline" className="text-[10px] font-mono">
+                                    loading…
+                                  </Badge>
+                                )}
+                              </div>
+
+                              {promptOptimizationError && (
+                                <div className="rounded-md border border-border/60 bg-secondary/30 p-2 text-xs">
+                                  {promptOptimizationError}
+                                </div>
+                              )}
+
+                              {promptOptimizations.length > 0 && (
+                                <div className="grid gap-2">
+                                  {promptOptimizations.map((row) => {
+                                    const ts = row.created_at ? safeDate(row.created_at) : undefined;
+                                    const text = row.final_prompt_text || "";
+                                    return (
+                                      <div key={row.id} className="rounded-md border border-border/60 bg-secondary/10 p-2">
+                                        <div className="flex flex-wrap items-center justify-between gap-2">
+                                          <div className="flex flex-wrap items-center gap-2">
+                                            {ts && (
+                                              <Badge variant="outline" className="text-[10px] font-mono">
+                                                {ts.toLocaleString()}
+                                              </Badge>
+                                            )}
+                                            {row.model_used && (
+                                              <Badge variant="outline" className="text-[10px] font-mono">
+                                                model={row.model_used}
+                                              </Badge>
+                                            )}
+                                            {row.framework_version && (
+                                              <Badge variant="outline" className="text-[10px] font-mono">
+                                                fw={row.framework_version}
+                                              </Badge>
+                                            )}
+                                          </div>
+                                          <div className="flex items-center gap-2">
+                                            <Button
+                                              size="sm"
+                                              variant="ghost"
+                                              className="h-7 text-xs"
+                                              onClick={() => copyText("Historical prompt copied", text)}
+                                              disabled={!text}
+                                            >
+                                              Copy
+                                            </Button>
+                                            <Button
+                                              size="sm"
+                                              variant="ghost"
+                                              className="h-7 text-xs"
+                                              onClick={() => {
+                                                setEditedPrompt(text);
+                                                setHasChanges(true);
+                                                toast({ title: "Prompt Updated", description: "Historical prompt copied to the editor." });
+                                              }}
+                                              disabled={!text}
+                                            >
+                                              Use
+                                            </Button>
+                                          </div>
+                                        </div>
+                                        {text && (
+                                          <pre className="mt-2 max-h-[120px] overflow-auto whitespace-pre-wrap break-words rounded bg-background/20 p-2 font-mono text-[11px]">
+                                            {text}
+                                          </pre>
+                                        )}
+                                      </div>
+                                    );
+                                  })}
+                                </div>
+                              )}
+
+                              {!isLoadingPromptOptimizations && !promptOptimizationError && promptOptimizations.length === 0 && (
+                                <div className="rounded-md border border-border/60 bg-secondary/10 p-2 text-xs text-muted-foreground">
+                                  No prompt history available for this scene.
+                                </div>
+                              )}
+                            </div>
+                          )}
+                        </div>
+                      )}
+                      {!debug.prompt &&
+                        !debug.promptFull &&
+                        !promptFromHistory.used &&
+                        !promptFromHistory.full &&
+                        !isLoadingPromptOptimizations &&
+                        !promptOptimizationError && (
+                        <div className="rounded-md border border-border/60 bg-secondary/10 p-2 text-xs text-muted-foreground">
+                          {isLoadingPromptOptimizations ? (
+                            <div className="flex items-center gap-2">
+                              <Loader2 className="h-3 w-3 animate-spin" />
+                              <span>Loading prompt history...</span>
+                            </div>
+                          ) : scene.generation_status === "completed" ? (
+                            "Generation prompt not found."
+                          ) : (
+                            "No generation prompt is available for this scene yet."
+                          )}
+                        </div>
+                      )}
+                    </div>
+                  </div>
                 </div>
               </div>
             </div>
-          </div>
 
-          {/* Failed Prompt View */}
-          {debug.prompt && (
-            <div className="space-y-2 border border-red-200 dark:border-red-900/50 bg-red-50/50 dark:bg-red-900/10 rounded-md p-3">
-              <div className="flex items-center justify-between">
-                <Label className="text-sm font-medium flex items-center gap-2 text-red-700 dark:text-red-400">
-                  <AlertTriangle className="w-4 h-4" />
-                  Failed System Prompt
-                </Label>
-                <Button size="sm" variant="ghost" className="h-7 text-xs" onClick={handleApplyFailedPrompt}>
-                  Copy to Editor
+          <div className="rounded-lg border border-border/60 bg-secondary/10 p-4">
+            <div className="flex flex-wrap items-center justify-between gap-3">
+              <div className="flex items-center gap-2">
+                <Badge variant="outline" className="text-xs">
+                  Reference Images
+                </Badge>
+                <Badge variant="secondary" className="text-xs">
+                  {referenceImages.filter((r) => r.selected && r.status === "ready").length} selected
+                </Badge>
+              </div>
+              <div className="flex items-center gap-2">
+                <input
+                  ref={referenceFileInputRef}
+                  type="file"
+                  accept="image/jpeg,image/png,image/webp"
+                  multiple
+                  className="hidden"
+                  onChange={(e) => {
+                    const files = Array.from(e.target.files || []);
+                    if (files.length > 0) void handleReferenceFiles(files);
+                    e.target.value = "";
+                  }}
+                />
+                <Button
+                  type="button"
+                  size="sm"
+                  variant="outline"
+                  onClick={() => referenceFileInputRef.current?.click()}
+                  disabled={isGenerating}
+                >
+                  <Upload className="w-4 h-4 mr-2" />
+                  Upload
                 </Button>
               </div>
-              <Textarea
-                value={failedPromptEdit}
-                onChange={(e) => setFailedPromptEdit(e.target.value)}
-                className="min-h-[100px] resize-none font-mono text-xs bg-transparent border-red-200 dark:border-red-900/30 focus-visible:ring-red-500"
-              />
-              <p className="text-[10px] text-muted-foreground">
-                This is the exact prompt sent to the model that caused the failure. You can edit it here or copy it to the main editor below.
-              </p>
             </div>
-          )}
+
+            <div
+              className={cn(
+                "mt-3 rounded-md border border-dashed border-border/70 px-3 py-4 text-sm text-muted-foreground",
+                isReferenceDragging && "border-primary/50 bg-primary/5",
+              )}
+              role="button"
+              tabIndex={0}
+              onClick={() => referenceFileInputRef.current?.click()}
+              onKeyDown={(e) => {
+                if (e.key === "Enter" || e.key === " ") referenceFileInputRef.current?.click();
+              }}
+              onDragEnter={handleReferenceDrag}
+              onDragOver={handleReferenceDrag}
+              onDragLeave={handleReferenceDrag}
+              onDrop={handleReferenceDrop}
+            >
+              Drag & drop JPG/PNG/WEBP (max 5MB)
+            </div>
+
+            {referenceImages.length > 0 && (
+              <div className="mt-4 grid gap-4">
+                <div className="grid grid-cols-2 sm:grid-cols-3 md:grid-cols-4 gap-3">
+                  {referenceImages.map((item) => {
+                    const thumb = item.thumbUrl || item.localThumbUrl || item.url;
+                    const isActive = item.id === activeReferenceId;
+                    return (
+                      <div
+                        key={item.id}
+                        className={cn(
+                          "rounded-md border bg-background/40 p-2",
+                          isActive ? "border-primary/50" : "border-border/60",
+                        )}
+                        role="button"
+                        tabIndex={0}
+                        onClick={() => setActiveReferenceId(item.id)}
+                        onKeyDown={(e) => {
+                          if (e.key === "Enter" || e.key === " ") setActiveReferenceId(item.id);
+                        }}
+                      >
+                        <div className="relative overflow-hidden rounded-sm bg-secondary/40 aspect-square">
+                          {thumb ? (
+                            <img
+                              src={thumb}
+                              alt={item.fileName}
+                              className="absolute inset-0 h-full w-full object-cover"
+                              loading="lazy"
+                              draggable={false}
+                            />
+                          ) : (
+                            <div className="absolute inset-0 flex items-center justify-center text-xs text-muted-foreground">
+                              No preview
+                            </div>
+                          )}
+                          <div className="absolute top-1 left-1 flex items-center gap-1">
+                            <Button
+                              type="button"
+                              size="icon"
+                              variant={item.selected ? "secondary" : "outline"}
+                              className="h-7 w-7"
+                              onClick={(e) => {
+                                e.stopPropagation();
+                                toggleReferenceSelected(item.id);
+                              }}
+                              disabled={isGenerating}
+                            >
+                              {item.selected ? <Check className="w-4 h-4" /> : <Square className="w-4 h-4" />}
+                            </Button>
+                          </div>
+                          <div className="absolute top-1 right-1 flex items-center gap-1">
+                            <Button
+                              type="button"
+                              size="icon"
+                              variant="outline"
+                              className="h-7 w-7"
+                              onClick={(e) => {
+                                e.stopPropagation();
+                                void (async () => {
+                                  try {
+                                    if (item.status === "ready" && item.objectPath) await deleteReferenceOnServer(item);
+                                  } catch {
+                                    toast({ title: "Delete failed", description: item.fileName, variant: "destructive" });
+                                  } finally {
+                                    removeReferenceLocal(item.id);
+                                  }
+                                })();
+                              }}
+                              disabled={isGenerating}
+                            >
+                              <Trash2 className="w-4 h-4" />
+                            </Button>
+                          </div>
+                        </div>
+
+                        <div className="mt-2 grid gap-1">
+                          <div className="text-xs font-medium truncate">{item.fileName}</div>
+                          {item.status === "uploading" && (
+                            <div className="grid gap-1">
+                              <Progress value={item.progress} />
+                              <div className="text-[10px] text-muted-foreground">{item.progress}%</div>
+                            </div>
+                          )}
+                          {item.status === "error" && (
+                            <div className="text-[10px] text-destructive truncate">{item.error || "Upload failed"}</div>
+                          )}
+                        </div>
+                      </div>
+                    );
+                  })}
+                </div>
+
+                {activeReference && (activeReference.url || activeReference.localThumbUrl || activeReference.thumbUrl) && (
+                  <div className="grid gap-2">
+                    <div className="flex flex-wrap items-center justify-between gap-2">
+                      <div className="text-sm font-medium truncate">{activeReference.fileName}</div>
+                      <div className="flex items-center gap-2">
+                        <Button type="button" size="icon" variant="outline" onClick={() => zoomReference(activeReference.id, 0.25)}>
+                          <ZoomIn className="w-4 h-4" />
+                        </Button>
+                        <Button type="button" size="icon" variant="outline" onClick={() => zoomReference(activeReference.id, -0.25)}>
+                          <ZoomOut className="w-4 h-4" />
+                        </Button>
+                        <Button type="button" size="icon" variant="outline" onClick={() => resetReferenceTransform(activeReference.id)}>
+                          <RotateCcw className="w-4 h-4" />
+                        </Button>
+                      </div>
+                    </div>
+                    <div
+                      className="relative mx-auto h-[320px] w-full max-w-[512px] overflow-hidden rounded-md border border-border/60 bg-secondary/20 touch-none sm:h-[512px]"
+                      aria-label="Reference image preview"
+                      onPointerDown={(e) => onReferencePointerDown(e, activeReference.id)}
+                      onPointerMove={(e) => onReferencePointerMove(e, activeReference.id)}
+                      onPointerUp={onReferencePointerUp}
+                      onPointerCancel={onReferencePointerUp}
+                      onWheel={(e) => onReferenceWheel(e, activeReference.id)}
+                    >
+                      <img
+                        src={activeReference.url || activeReference.localThumbUrl || activeReference.thumbUrl}
+                        alt={activeReference.fileName}
+                        className="absolute inset-0 h-full w-full object-contain"
+                        style={{
+                          transform: `translate(${activeReference.panX}px, ${activeReference.panY}px) scale(${activeReference.zoom})`,
+                          transformOrigin: "center center",
+                        }}
+                        draggable={false}
+                      />
+                    </div>
+                  </div>
+                )}
+              </div>
+            )}
+          </div>
 
           {/* Editable Prompt */}
           <div className="space-y-2">
@@ -995,7 +3157,11 @@ ${debug.upstreamError ? `\n[DEBUG] Upstream Diagnostic:\n${debug.upstreamError}`
               onChange={(e) => handlePromptChange(e.target.value)}
               placeholder="Enter the prompt used to generate this scene's image..."
               className="min-h-[120px] resize-none"
+              maxLength={PROMPT_CHAR_LIMIT}
             />
+            <div className="flex justify-end text-xs text-muted-foreground">
+              {editedPrompt.length}/{PROMPT_CHAR_LIMIT}
+            </div>
           </div>
 
           {onReportStyleMismatch && (
@@ -1055,6 +3221,7 @@ ${debug.upstreamError ? `\n[DEBUG] Upstream Diagnostic:\n${debug.upstreamError}`
               {isGenerating ? "Generating..." : "Regenerate Image"}
             </Button>
           </div>
+        </div>
         </div>
       </DialogContent>
     </Dialog>

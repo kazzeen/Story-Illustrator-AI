@@ -14,6 +14,7 @@ export interface Story {
   art_style: string;
   aspect_ratio: string;
   scene_count: number;
+  completed_scenes?: number;
   word_count: number;
   active_style_guide_id?: string | null;
   consistency_settings?: Json | null;
@@ -49,35 +50,92 @@ export function useStories() {
   const { toast } = useToast();
 
   const fetchStories = useCallback(async () => {
-  if (!user) {
-    setStories([]);
-    setLoading(false);
-    return;
-  }
+    if (!user) {
+      setStories([]);
+      setLoading(false);
+      return;
+    }
 
-  try {
-    const { data, error } = await supabase
-      .from('stories')
-      .select('*')
-      .order('updated_at', { ascending: false });
+    try {
+      const { data: storiesData, error: storiesError } = await supabase
+        .from('stories')
+        .select('*')
+        .order('updated_at', { ascending: false });
 
-    if (error) throw error;
-    setStories((data as Story[]) || []);
-  } catch (error) {
-    console.error('Error fetching stories:', error);
-    toast({
-      title: 'Error',
-      description: 'Failed to load stories',
-      variant: 'destructive',
-    });
-  } finally {
-    setLoading(false);
-  }
-}, [user, toast, setStories, setLoading]);
+      if (storiesError) throw storiesError;
+
+      // Fetch scene statuses for all stories to calculate progress
+      const { data: scenesData, error: scenesError } = await supabase
+        .from('scenes')
+        .select('story_id, generation_status');
+
+      if (scenesError) {
+        console.error('Error fetching scenes:', scenesError);
+        // Continue with stories only, progress will be 0
+      }
+
+      const storiesWithProgress = (storiesData as Story[]).map(story => {
+        const storyScenes = scenesData?.filter(s => s.story_id === story.id) || [];
+        const completed = storyScenes.filter(s => s.generation_status === 'completed').length;
+        return { ...story, completed_scenes: completed };
+      });
+
+      setStories(storiesWithProgress);
+    } catch (error) {
+      console.error('Error fetching stories:', error);
+      toast({
+        title: 'Error',
+        description: 'Failed to load stories',
+        variant: 'destructive',
+      });
+    } finally {
+      setLoading(false);
+    }
+  }, [user, toast, setStories, setLoading]);
 
   useEffect(() => {
-  fetchStories();
-}, [user, fetchStories]);
+    fetchStories();
+
+    // Real-time subscription for stories and scenes
+    const channel = supabase.channel('dashboard-changes')
+      .on('postgres_changes', { event: '*', schema: 'public', table: 'stories' }, () => {
+        fetchStories();
+      })
+      .on('postgres_changes', { event: '*', schema: 'public', table: 'scenes' }, async (payload) => {
+        const nextRaw = payload.new;
+        const oldRaw = payload.old;
+        const storyId =
+          (nextRaw && typeof nextRaw === 'object' && 'story_id' in nextRaw && typeof (nextRaw as { story_id?: unknown }).story_id === 'string'
+            ? (nextRaw as { story_id: string }).story_id
+            : null) ??
+          (oldRaw && typeof oldRaw === 'object' && 'story_id' in oldRaw && typeof (oldRaw as { story_id?: unknown }).story_id === 'string'
+            ? (oldRaw as { story_id: string }).story_id
+            : null);
+        if (!storyId) return;
+
+        // Fetch updated stats for this story
+        const { count: completedCount } = await supabase
+          .from('scenes')
+          .select('*', { count: 'exact', head: true })
+          .eq('story_id', storyId)
+          .eq('generation_status', 'completed');
+
+        setStories(prev => prev.map(story => {
+          if (story.id === storyId) {
+            return { 
+              ...story, 
+              completed_scenes: completedCount ?? story.completed_scenes 
+            };
+          }
+          return story;
+        }));
+      })
+      .subscribe();
+
+    return () => {
+      supabase.removeChannel(channel);
+    };
+  }, [user, fetchStories]);
 
   const createStory = async (title: string, content: string, filename: string) => {
     if (!user) return null;
@@ -227,17 +285,32 @@ export function useScenes(storyId: string | null) {
             return;
           }
 
+          const parseJsonIfString = (value: unknown) => {
+            if (typeof value !== "string") return value;
+            try {
+              return JSON.parse(value) as unknown;
+            } catch {
+              return value;
+            }
+          };
+
           const nextScene = typed.new as Scene;
           if (!nextScene?.id) return;
 
+          const normalizedNextScene = {
+            ...nextScene,
+            consistency_details: parseJsonIfString(nextScene.consistency_details),
+            character_states: parseJsonIfString(nextScene.character_states),
+          } as Scene;
+
           setScenes((prev) => {
-            const idx = prev.findIndex((s) => s.id === nextScene.id);
+            const idx = prev.findIndex((s) => s.id === normalizedNextScene.id);
             const next = [...prev];
 
             if (idx === -1) {
-              next.push(nextScene);
+              next.push(normalizedNextScene);
             } else {
-              next[idx] = { ...next[idx], ...nextScene };
+              next[idx] = { ...next[idx], ...normalizedNextScene };
             }
 
             next.sort((a, b) => a.scene_number - b.scene_number);
@@ -286,19 +359,59 @@ export function useScenes(storyId: string | null) {
 
   const updateScene = async (id: string, updates: Partial<Scene>) => {
     try {
+      const parseJsonIfString = (value: unknown) => {
+        if (typeof value !== "string") return value;
+        try {
+          return JSON.parse(value) as unknown;
+        } catch {
+          return value;
+        }
+      };
+      const isRecord = (value: unknown): value is Record<string, unknown> =>
+        typeof value === "object" && value !== null && !Array.isArray(value);
+
+      const existingScene = scenes.find((s) => s.id === id) ?? null;
+      const existingDetails = parseJsonIfString(existingScene?.consistency_details);
+      const nextDetails = parseJsonIfString(updates.consistency_details);
+
+      const finalUpdates =
+        "consistency_details" in updates && isRecord(existingDetails) && isRecord(nextDetails)
+          ? (() => {
+              const existingGen = parseJsonIfString(existingDetails.generation_debug);
+              const nextGen = parseJsonIfString(nextDetails.generation_debug);
+              const mergedGen =
+                isRecord(existingGen) && isRecord(nextGen)
+                  ? { ...existingGen, ...nextGen }
+                  : isRecord(nextGen)
+                    ? nextGen
+                    : isRecord(existingGen)
+                      ? existingGen
+                      : undefined;
+              const mergedDetails: Record<string, unknown> = { ...existingDetails, ...nextDetails };
+              if (mergedGen) mergedDetails.generation_debug = mergedGen;
+              return { ...updates, consistency_details: mergedDetails as Json };
+            })()
+          : updates;
+
       const { data, error } = await supabase
         .from('scenes')
-        .update(updates)
+        .update(finalUpdates)
         .eq('id', id)
         .select()
         .single();
 
       if (error) throw error;
 
+      const normalized = {
+        ...(data as Scene),
+        consistency_details: parseJsonIfString((data as Scene).consistency_details),
+        character_states: parseJsonIfString((data as Scene).character_states),
+      } as Scene;
+
       setScenes((prev) =>
-        prev.map((s) => (s.id === id ? (data as Scene) : s))
+        prev.map((s) => (s.id === id ? normalized : s))
       );
-      return data as Scene;
+      return normalized;
     } catch (error) {
       console.error('Error updating scene:', error);
       toast({

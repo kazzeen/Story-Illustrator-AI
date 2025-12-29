@@ -1,5 +1,6 @@
 import { serve } from "https://deno.land/std@0.168.0/http/server.ts";
 import { createClient } from "https://esm.sh/@supabase/supabase-js@2.49.2";
+import { ensureClothingColors, validateClothingColorCoverage } from "../_shared/clothing-colors.ts";
 
 const corsHeaders = {
   "Access-Control-Allow-Origin": "*",
@@ -36,6 +37,7 @@ type SceneRow = {
   image_prompt: string | null;
   image_url: string | null;
   character_states: unknown;
+  consistency_details?: unknown;
   stories?: StoryJoinRow | null;
 };
 
@@ -136,6 +138,22 @@ function sanitizePrompt(raw: string) {
     .join("");
   out = out.replace(/\s+/g, " ").trim();
   return out;
+}
+
+function computeUsedPromptForModel(fullPrompt: string, model: string) {
+  const limitedModels = ["hidream", "qwen-image", "z-image-turbo"];
+  if (model.startsWith("lustify") || limitedModels.includes(model)) {
+    return fullPrompt.length > 1400 ? fullPrompt.slice(0, 1400) : fullPrompt;
+  }
+  return fullPrompt;
+}
+
+async function sha256Hex(input: string) {
+  const bytes = new TextEncoder().encode(input);
+  const hash = await crypto.subtle.digest("SHA-256", bytes);
+  return Array.from(new Uint8Array(hash))
+    .map((b) => b.toString(16).padStart(2, "0"))
+    .join("");
 }
 
 // Allowed art styles
@@ -317,6 +335,54 @@ function extractFirstBase64Image(aiData: unknown): string | null {
   return direct ? stripDataUrlPrefix(direct) : null;
 }
 
+type SceneReferenceImage = {
+  id: string;
+  fileName: string;
+  bucket?: string;
+  objectPath?: string;
+  selected?: boolean;
+};
+
+async function signSceneReferenceImages(args: {
+  admin: ReturnType<typeof createClient>;
+  userId: string;
+  scene: SceneRow;
+  expiresIn: number;
+  limit: number;
+}): Promise<string[]> {
+  const details = asJsonObject(args.scene.consistency_details) || {};
+  const listRaw = details.reference_images;
+  if (!Array.isArray(listRaw) || listRaw.length === 0) return [];
+
+  const parsed = listRaw
+    .filter((v) => v && typeof v === "object" && !Array.isArray(v))
+    .map((v) => v as Record<string, unknown>)
+    .map(
+      (v): SceneReferenceImage => ({
+        id: typeof v.id === "string" ? v.id : "",
+        fileName: typeof v.fileName === "string" ? v.fileName : "",
+        bucket: typeof v.bucket === "string" ? v.bucket : undefined,
+        objectPath: typeof v.objectPath === "string" ? v.objectPath : undefined,
+        selected: typeof v.selected === "boolean" ? v.selected : undefined,
+      }),
+    )
+    .filter((v) => v.id && v.fileName && v.objectPath && v.selected === true)
+    .slice(0, args.limit);
+
+  const out: string[] = [];
+  for (const ref of parsed) {
+    const bucket = ref.bucket || "reference-images";
+    const objectPath = ref.objectPath || "";
+    if (!objectPath.startsWith(`references/${args.userId}/`)) continue;
+    const { data, error } = await args.admin.storage.from(bucket).createSignedUrl(objectPath, args.expiresIn);
+    if (error) continue;
+    const url = data?.signedUrl;
+    if (typeof url === "string" && url.length > 0) out.push(url);
+  }
+
+  return out;
+}
+
 export function detectImageMime(bytes: Uint8Array): "image/webp" | "image/png" | "image/jpeg" {
   if (bytes.length >= 12) {
     const riff = bytes[0] === 0x52 && bytes[1] === 0x49 && bytes[2] === 0x46 && bytes[3] === 0x46;
@@ -433,8 +499,28 @@ async function fetchWithTimeout(url: string, init: RequestInit, timeoutMs: numbe
 serve(async (req: Request) => {
   if (req.method === "OPTIONS") return new Response(null, { headers: corsHeaders });
 
+  const requestId = crypto.randomUUID();
+  let admin: ReturnType<typeof createClient> | null = null;
+  let currentSceneRow: SceneRow | null = null;
+  let requestedSceneId: string | null = null;
+  let lastPromptDebug:
+    | {
+        model: string;
+        prompt: string;
+        promptFull: string;
+        preprocessingSteps: string[];
+        promptHash: string;
+        requestParams: {
+          model?: string;
+          artStyle?: string;
+          styleIntensity?: number;
+          strictStyle?: boolean;
+          disabledStyleElements?: string[];
+        };
+      }
+    | null = null;
+
   try {
-    const requestId = crypto.randomUUID();
     const authHeader = req.headers.get("authorization") ?? req.headers.get("Authorization");
     if (!authHeader?.startsWith("Bearer ")) {
       return json(401, { error: "Missing Authorization header", requestId });
@@ -461,6 +547,7 @@ serve(async (req: Request) => {
     const storyId = requestBody.storyId;
     const { sceneId, artStyle, styleIntensity, strictStyle, model } = requestBody;
     const disabledStyleElements = asStringArray(requestBody.disabledStyleElements) ?? [];
+    requestedSceneId = typeof sceneId === "string" ? sceneId : null;
 
     const supabaseUrl = Deno.env.get("SUPABASE_URL")!;
     const supabaseServiceKey = Deno.env.get("SUPABASE_SERVICE_ROLE_KEY")!;
@@ -495,7 +582,7 @@ serve(async (req: Request) => {
     }
 
     // Privileged DB + Storage client
-    const admin = createClient(supabaseUrl, supabaseServiceKey);
+    admin = createClient(supabaseUrl, supabaseServiceKey);
 
     const toLogDetails = (details: unknown) => {
       const obj = asJsonObject(details);
@@ -511,7 +598,7 @@ serve(async (req: Request) => {
       details?: unknown;
     }) => {
       try {
-        await admin.from("consistency_logs").insert({
+        await admin!.from("consistency_logs").insert({
           story_id: args.story_id,
           scene_id: args.scene_id ?? null,
           check_type: args.check_type,
@@ -593,10 +680,10 @@ serve(async (req: Request) => {
     }
 
     const fetchSceneOnce = async () =>
-      await admin
+      await admin!
         .from("scenes")
         .select(
-          "id, story_id, scene_number, title, summary, original_text, characters, setting, emotional_tone, image_prompt, image_url, character_states"
+          "id, story_id, scene_number, title, summary, original_text, characters, setting, emotional_tone, image_prompt, image_url, character_states, consistency_details"
         )
         .eq("id", sceneId)
         .maybeSingle();
@@ -643,6 +730,7 @@ serve(async (req: Request) => {
     if (!scene) return json(404, { error: "Scene not found", requestId });
 
     const sceneRow = scene as SceneRow;
+    currentSceneRow = sceneRow;
     const { data: story, error: storyJoinError } = await admin
       .from("stories")
       .select("user_id, art_style, consistency_settings")
@@ -921,9 +1009,15 @@ serve(async (req: Request) => {
 
         const outfit = resolveOutfitForScene(sheet, Number(sceneRow.scene_number || 0));
         const clothingFromTimeline = asString(outfit?.description) || asString(outfit?.name) || null;
-        const clothing = sanitizePrompt(
+        const clothingBase = sanitizePrompt(
           asString(mergedState.clothing) || clothingFromTimeline || asString(char.clothing) || "",
         );
+        const coloredClothing = ensureClothingColors(clothingBase, {
+          seed: `${String(sceneRow.story_id)}:${String(sceneId)}:${String(char.name)}:outfit`,
+          scene_text: safePrompt,
+          force_if_no_keywords: true,
+        }).text;
+        const clothing = coloredClothing || clothingBase;
         const state = sanitizePrompt(asString(mergedState.state) || asString(mergedState.condition) || "");
         const physicalBase = sanitizePrompt(asString(char.physical_attributes) || "");
         const physicalFromState = sanitizePrompt(asString(mergedState.physical_attributes) || "");
@@ -933,11 +1027,20 @@ serve(async (req: Request) => {
         const line = `- ${char.name}: ${snippet ? `${sanitizePrompt(snippet)}. ` : ""}${physicalDetails ? `${physicalDetails}. ` : ""}${clothing ? `Outfit: ${clothing}. ` : ""}${accessories ? `Accessories: ${accessories}. ` : ""}${state ? `State: ${state}.` : ""}`.trim();
         characterContext += `${line}\n`;
 
+        const outfitColorCheck = validateClothingColorCoverage(clothing);
+        const outfitFallback = outfitColorCheck.ok
+          ? null
+          : ensureClothingColors(clothing, {
+              seed: `${String(sceneRow.story_id)}:${String(sceneId)}:${String(char.name)}:outfit:retry`,
+              scene_text: safePrompt,
+              force_if_no_keywords: true,
+            }).text;
+
         characterValidationInputs.push({
           name: char.name,
           reference_image_url: sheetRow?.reference_image_url || null,
           reference_text: snippet || char.physical_attributes || "",
-          expected_outfit: clothing,
+          expected_outfit: outfitFallback || clothing,
           expected_state: state,
         });
       });
@@ -951,8 +1054,17 @@ serve(async (req: Request) => {
     let adaptationLog = "";
     let consistencyResult: ConsistencyResult | null = null;
 
-    // Use a faster/smaller model for analysis to ensure we don't timeout
-    const analysisModel = "llama-3.2-3b"; 
+    const expiresIn = Math.floor(
+      clampNumber(Deno.env.get("REFERENCE_SIGNED_URL_TTL_SECONDS") ?? "3600", 60, 60 * 60 * 24 * 30, 3600),
+    );
+    const sceneReferenceImagesForPrompt = await signSceneReferenceImages({
+      admin,
+      userId: user.id,
+      scene: sceneRow,
+      expiresIn,
+      limit: 2,
+    });
+    const analysisModel = sceneReferenceImagesForPrompt.length > 0 ? "mistral-31-24b" : "llama-3.2-3b";
 
     try {
       const contextResponse = await fetchWithTimeout("https://api.venice.ai/api/v1/chat/completions", {
@@ -967,7 +1079,7 @@ serve(async (req: Request) => {
           messages: [
             {
               role: "system",
-              content: `You are an expert Art Director and Prompt Engineer. Return a JSON object with a structured Stable Diffusion prompt.
+              content: `You are an expert Art Director and Prompt Engineer. Return ONLY valid JSON (no markdown, no code fences) with a structured Stable Diffusion prompt and scene-aware character appearance guidance.
               
               Inputs:
               PREVIOUS_CONTEXT: ${previousSceneSummary ? `Scene: ${previousSceneSummary}. States: ${previousSceneStates}` : "None"}
@@ -975,12 +1087,18 @@ serve(async (req: Request) => {
               STYLE: ${styleModifier}
               CHARACTERS: ${characterContext || "None specified"}
               STYLE_GUIDE: ${styleGuideText || "None"}
+              REFERENCE_IMAGES: ${sceneReferenceImagesForPrompt.length > 0 ? "Provided in the user message." : "None"}
 
               Directives:
               1. VOCABULARY: Use precise artistic terminology and domain-specific modifiers. Avoid ambiguous terms.
               2. CONSISTENCY: Reflect physical changes (aging, damage, dirt, emotion) from previous scenes.
               3. INTEGRATION: Integrate character details naturally into the description.
               4. STRICTLY ADHERE to the STYLE GUIDE.
+              5. SCENE ANALYSIS: Infer environment (indoor/outdoor, location type, weather, time of day, season), social context (formal/casual/professional), and activity.
+              6. CHARACTER STATE: Infer emotions, posture, role, and relationship dynamics implied by the scene.
+              7. STYLE + WARDROBE: Produce scene-appropriate clothing details (materials, fit, layers, accessories) and a coherent color palette; preserve canonical outfits when provided.
+              8. COLORS: Every clothing item MUST include an explicit color adjective (e.g., 'red shirt', 'navy trousers'). Ensure colors are context-appropriate and visually distinct between items. If a garment is feminine-coded (dress, skirt, blouse, heels, lingerie), prefer: pink, rose pink, hot pink, blush, magenta, fuchsia, lavender, lilac, purple, violet, plum. If masculine-coded (suit, tuxedo, tie), prefer: black, charcoal, slate gray, navy, midnight blue, white, cream, brown, tan, olive, forest green, burgundy. If no color is specified, choose from the appropriate palette.
+              9. QUALITY CONTROL: Flag inconsistencies, missing details, inappropriate attire for scene/season/culture, or sensitivity concerns.
               
               Output Format:
               {
@@ -988,12 +1106,48 @@ serve(async (req: Request) => {
                 "style": "Specific art movement, medium, technique keywords (must align with input style)",
                 "composition": "Camera angle, framing, lighting setup, perspective guidelines",
                 "quality": "Resolution, detail level, and texture modifiers (e.g., '8k', 'intricate detail')",
+                "environment": "Prompt-friendly environment descriptors (location type, time of day, weather, season, ambiance)",
+                "wardrobe": "Prompt-friendly clothing and accessory descriptors for all named characters",
+                "color_palette": "Prompt-friendly palette descriptors (dominant colors, accents, materials/texture tones)",
+                "prompt_keywords": ["Optional extra prompt keywords; concise and non-redundant"],
+                "scene_context": {
+                  "environment": "Indoor/outdoor, location type",
+                  "weather": "If applicable",
+                  "time_of_day": "If applicable",
+                  "season": "If applicable",
+                  "social_context": "Formal/casual/professional/ceremonial",
+                  "activity": "What is happening"
+                },
+                "character_state_assessment": [
+                  {
+                    "name": "Character name",
+                    "emotion": "Inferred emotion",
+                    "posture": "Inferred posture/body language",
+                    "role": "Role in scene",
+                    "relationship_notes": "Dynamics with others, if relevant",
+                    "appearance_notes": "Hair/skin/makeup/wear-and-tear, if relevant",
+                    "outfit_detail": "More detailed outfit description consistent with canonical outfit"
+                  }
+                ],
+                "quality_control": {
+                  "issues": ["List issues if any, otherwise empty array"],
+                  "consistency_notes": "Notes about continuity and canonical details",
+                  "appropriateness_notes": "Seasonal/cultural/setting appropriateness notes",
+                  "sensitivity_notes": "Potential cultural sensitivity flags or 'none'",
+                  "detail_level": "low|medium|high"
+                },
                 "progression_notes": "Brief explanation of adaptations based on previous context"
               }`
             },
             {
               role: "user",
-              content: "Generate the JSON."
+              content:
+                sceneReferenceImagesForPrompt.length > 0
+                  ? [
+                      { type: "text", text: "Generate the JSON using the provided reference images." },
+                      ...sceneReferenceImagesForPrompt.map((u) => ({ type: "image_url", image_url: { url: u } })),
+                    ]
+                  : "Generate the JSON."
             }
           ]
         }),
@@ -1013,9 +1167,73 @@ serve(async (req: Request) => {
             const pStyle = asString(parsed.style) || "";
             const pComposition = asString(parsed.composition) || "";
             const pQuality = asString(parsed.quality) || "";
+            const pEnvironment = asString(parsed.environment) || "";
+            const pWardrobeRaw = asString(parsed.wardrobe) || "";
+            const wardrobeFallbackRaw =
+              characterValidationInputs.length > 0
+                ? characterValidationInputs
+                    .filter((c) => (c.expected_outfit || "").trim().length > 0)
+                    .map((c) => `${c.name}: ${c.expected_outfit}`)
+                    .join("; ")
+                : "";
+
+            const baseWardrobe = pWardrobeRaw.trim().length > 0 ? pWardrobeRaw : wardrobeFallbackRaw;
+            const pWardrobe =
+              ensureClothingColors(baseWardrobe, {
+                seed: `${String(sceneRow.story_id)}:${String(sceneId)}:wardrobe`,
+                scene_text: safePrompt,
+                force_if_no_keywords: true,
+              }).text || baseWardrobe;
+            const pPalette = asString(parsed.color_palette) || "";
+            const pKeywords = asStringArray(parsed.prompt_keywords) || [];
             
-            refinedPrompt = [pStyle, pSubject, pComposition, pQuality].filter(Boolean).join(", ");
-            adaptationLog = asString(parsed.progression_notes) || "Prompt refined by Contextual Analysis";
+            const qc = asJsonObject(parsed.quality_control) || {};
+            const qcIssues = asStringArray(qc.issues) || [];
+            const qcNotes = [
+              asString(qc.consistency_notes) || "",
+              asString(qc.appropriateness_notes) || "",
+              asString(qc.sensitivity_notes) || "",
+            ]
+              .filter(Boolean)
+              .join(" | ");
+
+            const progression = asString(parsed.progression_notes) || "Prompt refined by Contextual Analysis";
+            const issuesText = qcIssues.length > 0 ? ` QC Issues: ${qcIssues.join("; ")}` : "";
+            const notesText = qcNotes ? ` QC Notes: ${qcNotes}` : "";
+            let finalWardrobe = pWardrobe;
+            const wardrobeValidation = validateClothingColorCoverage(finalWardrobe);
+            if (!wardrobeValidation.ok) {
+              const attempt = ensureClothingColors(finalWardrobe, {
+                seed: `${String(sceneRow.story_id)}:${String(sceneId)}:wardrobe:retry`,
+                scene_text: safePrompt,
+                force_if_no_keywords: true,
+              }).text;
+              if (attempt) {
+                const retryValidation = validateClothingColorCoverage(attempt);
+                if (retryValidation.ok) {
+                  finalWardrobe = attempt;
+                }
+              }
+            }
+
+            refinedPrompt = [
+              pStyle,
+              pSubject,
+              pEnvironment,
+              finalWardrobe,
+              pPalette,
+              pComposition,
+              pQuality,
+              ...pKeywords,
+            ]
+              .filter(Boolean)
+              .join(", ");
+
+            const wardrobeValidation2 = validateClothingColorCoverage(finalWardrobe);
+            const wardrobeMissing = wardrobeValidation2.ok
+              ? ""
+              : ` Missing colors: ${wardrobeValidation2.missing.join(" | ")}`;
+            adaptationLog = `${progression}${issuesText}${notesText}${wardrobeMissing ? ` QC Colors:${wardrobeMissing}` : ""}`.trim();
           } else {
              // Fallback if no JSON found, try to use raw content but strip quotes
              refinedPrompt = content.replace(/^["']|["']$/g, "").trim();
@@ -1035,23 +1253,6 @@ serve(async (req: Request) => {
       console.error("Contextual Analysis error:", err);
     }
 
-    // Log the optimization to the new prompt_optimizations table
-    if (promptStructure || refinedPrompt) {
-      try {
-        await admin.from("prompt_optimizations").insert({
-          scene_id: sceneId,
-          story_id: sceneRow.story_id,
-          original_input: safePrompt,
-          optimized_prompt: promptStructure || { full_text: refinedPrompt },
-          final_prompt_text: refinedPrompt,
-          framework_version: "1.0.0",
-          model_used: analysisModel
-        });
-      } catch (e) {
-        console.warn("Failed to log prompt optimization:", e);
-      }
-    }
-
     // Final Prompt Construction
     // If analysis failed, use a structured fallback instead of simple concatenation
     const fullPromptRaw = refinedPrompt
@@ -1060,6 +1261,53 @@ serve(async (req: Request) => {
     
     // Ensure we don't exceed model limits (safe buffer)
     const fullPrompt = fullPromptRaw.length > 3000 ? fullPromptRaw.slice(0, 3000) : fullPromptRaw;
+
+    const primaryModel = model || "venice-sd35";
+    const requestParams = {
+      model: primaryModel,
+      artStyle: artStyle ?? undefined,
+      styleIntensity: typeof styleIntensity === "number" ? styleIntensity : undefined,
+      strictStyle: typeof strictStyle === "boolean" ? strictStyle : undefined,
+      disabledStyleElements,
+    };
+    const preprocessingStepsPreflight: string[] = ["sanitize_source_text"];
+    if (fullPromptRaw.length > 3000) preprocessingStepsPreflight.push("truncate_3000");
+    const usedPromptPreflight = computeUsedPromptForModel(fullPrompt, primaryModel);
+    if (usedPromptPreflight !== fullPrompt) preprocessingStepsPreflight.push("truncate_1400");
+    const promptHashPreflight = await sha256Hex(usedPromptPreflight);
+    lastPromptDebug = {
+      model: primaryModel,
+      prompt: usedPromptPreflight,
+      promptFull: fullPrompt,
+      preprocessingSteps: preprocessingStepsPreflight,
+      promptHash: promptHashPreflight,
+      requestParams,
+    };
+
+    try {
+      await admin.from("prompt_optimizations").insert({
+        scene_id: sceneId,
+        story_id: sceneRow.story_id,
+        original_input: safePrompt,
+        optimized_prompt: {
+          ...(promptStructure || (refinedPrompt ? { full_text: refinedPrompt } : {})),
+          app_prompt: {
+            full: fullPrompt,
+            raw: fullPromptRaw,
+            used: usedPromptPreflight,
+            preprocessingSteps: preprocessingStepsPreflight,
+            prompt_hash: promptHashPreflight,
+            image_model: primaryModel,
+            analysis_model: analysisModel,
+          },
+        },
+        final_prompt_text: fullPrompt,
+        framework_version: "1.0.0",
+        model_used: primaryModel,
+      });
+    } catch (e) {
+      console.warn("Failed to log prompt optimization:", e);
+    }
 
     if (Number(sceneRow.scene_number || 0) > 1 && activeCharacters.length > 0) {
       const prevNumber = Number(sceneRow.scene_number || 0) - 1;
@@ -1155,17 +1403,50 @@ serve(async (req: Request) => {
       }
     });
 
-    // Make sure we update the status BEFORE starting the heavy image generation
-    // This provides immediate feedback and also ensures the DB is reachable before spending credits
+    const existingDetails = asJsonObject(sceneRow.consistency_details) ?? {};
     const { error: statusUpdateError } = await admin
       .from("scenes")
-      .update({ generation_status: "generating" })
+      .update({
+        generation_status: "generating",
+        consistency_details: {
+          ...existingDetails,
+          generation_debug: {
+            timestamp: new Date().toISOString(),
+            requestId,
+            stage: "prompt_ready",
+            status: 0,
+            statusText: "",
+            model: primaryModel,
+            prompt: usedPromptPreflight,
+            prompt_full: fullPrompt,
+            preprocessingSteps: preprocessingStepsPreflight,
+            prompt_hash: promptHashPreflight,
+            requestParams,
+          },
+        },
+      })
       .eq("id", sceneId);
 
     if (statusUpdateError) {
        console.error("Failed to update status to generating:", statusUpdateError);
        // We don't abort, but we log it. It might indicate DB load issues.
     }
+    sceneRow.consistency_details = {
+      ...existingDetails,
+      generation_debug: {
+        timestamp: new Date().toISOString(),
+        requestId,
+        stage: "prompt_ready",
+        status: 0,
+        statusText: "",
+        model: primaryModel,
+        prompt: usedPromptPreflight,
+        prompt_full: fullPrompt,
+        preprocessingSteps: preprocessingStepsPreflight,
+        prompt_hash: promptHashPreflight,
+        requestParams,
+      },
+    };
 
     // Dynamic timeout calculation
     const elapsedPreGen = performance.now() - startTime;
@@ -1224,7 +1505,6 @@ serve(async (req: Request) => {
       return res;
     };
 
-    const primaryModel = model || "venice-sd35";
     const fallbackModel = "lustify-sdxl";
 
     let aiResponse = await generateImage(primaryModel);
@@ -1297,12 +1577,13 @@ serve(async (req: Request) => {
           reasons.push(`Model '${usedModel}' is not available to your API key. Available: ${availableModels.slice(0, 5).join(", ")}...`);
       }
 
-      // Capture exact prompt used for debugging
-      let usedPrompt = fullPrompt;
-      const limitedModels = ["hidream", "qwen-image", "z-image-turbo"];
-      if (usedModel.startsWith("lustify") || limitedModels.includes(usedModel)) {
-        usedPrompt = fullPrompt.length > 1400 ? fullPrompt.slice(0, 1400) : fullPrompt;
-      }
+      const usedPrompt = computeUsedPromptForModel(fullPrompt, usedModel);
+
+      const promptFull = fullPrompt;
+      const preprocessingSteps: string[] = ["sanitize_source_text"];
+      if (fullPromptRaw.length > 3000) preprocessingSteps.push("truncate_3000");
+      if (usedPrompt !== promptFull) preprocessingSteps.push("truncate_1400");
+      const promptHash = await sha256Hex(usedPrompt);
 
       await admin.from("scenes").update({ generation_status: "error" }).eq("id", sceneId);
 
@@ -1315,7 +1596,10 @@ serve(async (req: Request) => {
           http_status: aiResponse.status,
           model: usedModel,
           upstream_error: typeof aiErrorText === "string" ? aiErrorText.slice(0, 1000) : null,
-          prompt_used: usedPrompt
+          prompt_used: usedPrompt,
+          prompt_full: promptFull,
+          preprocessingSteps,
+          prompt_hash: promptHash,
         },
       });
 
@@ -1348,6 +1632,9 @@ serve(async (req: Request) => {
               upstream_error: upstreamError,
               reasons,
               prompt: usedPrompt,
+              prompt_full: promptFull,
+              preprocessingSteps,
+              prompt_hash: promptHash,
             },
           },
         })
@@ -1359,7 +1646,17 @@ serve(async (req: Request) => {
           requestId,
           stage: "image_generate",
           model: usedModel,
-          details: { headers: responseHeaders, redactedHeaders, statusText, upstream_error: upstreamError, reasons, prompt: usedPrompt },
+          details: {
+            headers: responseHeaders,
+            redactedHeaders,
+            statusText,
+            upstream_error: upstreamError,
+            reasons,
+            prompt: usedPrompt,
+            prompt_full: promptFull,
+            preprocessingSteps,
+            prompt_hash: promptHash,
+          },
         });
       }
       if (aiResponse.status === 402) {
@@ -1368,7 +1665,17 @@ serve(async (req: Request) => {
           requestId,
           stage: "image_generate",
           model: usedModel,
-          details: { headers: responseHeaders, redactedHeaders, statusText, upstream_error: upstreamError, reasons, prompt: usedPrompt },
+          details: {
+            headers: responseHeaders,
+            redactedHeaders,
+            statusText,
+            upstream_error: upstreamError,
+            reasons,
+            prompt: usedPrompt,
+            prompt_full: promptFull,
+            preprocessingSteps,
+            prompt_hash: promptHash,
+          },
         });
       }
       if (aiResponse.status === 400) {
@@ -1377,7 +1684,17 @@ serve(async (req: Request) => {
           error: "Content could not be processed. Try a different scene or style.",
           requestId,
           stage: "image_generate",
-          details: { headers: responseHeaders, redactedHeaders, statusText, upstream_error: body, reasons, prompt: usedPrompt },
+          details: {
+            headers: responseHeaders,
+            redactedHeaders,
+            statusText,
+            upstream_error: body,
+            reasons,
+            prompt: usedPrompt,
+            prompt_full: promptFull,
+            preprocessingSteps,
+            prompt_hash: promptHash,
+          },
           model: usedModel,
         });
       }
@@ -1387,7 +1704,17 @@ serve(async (req: Request) => {
           error: "Upstream image provider authentication failed.",
           requestId,
           stage: "image_generate",
-          details: { headers: responseHeaders, redactedHeaders, statusText, upstream_error: body, reasons, prompt: usedPrompt },
+          details: {
+            headers: responseHeaders,
+            redactedHeaders,
+            statusText,
+            upstream_error: body,
+            reasons,
+            prompt: usedPrompt,
+            prompt_full: promptFull,
+            preprocessingSteps,
+            prompt_hash: promptHash,
+          },
           model: usedModel,
         });
       }
@@ -1400,7 +1727,17 @@ serve(async (req: Request) => {
         error: `Upstream Generation Failed (${aiResponse.status})`, 
         requestId,
         stage: "image_generate",
-        details: { headers: responseHeaders, redactedHeaders, statusText, upstream_error: body, reasons, prompt: usedPrompt }, 
+        details: {
+          headers: responseHeaders,
+          redactedHeaders,
+          statusText,
+          upstream_error: body,
+          reasons,
+          prompt: usedPrompt,
+          prompt_full: promptFull,
+          preprocessingSteps,
+          prompt_hash: promptHash,
+        }, 
         model: usedModel 
       });
     }
@@ -1410,6 +1747,20 @@ serve(async (req: Request) => {
       .filter(([, v]) => v === "[redacted]")
       .map(([k]) => k);
     const statusText = String(aiResponse.statusText ?? "");
+
+    const usedPromptForUsedModel = computeUsedPromptForModel(fullPrompt, usedModel);
+    const preprocessingStepsForUsedModel: string[] = ["sanitize_source_text"];
+    if (fullPromptRaw.length > 3000) preprocessingStepsForUsedModel.push("truncate_3000");
+    if (usedPromptForUsedModel !== fullPrompt) preprocessingStepsForUsedModel.push("truncate_1400");
+    const promptHashForUsedModel = await sha256Hex(usedPromptForUsedModel);
+    lastPromptDebug = {
+      model: usedModel,
+      prompt: usedPromptForUsedModel,
+      promptFull: fullPrompt,
+      preprocessingSteps: preprocessingStepsForUsedModel,
+      promptHash: promptHashForUsedModel,
+      requestParams,
+    };
 
     const aiData = await aiResponse.json();
     console.log("AI response structure:", JSON.stringify(Object.keys(aiData)));
@@ -1434,6 +1785,11 @@ serve(async (req: Request) => {
               redactedHeaders,
               error: "No image data returned by upstream provider",
               model: usedModel,
+              prompt: usedPromptForUsedModel,
+              prompt_full: fullPrompt,
+              preprocessingSteps: preprocessingStepsForUsedModel,
+              prompt_hash: promptHashForUsedModel,
+              requestParams,
               reasons: deriveFailureReasons({
                 status: aiResponse.status,
                 statusText,
@@ -1465,6 +1821,11 @@ serve(async (req: Request) => {
           statusText,
           headers: responseHeaders,
           redactedHeaders,
+          prompt: usedPromptForUsedModel,
+          prompt_full: fullPrompt,
+          preprocessingSteps: preprocessingStepsForUsedModel,
+          prompt_hash: promptHashForUsedModel,
+          requestParams,
           reasons: deriveFailureReasons({
             status: aiResponse.status,
             statusText,
@@ -1518,13 +1879,32 @@ if (bytes.length < 1000 || isViolation) {
   await admin.from("scenes").update({
     generation_status: "error",
     consistency_status: "fail",
-    consistency_details: { ...errorDetails, generation_debug: errorDetails }
+    consistency_details: {
+      ...errorDetails,
+      generation_debug: {
+        ...errorDetails,
+        model: lastPromptDebug?.model ?? usedModel,
+        prompt: lastPromptDebug?.prompt,
+        prompt_full: lastPromptDebug?.promptFull,
+        preprocessingSteps: lastPromptDebug?.preprocessingSteps,
+        prompt_hash: lastPromptDebug?.promptHash,
+        requestParams: lastPromptDebug?.requestParams,
+      },
+    }
   }).eq("id", sceneId);
   return json(500, { 
     error: "Generated image invalid or blocked due to content policy.", 
     requestId, 
     stage: "image_validation",
-    details: errorDetails 
+    details: {
+      ...errorDetails,
+      model: lastPromptDebug?.model ?? usedModel,
+      prompt: lastPromptDebug?.prompt,
+      prompt_full: lastPromptDebug?.promptFull,
+      preprocessingSteps: lastPromptDebug?.preprocessingSteps,
+      prompt_hash: lastPromptDebug?.promptHash,
+      requestParams: lastPromptDebug?.requestParams,
+    } 
   });
 }
 
@@ -1543,10 +1923,23 @@ if (bytes.length < 1000 || isViolation) {
       } else {
         try {
           console.log("Running VLM validation...");
-        const referenceImages = characterValidationInputs
+        const expiresIn = Math.floor(
+          clampNumber(Deno.env.get("REFERENCE_SIGNED_URL_TTL_SECONDS") ?? "3600", 60, 60 * 60 * 24 * 30, 3600),
+        );
+        const sceneReferenceImages = await signSceneReferenceImages({
+          admin,
+          userId: user.id,
+          scene: sceneRow,
+          expiresIn,
+          limit: 2,
+        });
+
+        const characterReferenceImages = characterValidationInputs
           .map((c) => c.reference_image_url)
           .filter((u): u is string => typeof u === "string" && u.length > 0)
           .slice(0, 4);
+
+        const referenceImages = Array.from(new Set([...sceneReferenceImages, ...characterReferenceImages])).slice(0, 6);
 
         const requestText = `Return JSON only.
 
@@ -1758,8 +2151,14 @@ Score style adherence against the STYLE REFERENCE and STYLE GUIDE. If STRICT_STY
                     .from("scene-images")
                     .upload(retryFileName, retryFile, { contentType: retryMime, upsert: true });
 
-                   if (!retryUploadError) {
+                  if (!retryUploadError) {
                       const { data: retryUrlData } = admin.storage.from("scene-images").getPublicUrl(retryFileName);
+                      const retryPromptUsed = retryPrompt.slice(0, 1400);
+                      const preprocessingSteps: string[] = ["sanitize_source_text"];
+                      if (fullPromptRaw.length > 3000) preprocessingSteps.push("truncate_3000");
+                      preprocessingSteps.push("retry_prompt_adjustment");
+                      preprocessingSteps.push("truncate_1400");
+                      const promptHash = await sha256Hex(retryPromptUsed);
                       
                       // Log the retry success
                       await admin.from("consistency_logs").insert({
@@ -1775,11 +2174,57 @@ Score style adherence against the STYLE REFERENCE and STYLE GUIDE. If STRICT_STY
                         generation_status: "completed",
                         consistency_score: combinedScore,
                         consistency_status: "warn",
-                        consistency_details: { ...details, retried: true, retry: { original_status: status, original_score: combinedScore } }
+                        consistency_details: {
+                          ...details,
+                          retried: true,
+                          retry: { original_status: status, original_score: combinedScore },
+                          generation_debug: {
+                            timestamp: new Date().toISOString(),
+                            requestId,
+                            stage: "image_generate",
+                            status: 200,
+                            statusText: "OK",
+                            headers: retryHeaders,
+                            model: usedModel,
+                            prompt: retryPromptUsed,
+                            prompt_full: fullPrompt,
+                            preprocessingSteps,
+                            prompt_hash: promptHash,
+                            model_config: {
+                              width: 1024,
+                              height: 576,
+                              steps: 30,
+                              cfg_scale: 8.5,
+                              safe_mode: false,
+                              hide_watermark: true,
+                              embed_exif_metadata: false,
+                            },
+                          },
+                        }
                       }).eq("id", sceneId);
                       
                       const retryResponseHeaders = collectResponseHeaders(retryRes);
-                      return json(200, { success: true, imageUrl: retryUrlData.publicUrl, retried: true, requestId, headers: retryResponseHeaders });
+                      return json(200, {
+                        success: true,
+                        imageUrl: retryUrlData.publicUrl,
+                        retried: true,
+                        requestId,
+                        headers: retryResponseHeaders,
+                        model: usedModel,
+                        prompt: retryPromptUsed,
+                        promptFull: fullPrompt,
+                        preprocessingSteps,
+                        promptHash,
+                        modelConfig: {
+                          width: 1024,
+                          height: 576,
+                          steps: 30,
+                          cfg_scale: 8.5,
+                          safe_mode: false,
+                          hide_watermark: true,
+                          embed_exif_metadata: false,
+                        },
+                      });
                    }
                 }
               }
@@ -1802,7 +2247,39 @@ Score style adherence against the STYLE REFERENCE and STYLE GUIDE. If STRICT_STY
 
     if (uploadError) {
       console.error("Upload error:", uploadError);
-      await admin.from("scenes").update({ generation_status: "error" }).eq("id", sceneId);
+      const uploadExistingDetails = asJsonObject(sceneRow.consistency_details) ?? {};
+      const uploadExistingGen = asJsonObject(uploadExistingDetails.generation_debug) ?? {};
+      const promptPart = lastPromptDebug
+        ? {
+            model: lastPromptDebug.model,
+            prompt: lastPromptDebug.prompt,
+            prompt_full: lastPromptDebug.promptFull,
+            preprocessingSteps: lastPromptDebug.preprocessingSteps,
+            prompt_hash: lastPromptDebug.promptHash,
+            requestParams: lastPromptDebug.requestParams,
+          }
+        : {};
+      await admin
+        .from("scenes")
+        .update({
+          generation_status: "error",
+          consistency_status: "fail",
+          consistency_details: {
+            ...uploadExistingDetails,
+            generation_debug: {
+              ...uploadExistingGen,
+              timestamp: new Date().toISOString(),
+              requestId,
+              stage: "image_upload",
+              status: 500,
+              statusText: "Upload failed",
+              error: "Failed to store image",
+              uploadError: serializeSupabaseError(uploadError) ?? uploadError,
+              ...(promptPart as Record<string, unknown>),
+            },
+          },
+        })
+        .eq("id", sceneId);
       await logConsistency({
         story_id: sceneRow.story_id,
         scene_id: sceneId,
@@ -1810,7 +2287,20 @@ Score style adherence against the STYLE REFERENCE and STYLE GUIDE. If STRICT_STY
         status: "fail",
         details: { uploadError: serializeSupabaseError(uploadError) ?? uploadError },
       });
-      return json(500, { error: "Failed to store image", requestId, stage: "image_upload" });
+      return json(500, {
+        error: "Failed to store image",
+        requestId,
+        stage: "image_upload",
+        details: {
+          uploadError: serializeSupabaseError(uploadError) ?? uploadError,
+          model: lastPromptDebug?.model,
+          prompt: lastPromptDebug?.prompt,
+          prompt_full: lastPromptDebug?.promptFull,
+          preprocessingSteps: lastPromptDebug?.preprocessingSteps,
+          prompt_hash: lastPromptDebug?.promptHash,
+          requestParams: lastPromptDebug?.requestParams,
+        },
+      });
     }
     logTiming("image_upload");
 
@@ -1835,6 +2325,16 @@ Score style adherence against the STYLE REFERENCE and STYLE GUIDE. If STRICT_STY
       });
     }
 
+    const stepsForModel =
+      usedModel === "qwen-image" ? 8 : usedModel === "z-image-turbo" ? 0 : 30;
+    const usedPrompt = computeUsedPromptForModel(fullPrompt, usedModel);
+    const promptFull = fullPrompt;
+    const preprocessingSteps: string[] = ["sanitize_source_text"];
+    if (fullPromptRaw.length > 3000) preprocessingSteps.push("truncate_3000");
+    if (usedPrompt !== promptFull) preprocessingSteps.push("truncate_1400");
+    const promptHash = await sha256Hex(usedPrompt);
+    const baseDetails = asJsonObject(consistencyResult?.details) ?? { headers: responseHeaders };
+
     await admin
       .from("scenes")
       .update({
@@ -1842,19 +2342,114 @@ Score style adherence against the STYLE REFERENCE and STYLE GUIDE. If STRICT_STY
         generation_status: "completed",
         consistency_score: consistencyResult?.overallScore ?? null,
         consistency_status: consistencyResult?.status ?? null,
-        consistency_details: consistencyResult?.details ?? { headers: responseHeaders },
+        consistency_details: {
+          ...baseDetails,
+          generation_debug: {
+            timestamp: new Date().toISOString(),
+            requestId,
+            stage: "image_generate",
+            status: 200,
+            statusText: "OK",
+            headers: responseHeaders,
+            redactedHeaders,
+            model: usedModel,
+            prompt: usedPrompt,
+            prompt_full: promptFull,
+            preprocessingSteps,
+            prompt_hash: promptHash,
+            model_config: {
+              width: 1024,
+              height: 576,
+              steps: stepsForModel,
+              cfg_scale: 7.5,
+              safe_mode: false,
+              hide_watermark: true,
+              embed_exif_metadata: false,
+            },
+          },
+        },
       })
       .eq("id", sceneId);
 
     logTiming("final_db_update");
     console.log("Performance Timings:", JSON.stringify(timings));
 
-    return json(200, { success: true, imageUrl: urlData.publicUrl, requestId, headers: responseHeaders });
+    return json(200, {
+      success: true,
+      imageUrl: urlData.publicUrl,
+      requestId,
+      headers: responseHeaders,
+      model: usedModel,
+      prompt: usedPrompt,
+      promptFull,
+      preprocessingSteps,
+      promptHash,
+      modelConfig: {
+        width: 1024,
+        height: 576,
+        steps: stepsForModel,
+        cfg_scale: 7.5,
+        safe_mode: false,
+        hide_watermark: true,
+        embed_exif_metadata: false,
+      },
+    });
   } catch (error) {
     console.error("Error in generate-scene-image function:", error);
+    const details =
+      error instanceof Error
+        ? { message: error.message, name: error.name }
+        : { message: String(error) };
+    const sceneIdCandidate = requestedSceneId && UUID_REGEX.test(requestedSceneId) ? requestedSceneId : null;
+    if (admin && sceneIdCandidate) {
+      try {
+        const promptPart = lastPromptDebug
+          ? {
+              model: lastPromptDebug.model,
+              prompt: lastPromptDebug.prompt,
+              prompt_full: lastPromptDebug.promptFull,
+              preprocessingSteps: lastPromptDebug.preprocessingSteps,
+              prompt_hash: lastPromptDebug.promptHash,
+              requestParams: lastPromptDebug.requestParams,
+            }
+          : undefined;
+        const existing =
+          currentSceneRow && currentSceneRow.id === sceneIdCandidate
+            ? (asJsonObject(currentSceneRow.consistency_details) ?? {})
+            : {};
+        await admin
+          .from("scenes")
+          .update({
+            generation_status: "error",
+            consistency_status: "fail",
+            consistency_details: {
+              ...existing,
+              generation_debug: {
+                timestamp: new Date().toISOString(),
+                requestId,
+                stage: "exception",
+                error: "An unexpected error occurred. Please try again.",
+                details,
+                ...(promptPart ?? {}),
+              },
+            },
+          })
+          .eq("id", sceneIdCandidate);
+      } catch {
+        void 0;
+      }
+    }
     return json(500, {
       error: "An unexpected error occurred. Please try again.",
-      details: error instanceof Error ? error.message : String(error),
+      requestId,
+      stage: "exception",
+      details,
+      model: lastPromptDebug?.model,
+      prompt: lastPromptDebug?.prompt,
+      promptFull: lastPromptDebug?.promptFull,
+      preprocessingSteps: lastPromptDebug?.preprocessingSteps,
+      promptHash: lastPromptDebug?.promptHash,
+      requestParams: lastPromptDebug?.requestParams,
     });
   }
 });

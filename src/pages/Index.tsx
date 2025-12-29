@@ -111,7 +111,8 @@ export default function Index() {
                         title={story.title}
                         author="You"
                         sceneCount={story.scene_count}
-                        progress={story.status === 'completed' ? 100 : story.status === 'analyzed' ? 50 : 25}
+                        progress={story.scene_count > 0 ? Math.min(100, Math.round(((story.completed_scenes || 0) / story.scene_count) * 100)) : 0}
+                        completedScenes={story.completed_scenes || 0}
                         lastEdited={new Date(story.updated_at).toLocaleDateString()}
                         status={getStatusFromStoryStatus(story.status)}
                       />

@@ -361,6 +361,8 @@ export type Database = {
           summary: string | null
           title: string | null
           updated_at: string
+          user_feedback: string | null
+          user_rating: number | null
         }
         Insert: {
           characters?: string[] | null
@@ -381,6 +383,8 @@ export type Database = {
           summary?: string | null
           title?: string | null
           updated_at?: string
+          user_feedback?: string | null
+          user_rating?: number | null
         }
         Update: {
           characters?: string[] | null
@@ -401,10 +405,63 @@ export type Database = {
           summary?: string | null
           title?: string | null
           updated_at?: string
+          user_feedback?: string | null
+          user_rating?: number | null
         }
         Relationships: [
           {
             foreignKeyName: "scenes_story_id_fkey"
+            columns: ["story_id"]
+            isOneToOne: false
+            referencedRelation: "stories"
+            referencedColumns: ["id"]
+          },
+        ]
+      }
+      prompt_optimizations: {
+        Row: {
+          created_at: string
+          final_prompt_text: string | null
+          framework_version: string
+          id: string
+          model_used: string | null
+          optimized_prompt: Json | null
+          original_input: string | null
+          scene_id: string | null
+          story_id: string
+        }
+        Insert: {
+          created_at?: string
+          final_prompt_text?: string | null
+          framework_version: string
+          id?: string
+          model_used?: string | null
+          optimized_prompt?: Json | null
+          original_input?: string | null
+          scene_id?: string | null
+          story_id: string
+        }
+        Update: {
+          created_at?: string
+          final_prompt_text?: string | null
+          framework_version?: string
+          id?: string
+          model_used?: string | null
+          optimized_prompt?: Json | null
+          original_input?: string | null
+          scene_id?: string | null
+          story_id?: string
+        }
+        Relationships: [
+          {
+            foreignKeyName: "prompt_optimizations_scene_id_fkey"
+            columns: ["scene_id"]
+            isOneToOne: false
+            referencedRelation: "scenes"
+            referencedColumns: ["id"]
+          },
+          {
+            foreignKeyName: "prompt_optimizations_story_id_fkey"
             columns: ["story_id"]
             isOneToOne: false
             referencedRelation: "stories"
