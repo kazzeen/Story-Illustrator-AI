@@ -31,8 +31,8 @@ The project includes compliance and quality controls around character age requir
 ### Install and run the frontend
 
 ```sh
-git clone <YOUR_GIT_URL>
-cd <YOUR_PROJECT_NAME>
+git clone https://github.com/kazzeen/Story-Illustrator-AI.git
+cd Story-Illustrator-AI
 npm install
 ```
 
@@ -221,7 +221,7 @@ npm test
 
 ## 9. License Information
 
-No license file is present in this repository. Until a license is added, default copyright rules apply.
+This project is licensed under the MIT License - see the [LICENSE](LICENSE) file for details.
 
 ## 10. Badges
 
