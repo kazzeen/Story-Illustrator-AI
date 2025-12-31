@@ -1,5 +1,5 @@
 import { Link, useLocation, useNavigate } from "react-router-dom";
-import { BookOpen, Home, Upload, Grid3X3, LogIn, LogOut, Sparkles, User } from "lucide-react";
+import { BookOpen, Home, Upload, Grid3X3, LogIn, LogOut, Sparkles, User, CreditCard } from "lucide-react";
 import { Button } from "@/components/ui/button";
 import { cn } from "@/lib/utils";
 import { useAuth } from "@/hooks/useAuth";
@@ -14,12 +14,13 @@ const navItems = [
   { path: "/", icon: Home, label: "Dashboard" },
   { path: "/import", icon: Upload, label: "Import" },
   { path: "/storyboard", icon: Grid3X3, label: "Storyboard" },
+  { path: "/pricing", icon: CreditCard, label: "Pricing" },
 ];
 
 export function Navbar() {
   const location = useLocation();
   const navigate = useNavigate();
-  const { user, signOut } = useAuth();
+  const { user, signOut, profile } = useAuth();
 
   const handleSignOut = async () => {
     await signOut();
@@ -68,6 +69,15 @@ export function Navbar() {
           <div className="flex items-center gap-3">
             {user ? (
               <>
+                {profile && (
+                  <Link to="/pricing">
+                    <Button variant="ghost" size="sm" className="hidden sm:flex items-center gap-2">
+                      <CreditCard className="w-4 h-4" />
+                      <span className="font-semibold">{profile.credits_balance}</span>
+                      <span className="text-muted-foreground text-xs">credits</span>
+                    </Button>
+                  </Link>
+                )}
                 <Link to="/import">
                   <Button variant="hero" size="sm">
                     New Story

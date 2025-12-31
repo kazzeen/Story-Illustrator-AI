@@ -4,19 +4,45 @@ import { QuickActions } from "@/components/dashboard/QuickActions";
 import { Stats } from "@/components/dashboard/Stats";
 import { Button } from "@/components/ui/button";
 import { Plus, ArrowRight, Sparkles, LogIn } from "lucide-react";
-import { Link } from "react-router-dom";
+import type { KeyboardEvent, MouseEvent } from "react";
+import { Link, useNavigate } from "react-router-dom";
 import { useAuth } from "@/hooks/useAuth";
 import { useStories } from "@/hooks/useStories";
 import { Skeleton } from "@/components/ui/skeleton";
 
 export default function Index() {
   const { user, loading: authLoading } = useAuth();
-  const { stories, loading: storiesLoading } = useStories();
+  const { stories, latestStoryImageById, loading: storiesLoading } = useStories();
+  const navigate = useNavigate();
 
   const getStatusFromStoryStatus = (status: string): "draft" | "processing" | "complete" => {
     if (status === "completed") return "complete";
     if (["analyzing", "generating"].includes(status)) return "processing";
     return "draft";
+  };
+
+  const handleStoryGridClick = (event: MouseEvent<HTMLDivElement>) => {
+    const target = event.target as HTMLElement | null;
+    if (!target) return;
+    if (target.closest("button, a, input, textarea, select, [role='button']")) return;
+
+    const container = target.closest("[data-story-id]") as HTMLElement | null;
+    const storyId = container?.dataset?.storyId;
+    if (!storyId) return;
+    navigate(`/storyboard/${storyId}`);
+  };
+
+  const handleStoryGridKeyDown = (event: KeyboardEvent<HTMLDivElement>) => {
+    if (event.key !== "Enter" && event.key !== " ") return;
+    const target = event.target as HTMLElement | null;
+    if (!target) return;
+    if (target.closest("button, a, input, textarea, select, [role='button']")) return;
+
+    const container = target.closest("[data-story-id]") as HTMLElement | null;
+    const storyId = container?.dataset?.storyId;
+    if (!storyId) return;
+    event.preventDefault();
+    navigate(`/storyboard/${storyId}`);
   };
 
   return (
@@ -104,19 +130,31 @@ export default function Index() {
                   ))}
                 </div>
               ) : stories.length > 0 ? (
-                <div className="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-4 gap-6">
+                <div
+                  className="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-4 gap-6"
+                  onClick={handleStoryGridClick}
+                  onKeyDown={handleStoryGridKeyDown}
+                >
                   {stories.slice(0, 8).map((story) => (
-                    <Link key={story.id} to={`/storyboard/${story.id}`}>
+                    <div
+                      key={story.id}
+                      data-story-id={story.id}
+                      role="link"
+                      tabIndex={0}
+                      aria-label={`Open story: ${story.title}`}
+                      className="rounded-xl outline-none focus-visible:ring-2 focus-visible:ring-ring focus-visible:ring-offset-2 focus-visible:ring-offset-background"
+                    >
                       <StoryCard 
                         title={story.title}
                         author="You"
+                        coverImage={latestStoryImageById[story.id]}
                         sceneCount={story.scene_count}
                         progress={story.scene_count > 0 ? Math.min(100, Math.round(((story.completed_scenes || 0) / story.scene_count) * 100)) : 0}
                         completedScenes={story.completed_scenes || 0}
                         lastEdited={new Date(story.updated_at).toLocaleDateString()}
                         status={getStatusFromStoryStatus(story.status)}
                       />
-                    </Link>
+                    </div>
                   ))}
                 </div>
               ) : (

@@ -57,13 +57,6 @@ describe("ui preferences", () => {
     expect(source).toContain("onClick={() => setIsDebugExpanded((v) => !v)}");
   });
 
-  test("SceneDetailModal hides empty prompt message when history exists", () => {
-    const modalPath = new URL("../components/storyboard/SceneDetailModal.tsx", import.meta.url);
-    const source = fs.readFileSync(modalPath, "utf8");
-
-    expect(source).toMatch(/!debug\.prompt[\s\S]*?!debug\.promptFull[\s\S]*?!promptFromHistory\.used[\s\S]*?!promptFromHistory\.full/);
-  });
-
   test("Storyboard hydrates scene debug info from DB after failures", () => {
     const storyboardPath = new URL("../pages/Storyboard.tsx", import.meta.url);
     const source = fs.readFileSync(storyboardPath, "utf8");

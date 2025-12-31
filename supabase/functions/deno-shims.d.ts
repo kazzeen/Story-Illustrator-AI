@@ -49,8 +49,15 @@ declare module "https://esm.sh/@supabase/supabase-js@2.49.2" {
   export function createClient(url: string, key: string, options?: unknown): SupabaseClientLike;
 }
 
+declare module "https://deno.land/std@0.168.0/testing/asserts.ts" {
+  export function assertEquals(actual: unknown, expected: unknown, msg?: string): void;
+  export function assertMatch(actual: string, expected: RegExp, msg?: string): void;
+}
+
 declare const Deno: {
   env: {
     get(key: string): string | undefined;
   };
+  test(name: string, fn: () => void | Promise<void>): void;
+  test(options: { name: string; fn: () => void | Promise<void>; [key: string]: any }): void;
 };

@@ -8,6 +8,7 @@ import Index from "./pages/Index";
 import Import from "./pages/Import";
 import Storyboard from "./pages/Storyboard";
 import Auth from "./pages/Auth";
+import Pricing from "./pages/Pricing";
 import NotFound from "./pages/NotFound";
 
 const queryClient = new QueryClient();
@@ -22,6 +23,7 @@ const App = () => (
           <Routes>
             <Route path="/" element={<Index />} />
             <Route path="/auth" element={<Auth />} />
+            <Route path="/pricing" element={<Pricing />} />
             <Route path="/import" element={<Import />} />
             <Route path="/storyboard" element={<Storyboard />} />
             <Route path="/storyboard/:storyId" element={<Storyboard />} />

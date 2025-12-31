@@ -1,8 +1,9 @@
-import { useState, useEffect, useCallback } from 'react';
+import { useState, useEffect, useCallback, useRef } from 'react';
 import { supabase } from '@/integrations/supabase/client';
 import type { Json } from '@/integrations/supabase/types';
 import { useAuth } from './useAuth';
 import { useToast } from './use-toast';
+import { updateImagePromptWithAttributes } from '@/lib/scene-character-appearance';
 
 export interface Story {
   id: string;
@@ -45,13 +46,20 @@ export interface Scene {
 
 export function useStories() {
   const [stories, setStories] = useState<Story[]>([]);
+  const [latestStoryImageById, setLatestStoryImageById] = useState<Record<string, string>>({});
   const [loading, setLoading] = useState(true);
   const { user } = useAuth();
   const { toast } = useToast();
+  const latestStoryImageByIdRef = useRef<Record<string, string>>({});
+
+  useEffect(() => {
+    latestStoryImageByIdRef.current = latestStoryImageById;
+  }, [latestStoryImageById]);
 
   const fetchStories = useCallback(async () => {
     if (!user) {
       setStories([]);
+      setLatestStoryImageById({});
       setLoading(false);
       return;
     }
@@ -72,6 +80,32 @@ export function useStories() {
       if (scenesError) {
         console.error('Error fetching scenes:', scenesError);
         // Continue with stories only, progress will be 0
+      }
+
+      const storyIds = (storiesData as Story[]).map((s) => s.id).filter(Boolean);
+      if (storyIds.length > 0) {
+        const { data: scenesWithImages, error: scenesWithImagesError } = await supabase
+          .from("scenes")
+          .select("story_id, image_url, updated_at")
+          .in("story_id", storyIds)
+          .not("image_url", "is", null)
+          .order("updated_at", { ascending: false });
+
+        if (!scenesWithImagesError) {
+          const next: Record<string, string> = {};
+          (scenesWithImages || []).forEach((row) => {
+            const sid = typeof row.story_id === "string" ? row.story_id : null;
+            const url = typeof row.image_url === "string" ? row.image_url : null;
+            if (!sid || !url) return;
+            if (next[sid]) return;
+            next[sid] = url;
+          });
+          setLatestStoryImageById(next);
+        } else {
+          console.error("Error fetching latest scene images:", scenesWithImagesError);
+        }
+      } else {
+        setLatestStoryImageById({});
       }
 
       const storiesWithProgress = (storiesData as Story[]).map(story => {
@@ -102,6 +136,9 @@ export function useStories() {
         fetchStories();
       })
       .on('postgres_changes', { event: '*', schema: 'public', table: 'scenes' }, async (payload) => {
+        const eventTypeRaw = (payload as unknown as { eventType?: unknown }).eventType;
+        const eventType =
+          eventTypeRaw === "INSERT" || eventTypeRaw === "UPDATE" || eventTypeRaw === "DELETE" ? eventTypeRaw : null;
         const nextRaw = payload.new;
         const oldRaw = payload.old;
         const storyId =
@@ -113,22 +150,76 @@ export function useStories() {
             : null);
         if (!storyId) return;
 
-        // Fetch updated stats for this story
-        const { count: completedCount } = await supabase
-          .from('scenes')
-          .select('*', { count: 'exact', head: true })
-          .eq('story_id', storyId)
-          .eq('generation_status', 'completed');
+        const nextImageUrl =
+          nextRaw && typeof nextRaw === "object" && "image_url" in nextRaw && typeof (nextRaw as { image_url?: unknown }).image_url === "string"
+            ? ((nextRaw as { image_url: string }).image_url || "").trim()
+            : "";
+        const oldImageUrl =
+          oldRaw && typeof oldRaw === "object" && "image_url" in oldRaw && typeof (oldRaw as { image_url?: unknown }).image_url === "string"
+            ? ((oldRaw as { image_url: string }).image_url || "").trim()
+            : "";
 
-        setStories(prev => prev.map(story => {
-          if (story.id === storyId) {
-            return { 
-              ...story, 
-              completed_scenes: completedCount ?? story.completed_scenes 
-            };
+        if (nextImageUrl) {
+          setLatestStoryImageById((prev) => {
+            if (prev[storyId] === nextImageUrl) return prev;
+            return { ...prev, [storyId]: nextImageUrl };
+          });
+        } else if (oldImageUrl) {
+          const current = latestStoryImageByIdRef.current[storyId];
+          if (current && current === oldImageUrl) {
+            void (async () => {
+              const { data } = await supabase
+                .from("scenes")
+                .select("image_url, updated_at")
+                .eq("story_id", storyId)
+                .not("image_url", "is", null)
+                .order("updated_at", { ascending: false })
+                .limit(1);
+              const url = data?.[0]?.image_url;
+              if (typeof url !== "string" || !url.trim()) {
+                setLatestStoryImageById((prev) => {
+                  if (!prev[storyId]) return prev;
+                  const next = { ...prev };
+                  delete next[storyId];
+                  return next;
+                });
+                return;
+              }
+              const cleaned = url.trim();
+              setLatestStoryImageById((prev) => (prev[storyId] === cleaned ? prev : { ...prev, [storyId]: cleaned }));
+            })();
           }
-          return story;
-        }));
+        }
+
+        const nextStatus =
+          nextRaw && typeof nextRaw === "object" && "generation_status" in nextRaw
+            ? String((nextRaw as { generation_status?: unknown }).generation_status ?? "")
+            : "";
+        const oldStatus =
+          oldRaw && typeof oldRaw === "object" && "generation_status" in oldRaw
+            ? String((oldRaw as { generation_status?: unknown }).generation_status ?? "")
+            : "";
+
+        const shouldRecount = eventType === "DELETE" || (nextStatus && nextStatus !== oldStatus);
+        if (!shouldRecount) return;
+
+        const { count: completedCount } = await supabase
+          .from("scenes")
+          .select("*", { count: "exact", head: true })
+          .eq("story_id", storyId)
+          .eq("generation_status", "completed");
+
+        setStories((prev) => {
+          let changed = false;
+          const next = prev.map((story) => {
+            if (story.id !== storyId) return story;
+            const nextCompleted = typeof completedCount === "number" ? completedCount : story.completed_scenes;
+            if (nextCompleted === story.completed_scenes) return story;
+            changed = true;
+            return { ...story, completed_scenes: nextCompleted };
+          });
+          return changed ? next : prev;
+        });
       })
       .subscribe();
 
@@ -218,6 +309,7 @@ export function useStories() {
 
   return {
     stories,
+    latestStoryImageById,
     loading,
     fetchStories,
     createStory,
@@ -229,7 +321,106 @@ export function useStories() {
 export function useScenes(storyId: string | null) {
   const [scenes, setScenes] = useState<Scene[]>([]);
   const [loading, setLoading] = useState(true);
+  const [characterDefaultsByLowerName, setCharacterDefaultsByLowerName] = useState<
+    Record<string, { clothing?: string; accessories?: string; physical_attributes?: string }>
+  >({});
+  const scenesRef = useRef<Scene[]>([]);
   const { toast } = useToast();
+
+  useEffect(() => {
+    scenesRef.current = scenes;
+  }, [scenes]);
+
+  const refreshCharacterDefaults = useCallback(async () => {
+    if (!storyId) {
+      setCharacterDefaultsByLowerName({});
+      return { ok: false as const, byLowerName: {} as Record<string, { clothing?: string; accessories?: string; physical_attributes?: string }> };
+    }
+    try {
+      const { data, error } = await supabase
+        .from("characters")
+        .select("name, clothing, accessories, physical_attributes")
+        .eq("story_id", storyId);
+      if (error) throw error;
+
+      const next: Record<string, { clothing?: string; accessories?: string; physical_attributes?: string }> = {};
+      (data || []).forEach((row) => {
+        const name = typeof row.name === "string" ? row.name.trim() : "";
+        if (!name) return;
+        const key = name.toLowerCase();
+        const clothing = typeof row.clothing === "string" ? row.clothing : "";
+        const accessories = typeof row.accessories === "string" ? row.accessories : "";
+        const physical_attributes = typeof row.physical_attributes === "string" ? row.physical_attributes : "";
+        next[key] = {
+          clothing: clothing || undefined,
+          accessories: accessories || undefined,
+          physical_attributes: physical_attributes || undefined,
+        };
+      });
+
+      setCharacterDefaultsByLowerName(next);
+      return { ok: true as const, byLowerName: next };
+    } catch {
+      setCharacterDefaultsByLowerName({});
+      return { ok: false as const, byLowerName: {} as Record<string, { clothing?: string; accessories?: string; physical_attributes?: string }> };
+    }
+  }, [storyId]);
+
+  useEffect(() => {
+    void refreshCharacterDefaults();
+  }, [refreshCharacterDefaults]);
+
+  useEffect(() => {
+    if (!storyId) return;
+
+    type CharactersRealtimePayload =
+      | { eventType: "INSERT" | "UPDATE"; new: unknown; old?: unknown }
+      | { eventType: "DELETE"; old: unknown };
+
+    const channel = supabase
+      .channel(`characters:${storyId}`)
+      .on(
+        "postgres_changes",
+        { event: "*", schema: "public", table: "characters", filter: `story_id=eq.${storyId}` },
+        (payload) => {
+          const typed = payload as unknown as CharactersRealtimePayload;
+          const rowNew = typed.eventType === "DELETE" ? null : (typed.new as Record<string, unknown> | null);
+          const changedName =
+            rowNew && typeof rowNew.name === "string" ? rowNew.name.trim() : rowNew && rowNew.name ? String(rowNew.name).trim() : "";
+          const changedKey = changedName ? changedName.toLowerCase() : null;
+
+          void (async () => {
+            const { byLowerName } = await refreshCharacterDefaults();
+            if (!changedKey) return;
+
+            const impacted = scenesRef.current.filter((s) => {
+              if (typeof s.image_prompt !== "string" || s.image_prompt.trim().length === 0) return false;
+              const names = Array.isArray(s.characters) ? s.characters : [];
+              return names.some((n) => String(n || "").trim().toLowerCase() === changedKey);
+            });
+
+            for (const s of impacted) {
+              const base = s.image_prompt;
+              if (typeof base !== "string" || base.trim().length === 0) continue;
+              const nextPrompt = updateImagePromptWithAttributes({
+                basePrompt: base,
+                characterNames: s.characters,
+                characterStates: s.character_states,
+                defaultsByLowerName: byLowerName,
+              });
+              if (nextPrompt && nextPrompt !== base) {
+                void supabase.from("scenes").update({ image_prompt: nextPrompt }).eq("id", s.id);
+              }
+            }
+          })();
+        },
+      )
+      .subscribe();
+
+    return () => {
+      void supabase.removeChannel(channel);
+    };
+  }, [storyId, refreshCharacterDefaults]);
 
   useEffect(() => {
     if (!storyId) {
@@ -316,6 +507,26 @@ export function useScenes(storyId: string | null) {
             next.sort((a, b) => a.scene_number - b.scene_number);
             return next;
           });
+
+          if (typed.eventType === "INSERT") {
+            const promptRaw = normalizedNextScene.image_prompt;
+            const shouldUpdate =
+              typeof promptRaw === "string" &&
+              promptRaw.trim().length > 0 &&
+              Array.isArray(normalizedNextScene.characters) &&
+              normalizedNextScene.characters.length > 0;
+            if (shouldUpdate) {
+              const nextPrompt = updateImagePromptWithAttributes({
+                basePrompt: promptRaw,
+                characterNames: normalizedNextScene.characters,
+                characterStates: normalizedNextScene.character_states,
+                defaultsByLowerName: characterDefaultsByLowerName,
+              });
+              if (nextPrompt && nextPrompt !== promptRaw) {
+                void supabase.from("scenes").update({ image_prompt: nextPrompt }).eq("id", normalizedNextScene.id);
+              }
+            }
+          }
         },
       )
       .subscribe();
@@ -323,7 +534,7 @@ export function useScenes(storyId: string | null) {
     return () => {
       void supabase.removeChannel(channel);
     };
-  }, [storyId]);
+  }, [storyId, characterDefaultsByLowerName]);
 
   const fetchScenes = useCallback(async () => {
     if (!storyId) {
@@ -374,7 +585,7 @@ export function useScenes(storyId: string | null) {
       const existingDetails = parseJsonIfString(existingScene?.consistency_details);
       const nextDetails = parseJsonIfString(updates.consistency_details);
 
-      const finalUpdates =
+      const mergedDetailsUpdates =
         "consistency_details" in updates && isRecord(existingDetails) && isRecord(nextDetails)
           ? (() => {
               const existingGen = parseJsonIfString(existingDetails.generation_debug);
@@ -392,6 +603,32 @@ export function useScenes(storyId: string | null) {
               return { ...updates, consistency_details: mergedDetails as Json };
             })()
           : updates;
+
+      const shouldRefreshPrompt = ("character_states" in updates || "characters" in updates) && !("image_prompt" in updates);
+      const nextSceneForPrompt = existingScene
+        ? ({
+            ...existingScene,
+            ...mergedDetailsUpdates,
+            character_states:
+              "character_states" in mergedDetailsUpdates ? parseJsonIfString(mergedDetailsUpdates.character_states) : existingScene.character_states,
+            characters: "characters" in mergedDetailsUpdates ? mergedDetailsUpdates.characters : existingScene.characters,
+          } as Scene)
+        : null;
+
+      const refreshedPrompt =
+        shouldRefreshPrompt && nextSceneForPrompt
+          ? updateImagePromptWithAttributes({
+              basePrompt: nextSceneForPrompt.image_prompt,
+              characterNames: nextSceneForPrompt.characters,
+              characterStates: nextSceneForPrompt.character_states,
+              defaultsByLowerName: characterDefaultsByLowerName,
+            })
+          : null;
+
+      const finalUpdates =
+        shouldRefreshPrompt && refreshedPrompt && refreshedPrompt !== nextSceneForPrompt?.image_prompt
+          ? { ...mergedDetailsUpdates, image_prompt: refreshedPrompt }
+          : mergedDetailsUpdates;
 
       const { data, error } = await supabase
         .from('scenes')

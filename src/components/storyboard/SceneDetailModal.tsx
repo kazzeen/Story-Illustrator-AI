@@ -17,23 +17,19 @@ import { cn } from "@/lib/utils";
 import { validateSceneReferenceImageCandidate } from "@/lib/reference-images";
 import { supabase } from "@/integrations/supabase/client";
 import { buildVeniceEditPrompt, type ImageEditTool, inferImageMimeFromUrl, normalizeImageMime, type NormalizedRect, validateVeniceImageConstraints } from "@/lib/venice-image-edit";
-import { Save, X, RefreshCw, Wand2, AlertTriangle, Copy, Download, Edit3, Undo2, Redo2, Check, Square, Loader2, Upload, Trash2, ZoomIn, ZoomOut, RotateCcw, ChevronDown } from "lucide-react";
+import { Save, X, RefreshCw, Wand2, Copy, Download, Edit3, Undo2, Redo2, Check, Square, Loader2, Upload, Trash2, ZoomIn, ZoomOut, RotateCcw, ChevronDown } from "lucide-react";
 import { Scene } from "@/hooks/useStories";
 import { extractDetailedError, DetailedError } from "@/lib/error-reporting";
 import { useToast } from "@/hooks/use-toast";
-import { applyClothingColorsToCharacterStates } from "@/lib/scene-character-appearance";
+import { applyClothingColorsToCharacterStates, regenerateImagePromptFromCharacterStates, type SceneCharacterAppearanceState } from "@/lib/scene-character-appearance";
 import { ensureClothingColors, validateClothingColorCoverage } from "@/lib/clothing-colors";
 import { readBooleanPreference, writeBooleanPreference } from "@/lib/ui-preferences";
 
-interface PromptOptimization {
-  id: string;
-  created_at: string | null;
-  final_prompt_text: string | null;
-  optimized_prompt: Record<string, unknown> | null;
-  original_input: string | null;
-  model_used: string | null;
-  framework_version: string | null;
-}
+const EMPTY_APPEARANCE_STATE: SceneCharacterAppearanceState = {
+  clothing: "",
+  state: "",
+  physical_attributes: "",
+};
 
 interface SceneDetailModalProps {
   scene: Scene | null;
@@ -172,12 +168,13 @@ export function SceneDetailModal({
     }),
   );
   const [editedPrompt, setEditedPrompt] = useState("");
+  const [isUpdatingPrompt, setIsUpdatingPrompt] = useState(false);
   const [isSaving, setIsSaving] = useState(false);
   const [hasChanges, setHasChanges] = useState(false);
   const [styleFeedback, setStyleFeedback] = useState("");
   const [isSubmittingFeedback, setIsSubmittingFeedback] = useState(false);
-  const [characterStatesDraft, setCharacterStatesDraft] = useState<Record<string, Record<string, string>>>({});
-  const [originalCharacterStates, setOriginalCharacterStates] = useState<Record<string, Record<string, string>>>({});
+  const [characterStatesDraft, setCharacterStatesDraft] = useState<Record<string, SceneCharacterAppearanceState>>({});
+  const [originalCharacterStates, setOriginalCharacterStates] = useState<Record<string, SceneCharacterAppearanceState>>({});
   const [hasCharacterStateChanges, setHasCharacterStateChanges] = useState(false);
   const [isImageEditorOpen, setIsImageEditorOpen] = useState(false);
   const [editTool, setEditTool] = useState<ImageEditTool>("inpaint");
@@ -208,24 +205,8 @@ export function SceneDetailModal({
   const lastPersistedReferencesRef = useRef<string | null>(null);
   const referenceFileInputRef = useRef<HTMLInputElement | null>(null);
 
-  const [failedPromptEdit, setFailedPromptEdit] = useState("");
-  const [showRawPrompt, setShowRawPrompt] = useState(false);
-  const [promptTextView, setPromptTextView] = useState<"sent" | "full">("full");
-  const [promptHashState, setPromptHashState] = useState<"unavailable" | "match" | "mismatch">("unavailable");
-  const [refreshTrigger, setRefreshTrigger] = useState(0);
   const [directSceneDetails, setDirectSceneDetails] = useState<Record<string, unknown> | null>(null);
-  const [promptOptimizationsUnavailable, setPromptOptimizationsUnavailable] = useState(false);
-  // Added to fix ReferenceError
-  const [promptFromDebugHistory, setPromptFromDebugHistory] = useState<{ used?: string; full?: string }>({});
-  const [promptFromHistory, setPromptFromHistory] = useState<{ used?: string; full?: string; raw?: string }>({});
-
-  const [promptOptimizations, setPromptOptimizations] = useState<PromptOptimization[]>([]);
-  const [promptOptimizationError, setPromptOptimizationError] = useState<string | null>(null);
-  const [isLoadingPromptOptimizations, setIsLoadingPromptOptimizations] = useState(false);
-  const promptFetchSeqRef = useRef(0);
   const directFetchSeqRef = useRef(0);
-  const refreshBurstSeqRef = useRef(0);
-  const lastKnownPromptTsRef = useRef<number>(0);
 
 
 
@@ -261,7 +242,7 @@ export function SceneDetailModal({
 
       const raw = scene.character_states;
       const rawObj = raw && typeof raw === "object" && !Array.isArray(raw) ? (raw as Record<string, unknown>) : {};
-      const next: Record<string, Record<string, string>> = {};
+      const next: Record<string, SceneCharacterAppearanceState> = {};
 
       (scene.characters || []).forEach((name) => {
         const stateRaw = rawObj[name];
@@ -295,7 +276,7 @@ export function SceneDetailModal({
         storyId: scene.story_id,
         sceneId: scene.id,
         sceneText,
-        characterStates: next as Record<string, { clothing: string; state: string; physical_attributes: string }>,
+        characterStates: next,
       });
 
       setCharacterStatesDraft(colored);
@@ -306,29 +287,7 @@ export function SceneDetailModal({
 
   useEffect(() => {
     setDirectSceneDetails(null);
-    setPromptOptimizationsUnavailable(false);
   }, [scene?.id]);
-
-  const lastPromptRefreshKeyRef = useRef<string | null>(null);
-  useEffect(() => {
-    if (!scene?.id) return;
-    if (scene.generation_status !== "completed" && scene.generation_status !== "error") return;
-
-    const key = `${scene.id}:${scene.generation_status}:${scene.image_url ?? ""}`;
-    if (lastPromptRefreshKeyRef.current === key) return;
-    lastPromptRefreshKeyRef.current = key;
-
-    const t0 = window.setTimeout(() => setRefreshTrigger((v) => v + 1), 0);
-    const t1 = window.setTimeout(() => setRefreshTrigger((v) => v + 1), 1200);
-    return () => {
-      window.clearTimeout(t0);
-      window.clearTimeout(t1);
-    };
-  }, [scene?.id, scene?.generation_status, scene?.image_url]);
-
-  useEffect(() => {
-    if (!isOpen) refreshBurstSeqRef.current += 1;
-  }, [isOpen]);
 
   useEffect(() => {
     writeBooleanPreference({
@@ -346,97 +305,88 @@ export function SceneDetailModal({
     setHasChanges(next !== (scene?.image_prompt || ""));
   };
 
+  const clampPromptPreservingAppearanceAppendix = (value: string) => {
+    if (value.length <= PROMPT_CHAR_LIMIT) return value;
+    const idx = value.toLowerCase().indexOf("character appearance:");
+    if (idx < 0) return value.slice(0, PROMPT_CHAR_LIMIT);
+    const appendix = value.slice(idx).trim();
+    const remaining = PROMPT_CHAR_LIMIT - appendix.length - 2;
+    if (remaining <= 0) return appendix.slice(0, PROMPT_CHAR_LIMIT);
+    const base = value.slice(0, remaining).trim();
+    return `${base}\n\n${appendix}`.slice(0, PROMPT_CHAR_LIMIT);
+  };
+
+  const handleUpdatePromptWithCharacterStates = async () => {
+    if (!scene) return;
+    if (isUpdatingPrompt) return;
+
+    setIsUpdatingPrompt(true);
+    try {
+      const names = Array.isArray(scene.characters) ? scene.characters : [];
+      const sceneText = [
+        typeof scene.setting === "string" ? scene.setting : "",
+        typeof scene.emotional_tone === "string" ? scene.emotional_tone : "",
+        typeof scene.summary === "string" ? scene.summary : "",
+        typeof scene.original_text === "string" ? scene.original_text : "",
+      ]
+        .filter(Boolean)
+        .join(" • ");
+
+      const normalizedDraft: Record<string, SceneCharacterAppearanceState> = {};
+      for (const name of names) {
+        normalizedDraft[name] = characterStatesDraft[name] ?? EMPTY_APPEARANCE_STATE;
+      }
+
+      const { prompt, coloredCharacterStates } = regenerateImagePromptFromCharacterStates({
+        storyId: scene.story_id,
+        sceneId: scene.id,
+        sceneText,
+        basePrompt: editedPrompt,
+        characterNames: names,
+        characterStates: normalizedDraft,
+      });
+
+      const changedStates = names.some((n) => {
+        const curr = coloredCharacterStates[n] ?? EMPTY_APPEARANCE_STATE;
+        const orig = originalCharacterStates[n] ?? EMPTY_APPEARANCE_STATE;
+        return (
+          (curr.clothing || "") !== (orig.clothing || "") ||
+          (curr.state || "") !== (orig.state || "") ||
+          (curr.physical_attributes || "") !== (orig.physical_attributes || "")
+        );
+      });
+
+      setCharacterStatesDraft(coloredCharacterStates);
+      setHasCharacterStateChanges(changedStates);
+
+      const nextPrompt = clampPromptPreservingAppearanceAppendix(prompt);
+      setEditedPrompt(nextPrompt);
+      setHasChanges(nextPrompt !== (scene?.image_prompt || ""));
+    } catch (e) {
+      const msg = e instanceof Error ? e.message : "Failed to update prompt";
+      toast({ title: "Prompt update failed", description: msg, variant: "destructive" });
+    } finally {
+      setIsUpdatingPrompt(false);
+    }
+  };
+
   const fetchLatestSceneDetails = useCallback(
     async (sceneId: string) => {
       const seq = (directFetchSeqRef.current += 1);
       try {
         const { data, error } = await supabase.from("scenes").select("consistency_details").eq("id", sceneId).single();
-        if (directFetchSeqRef.current !== seq || error || !data) return null;
+        if (directFetchSeqRef.current !== seq || error || !data) return;
 
         const raw = data.consistency_details;
         const parsed = isPlainObject(raw) ? raw : typeof raw === "string" ? (JSON.parse(raw) as unknown) : null;
-        if (!isPlainObject(parsed)) return null;
+        if (!isPlainObject(parsed)) return;
 
         setDirectSceneDetails(parsed);
-        const gen = pickGenerationDebug(parsed);
-        const ts = safeDate(gen?.timestamp)?.getTime();
-        return typeof ts === "number" ? ts : null;
       } catch {
-        if (directFetchSeqRef.current === seq) return null;
-        return null;
+        if (directFetchSeqRef.current !== seq) return;
       }
     },
     [],
-  );
-
-  const fetchLatestPromptOptimizations = useCallback(
-    async (sceneId: string) => {
-      if (promptOptimizationsUnavailable) {
-        setIsLoadingPromptOptimizations(false);
-        return;
-      }
-      const seq = (promptFetchSeqRef.current += 1);
-      setIsLoadingPromptOptimizations(true);
-      try {
-        setPromptOptimizationError(null);
-        const { data, error } = await supabase
-          .from("prompt_optimizations")
-          .select("id, created_at, final_prompt_text, optimized_prompt, original_input, model_used, framework_version")
-          .eq("scene_id", sceneId)
-          .order("created_at", { ascending: false })
-          .limit(12);
-
-        if (promptFetchSeqRef.current !== seq) return;
-        if (error) {
-          const message = error.message || "Failed to load prompt history";
-          const missingTable =
-            message.toLowerCase().includes("schema cache") &&
-            message.toLowerCase().includes("prompt_optimizations") &&
-            (message.toLowerCase().includes("could not find the table") ||
-              message.toLowerCase().includes("relation") ||
-              message.toLowerCase().includes("does not exist"));
-          setPromptOptimizations([]);
-          if (missingTable) {
-            setPromptOptimizationsUnavailable(true);
-            setPromptOptimizationError("Prompt history unavailable (prompt_optimizations table is missing)");
-          } else {
-            setPromptOptimizationError(message);
-          }
-          return;
-        }
-
-        setPromptOptimizations(
-          (data || []).map((row) => ({
-            id: String((row as Record<string, unknown>).id),
-            created_at: typeof (row as Record<string, unknown>).created_at === "string" ? ((row as Record<string, unknown>).created_at as string) : null,
-            final_prompt_text:
-              typeof (row as Record<string, unknown>).final_prompt_text === "string"
-                ? ((row as Record<string, unknown>).final_prompt_text as string)
-                : null,
-            optimized_prompt:
-              (row as Record<string, unknown>).optimized_prompt && typeof (row as Record<string, unknown>).optimized_prompt === "object"
-                ? ((row as Record<string, unknown>).optimized_prompt as Record<string, unknown>)
-                : null,
-            original_input:
-              typeof (row as Record<string, unknown>).original_input === "string"
-                ? ((row as Record<string, unknown>).original_input as string)
-                : null,
-            model_used: typeof (row as Record<string, unknown>).model_used === "string" ? ((row as Record<string, unknown>).model_used as string) : null,
-            framework_version:
-              typeof (row as Record<string, unknown>).framework_version === "string"
-                ? ((row as Record<string, unknown>).framework_version as string)
-                : null,
-          })),
-        );
-      } catch (e) {
-        if (promptFetchSeqRef.current !== seq) return;
-        setPromptOptimizations([]);
-        setPromptOptimizationError(e instanceof Error ? e.message : "Failed to load prompt history");
-      } finally {
-        if (promptFetchSeqRef.current === seq) setIsLoadingPromptOptimizations(false);
-      }
-    },
-    [promptOptimizationsUnavailable],
   );
 
   const handleSave = async () => {
@@ -451,7 +401,7 @@ export function SceneDetailModal({
 
       if (hasCharacterStateChanges && onSaveCharacterStates) {
         const toSave: Record<string, unknown> = {};
-        const normalizedDraft: Record<string, Record<string, string>> = {};
+        const normalizedDraft: Record<string, SceneCharacterAppearanceState> = {};
         for (const [name, state] of Object.entries(characterStatesDraft)) {
           const clothingRaw = normalizeField(state.clothing || "", 400);
           const sceneText = [
@@ -525,7 +475,6 @@ export function SceneDetailModal({
     }
     
     await onRegenerate(scene.id);
-    startPromptRefreshBurst(scene.id);
   };
 
   const handleRegenerateStrictStyle = async () => {
@@ -546,7 +495,6 @@ export function SceneDetailModal({
     }
 
     await onRegenerateStrictStyle(scene.id);
-    startPromptRefreshBurst(scene.id);
   };
 
   const handleSubmitStyleMismatch = async () => {
@@ -565,16 +513,11 @@ export function SceneDetailModal({
 
   useEffect(() => {
     if (!scene?.id || !isOpen) return;
-    
-    let cancelled = false;
+
     void (async () => {
-      const ts = await fetchLatestSceneDetails(scene.id);
-      if (!cancelled && typeof ts === "number") lastKnownPromptTsRef.current = ts;
+      await fetchLatestSceneDetails(scene.id);
     })();
-    return () => {
-      cancelled = true;
-    };
-  }, [scene?.id, isOpen, refreshTrigger, fetchLatestSceneDetails]);
+  }, [scene?.id, isOpen, fetchLatestSceneDetails]);
 
   const sceneDetails = (() => {
     const raw = scene?.consistency_details;
@@ -615,31 +558,6 @@ export function SceneDetailModal({
         if (meaningful(v)) out[k] = v;
       }
 
-      const outPromptFull =
-        nonEmptyString(out.prompt_full) ?? nonEmptyString(out.promptFull);
-      const scenePromptFull =
-        nonEmptyString(sceneGen?.prompt_full) ?? nonEmptyString(sceneGen?.promptFull);
-      const directPromptFull =
-        nonEmptyString(directGen?.prompt_full) ?? nonEmptyString(directGen?.promptFull);
-
-      if (!scenePromptFull && directPromptFull) {
-        if (directGen?.timestamp !== undefined) out.timestamp = directGen.timestamp;
-      } else {
-        const directTs = safeDate(directGen?.timestamp)?.getTime();
-        const sceneTs = safeDate(sceneGen?.timestamp)?.getTime();
-        if (typeof directTs === "number" && typeof sceneTs === "number") {
-          out.timestamp = directTs >= sceneTs ? directGen?.timestamp : sceneGen?.timestamp;
-        } else if (typeof directTs === "number") {
-          out.timestamp = directGen?.timestamp;
-        } else if (typeof sceneTs === "number") {
-          out.timestamp = sceneGen?.timestamp;
-        }
-      }
-
-      if (!outPromptFull && directPromptFull) {
-        out.prompt_full = directPromptFull;
-      }
-
       return out;
     })();
 
@@ -658,30 +576,6 @@ export function SceneDetailModal({
 
   const requestParams =
     debugInfoRequestParams ?? (isPlainObject(persistedDebugRaw?.requestParams) ? persistedDebugRaw.requestParams : undefined);
-
-  const promptFromHistory = (() => {
-    const latest = promptOptimizations[0];
-    if (!latest) return { used: undefined, full: undefined, raw: undefined };
-
-    const opt = latest.optimized_prompt as Record<string, unknown> | null;
-    const app = opt?.app_prompt as Record<string, unknown> | undefined;
-
-    return {
-      used: typeof app?.used === "string" ? app.used : undefined,
-      full: typeof app?.full === "string" ? app.full : undefined,
-      raw: typeof app?.raw === "string" ? app.raw : undefined,
-    };
-  })();
-
-  const promptFromDebugHistory = (() => {
-    const params = requestParams as Record<string, unknown> | undefined;
-    const prompt = params?.prompt;
-
-    return {
-      used: typeof prompt === "string" ? prompt : undefined,
-      full: undefined,
-    };
-  })();
 
   const debug = {
     headers:
@@ -746,37 +640,6 @@ export function SceneDetailModal({
       (typeof persistedDebugRaw?.upstreamError === "string" ? persistedDebugRaw.upstreamError : undefined) ??
       (typeof persistedDetails?.upstream_error === "string" ? persistedDetails.upstream_error : undefined) ??
       (typeof persistedDetails?.upstreamError === "string" ? persistedDetails.upstreamError : undefined),
-    prompt:
-      nonEmptyString(debugInfo?.prompt) ??
-      nonEmptyString(persistedDebugRaw?.prompt) ??
-      nonEmptyString(persistedDebugRaw?.prompt_used) ??
-      nonEmptyString(persistedDetails?.prompt) ??
-      promptFromDebugHistory.used ??
-      promptFromHistory.used ??
-      promptFromHistory.full,
-    promptFull:
-      (() => {
-        const used =
-          nonEmptyString(debugInfo?.prompt) ??
-          nonEmptyString(persistedDebugRaw?.prompt) ??
-          nonEmptyString(persistedDebugRaw?.prompt_used) ??
-          nonEmptyString(persistedDetails?.prompt) ??
-          promptFromDebugHistory.used ??
-          promptFromHistory.used ??
-          promptFromHistory.full;
-
-        const fromDebug =
-          nonEmptyString(debugInfo?.promptFull) ??
-          nonEmptyString((debugInfo as Record<string, unknown> | undefined)?.prompt_full) ??
-          nonEmptyString((persistedDebugRaw as Record<string, unknown> | null)?.prompt_full) ??
-          nonEmptyString((persistedDebugRaw as Record<string, unknown> | null)?.promptFull) ??
-          nonEmptyString(persistedDetails?.prompt_full) ??
-          nonEmptyString(persistedDetails?.promptFull) ??
-          promptFromDebugHistory.full;
-
-        if (promptFromHistory.raw && (!fromDebug || (used && fromDebug === used))) return promptFromHistory.raw;
-        return fromDebug ?? promptFromHistory.raw ?? promptFromHistory.full;
-      })(),
     preprocessingSteps:
       (debugInfo && "preprocessingSteps" in debugInfo && Array.isArray(debugInfo.preprocessingSteps)
         ? debugInfo.preprocessingSteps.filter((v): v is string => typeof v === "string")
@@ -795,151 +658,7 @@ export function SceneDetailModal({
       (debugInfo && "modelConfig" in debugInfo ? debugInfo.modelConfig : undefined) ??
       ((persistedDebugRaw as Record<string, unknown> | null)?.model_config ??
         (persistedDebugRaw as Record<string, unknown> | null)?.modelConfig),
-    promptHash:
-      (debugInfo && "promptHash" in debugInfo && typeof debugInfo.promptHash === "string" ? debugInfo.promptHash : undefined) ??
-      (typeof (persistedDebugRaw as Record<string, unknown> | null)?.prompt_hash === "string"
-        ? ((persistedDebugRaw as Record<string, unknown>).prompt_hash as string)
-        : undefined),
-    promptHistory: debugInfo && "promptHistory" in debugInfo ? (debugInfo as Record<string, unknown>).promptHistory : undefined,
   };
-
-  useEffect(() => {
-    const t = debug.timestamp?.getTime();
-    if (typeof t === "number") lastKnownPromptTsRef.current = t;
-  }, [debug.timestamp]);
-
-  const startPromptRefreshBurst = useCallback(
-    (sceneId: string) => {
-      const seq = (refreshBurstSeqRef.current += 1);
-      const baseline = lastKnownPromptTsRef.current;
-      const deadline = Date.now() + 45_000;
-      setRefreshTrigger((v) => v + 1);
-
-      void (async () => {
-        while (refreshBurstSeqRef.current === seq && isOpen && Date.now() < deadline) {
-          const ts = await fetchLatestSceneDetails(sceneId);
-          if (!promptOptimizationsUnavailable) await fetchLatestPromptOptimizations(sceneId);
-          if (typeof ts === "number") lastKnownPromptTsRef.current = ts;
-          if (typeof ts === "number" && ts > baseline) break;
-          await new Promise<void>((resolve) => window.setTimeout(resolve, 1500));
-        }
-      })();
-    },
-    [fetchLatestPromptOptimizations, fetchLatestSceneDetails, isOpen, promptOptimizationsUnavailable],
-  );
-
-  useEffect(() => {
-    if (!scene?.id || !isOpen) return;
-
-    const channel = supabase.channel(`scene_modal_prompt_${scene.id}`);
-    const bump = () => setRefreshTrigger((v) => v + 1);
-
-    channel.on(
-      "postgres_changes",
-      { event: "UPDATE", schema: "public", table: "scenes", filter: `id=eq.${scene.id}` },
-      () => bump(),
-    );
-    if (!promptOptimizationsUnavailable) {
-      channel.on(
-        "postgres_changes",
-        { event: "INSERT", schema: "public", table: "prompt_optimizations", filter: `scene_id=eq.${scene.id}` },
-        () => bump(),
-      );
-      channel.on(
-        "postgres_changes",
-        { event: "UPDATE", schema: "public", table: "prompt_optimizations", filter: `scene_id=eq.${scene.id}` },
-        () => bump(),
-      );
-    }
-
-    channel.subscribe();
-    return () => {
-      void supabase.removeChannel(channel);
-    };
-  }, [scene?.id, isOpen, promptOptimizationsUnavailable]);
-
-  useEffect(() => {
-    if (!scene?.id || !isOpen) return;
-    if (!isGenerating) return;
-    startPromptRefreshBurst(scene.id);
-  }, [isGenerating, isOpen, scene?.id, startPromptRefreshBurst]);
-
-  const userChangedPromptViewRef = useRef(false);
-  const lastAutoExpandKeyRef = useRef<string | null>(null);
-  useEffect(() => {
-    if (!scene?.id) return;
-    const ts = debug.timestamp?.toISOString();
-    if (!ts) return;
-    const key = `${scene.id}:${ts}`;
-    if (lastAutoExpandKeyRef.current === key) return;
-    lastAutoExpandKeyRef.current = key;
-
-    const hasAnyPrompt = Boolean(nonEmptyString(debug.promptFull) ?? nonEmptyString(debug.prompt));
-    if (!hasAnyPrompt) return;
-    if (scene.generation_status !== "completed" && scene.generation_status !== "error") return;
-
-    setIsDebugExpanded(true);
-  }, [scene?.id, scene?.generation_status, debug.prompt, debug.promptFull, debug.timestamp]);
-
-  useEffect(() => {
-    if (!scene?.id) return;
-    userChangedPromptViewRef.current = false;
-    setPromptTextView("full");
-  }, [scene?.id]);
-
-  useEffect(() => {
-    const fullCandidate = nonEmptyString(debug.promptFull) ?? promptFromHistory.raw ?? promptFromHistory.full;
-    const sentCandidate = nonEmptyString(debug.prompt) ?? promptFromHistory.used;
-    const next =
-      promptTextView === "full"
-        ? (fullCandidate ?? sentCandidate ?? "")
-        : (sentCandidate ?? fullCandidate ?? "");
-    setFailedPromptEdit(next);
-  }, [debug.prompt, debug.promptFull, promptTextView, promptFromHistory.full, promptFromHistory.raw, promptFromHistory.used]);
-
-  useEffect(() => {
-    let cancelled = false;
-    const run = async () => {
-      if (!debug.prompt || !debug.promptHash || !window.crypto?.subtle) {
-        if (!cancelled) setPromptHashState("unavailable");
-        return;
-      }
-      try {
-        const bytes = new TextEncoder().encode(debug.prompt);
-        const hash = await window.crypto.subtle.digest("SHA-256", bytes);
-        const hex = Array.from(new Uint8Array(hash))
-          .map((b) => b.toString(16).padStart(2, "0"))
-          .join("");
-        if (!cancelled) setPromptHashState(hex === debug.promptHash ? "match" : "mismatch");
-      } catch {
-        if (!cancelled) setPromptHashState("unavailable");
-      }
-    };
-    void run();
-    return () => {
-      cancelled = true;
-    };
-  }, [debug.prompt, debug.promptHash]);
-
-  useEffect(() => {
-    if (!scene?.id || !isOpen) return;
-    if (promptOptimizationsUnavailable) return;
-    
-    let cancelled = false;
-    const run = async () => {
-      try {
-        await fetchLatestPromptOptimizations(scene.id);
-      } catch (e) {
-        if (cancelled) return;
-        setPromptOptimizations([]);
-        setPromptOptimizationError(e instanceof Error ? e.message : "Failed to load prompt history");
-      }
-    };
-    void run();
-    return () => {
-      cancelled = true;
-    };
-  }, [scene?.id, isOpen, refreshTrigger, fetchLatestPromptOptimizations, promptOptimizationsUnavailable]);
 
   let detailedError: DetailedError | null = null;
   try {
@@ -956,29 +675,16 @@ export function SceneDetailModal({
     console.error("Failed to extract detailed error:", e);
   }
 
-  const handleApplyFailedPrompt = () => {
-    setEditedPrompt(failedPromptEdit);
-    setHasChanges(true);
-    toast({
-      title: "Prompt Updated",
-      description: "The failed system prompt has been copied to the editor. Review and modify it, then save and retry.",
-    });
-  };
-
-  const updateCharacterState = (name: string, key: string, value: string) => {
+  const updateCharacterState = (name: string, key: "clothing" | "state" | "physical_attributes", value: string) => {
     setCharacterStatesDraft((prev) => {
-      const next = {
-        ...prev,
-        [name]: {
-          ...(prev[name] || {}),
-          [key]: value,
-        },
-      };
+      const prevState = prev[name] ?? EMPTY_APPEARANCE_STATE;
+      const nextState: SceneCharacterAppearanceState = { ...prevState, [key]: value };
+      const next: Record<string, SceneCharacterAppearanceState> = { ...prev, [name]: nextState };
 
       const names = scene?.characters || [];
       const changed = names.some((n) => {
-        const curr = next[n] || {};
-        const orig = originalCharacterStates[n] || {};
+        const curr = next[n] ?? EMPTY_APPEARANCE_STATE;
+        const orig = originalCharacterStates[n] ?? EMPTY_APPEARANCE_STATE;
         return (
           (curr.clothing || "") !== (orig.clothing || "") ||
           (curr.state || "") !== (orig.state || "") ||
@@ -1886,7 +1592,7 @@ export function SceneDetailModal({
 
     names.forEach((name) => {
       const prev = getPrev(name);
-      const currRaw = characterStatesDraft[name] || {};
+      const currRaw = characterStatesDraft[name] ?? EMPTY_APPEARANCE_STATE;
       const curr = {
         clothing: normalizeField(currRaw.clothing || "", 400),
         state: normalizeField(currRaw.state || "", 400),
@@ -2713,238 +2419,6 @@ ${debug.upstreamError ? `\n[DEBUG] Upstream Diagnostic:\n${debug.upstreamError}`
                         </div>
                       </div>
 
-                      {(debug.prompt ||
-                        debug.promptFull ||
-                        promptFromHistory.used ||
-                        promptFromHistory.full ||
-                        isLoadingPromptOptimizations ||
-                        !!promptOptimizationError) && (
-                        <div
-                          className={cn(
-                            "space-y-2 rounded-md p-3 border",
-                            scene.generation_status === "error"
-                              ? "border-red-200 dark:border-red-900/50 bg-red-50/50 dark:bg-red-900/10"
-                              : "border-blue-200 dark:border-blue-900/50 bg-blue-50/50 dark:bg-blue-900/10",
-                          )}
-                        >
-                          <div className="flex items-center justify-between gap-2">
-                            <Label
-                              className={cn(
-                                "text-sm font-medium flex items-center gap-2",
-                                scene.generation_status === "error"
-                                  ? "text-red-700 dark:text-red-400"
-                                  : "text-blue-700 dark:text-blue-400",
-                              )}
-                            >
-                              <AlertTriangle className="w-4 h-4" />
-                              Generation Prompt ({promptTextView === "full" ? "Full" : "Sent"})
-                            </Label>
-                            <div className="flex items-center gap-2">
-                              {debug.timestamp && (
-                                <Badge variant="outline" className="text-[10px] font-mono">
-                                  {debug.timestamp.toISOString()}
-                                </Badge>
-                              )}
-                              {promptHashState !== "unavailable" && (
-                                <Badge variant={promptHashState === "match" ? "secondary" : "destructive"} className="text-[10px] font-mono">
-                                  {promptHashState === "match" ? "hash=ok" : "hash=mismatch"}
-                                </Badge>
-                              )}
-                              {(() => {
-                                const fullCandidate =
-                                  typeof debug.promptFull === "string" && debug.promptFull.length > 0 ? debug.promptFull : promptFromHistory.full;
-                                return (
-                                  typeof fullCandidate === "string" &&
-                                  fullCandidate.length > 0 &&
-                                  typeof debug.prompt === "string" &&
-                                  debug.prompt.length > 0 &&
-                                  fullCandidate !== debug.prompt
-                                );
-                              })() && (
-                                <Button
-                                  size="sm"
-                                  variant="ghost"
-                                  className="h-7 text-xs"
-                                  onClick={() => {
-                                    userChangedPromptViewRef.current = true;
-                                    setPromptTextView((v) => (v === "full" ? "sent" : "full"));
-                                  }}
-                                >
-                                  {promptTextView === "full" ? "Sent" : "Full"}
-                                </Button>
-                              )}
-                              <Button
-                                size="sm"
-                                variant="ghost"
-                                className="h-7 text-xs"
-                                onClick={() => copyText("Prompt copied to clipboard", failedPromptEdit)}
-                              >
-                                <Copy className="w-3.5 h-3.5 mr-1" />
-                                Copy
-                              </Button>
-                              <Button
-                                size="sm"
-                                variant="ghost"
-                                className="h-7 text-xs"
-                                onClick={() => setShowRawPrompt((v) => !v)}
-                              >
-                                {showRawPrompt ? "Formatted" : "Raw"}
-                              </Button>
-                              <Button size="sm" variant="ghost" className="h-7 text-xs" onClick={handleApplyFailedPrompt}>
-                                Copy to Editor
-                              </Button>
-                            </div>
-                          </div>
-
-                          {!failedPromptEdit ? (
-                            <div className="rounded-md border border-border/60 bg-secondary/10 p-2 text-xs text-muted-foreground">
-                              {isLoadingPromptOptimizations
-                                ? "Loading prompt..."
-                                : scene.generation_status === "completed"
-                                  ? "Generation prompt not found."
-                                  : "No generation prompt is available for this scene yet."}
-                            </div>
-                          ) : showRawPrompt ? (
-                            <pre className="min-h-[100px] max-h-[300px] overflow-auto whitespace-pre-wrap break-words rounded-md bg-transparent p-2 font-mono text-xs border border-border/50">
-                              {failedPromptEdit}
-                            </pre>
-                          ) : (
-                            <Textarea
-                              value={failedPromptEdit}
-                              readOnly={scene.generation_status !== "error"}
-                              onChange={(e) => setFailedPromptEdit(e.target.value)}
-                              className={cn(
-                                "min-h-[100px] resize-none font-mono text-xs bg-transparent",
-                                scene.generation_status === "error"
-                                  ? "border-red-200 dark:border-red-900/30 focus-visible:ring-red-500"
-                                  : "border-blue-200 dark:border-blue-900/30 focus-visible:ring-blue-500",
-                              )}
-                            />
-                          )}
-
-                          <div className="flex flex-wrap gap-2 text-[10px] text-muted-foreground">
-                            {debug.timestamp && <span className="font-mono">ts={debug.timestamp.toISOString()}</span>}
-                            {debug.model && <span className="font-mono">model={debug.model}</span>}
-                            <span className="font-mono">view={promptTextView}</span>
-                            <span className="font-mono">len={failedPromptEdit.length}</span>
-                            {Array.isArray(debug.preprocessingSteps) && debug.preprocessingSteps.length > 0 && (
-                              <span className="font-mono">steps={debug.preprocessingSteps.join(",")}</span>
-                            )}
-                            {(() => {
-                              const fullCandidate =
-                                typeof debug.promptFull === "string" && debug.promptFull.length > 0 ? debug.promptFull : promptFromHistory.full;
-                              return typeof fullCandidate === "string" && fullCandidate.length > 0 && fullCandidate !== failedPromptEdit ? (
-                                <span className="font-mono">fullLen={fullCandidate.length}</span>
-                              ) : null;
-                            })()}
-                          </div>
-
-                          {(isLoadingPromptOptimizations || promptOptimizationError || promptOptimizations.length > 0) && (
-                            <div className="mt-2 space-y-2">
-                              <div className="flex items-center justify-between">
-                                <div className="text-xs font-semibold text-muted-foreground">Prompt History</div>
-                                {isLoadingPromptOptimizations && (
-                                  <Badge variant="outline" className="text-[10px] font-mono">
-                                    loading…
-                                  </Badge>
-                                )}
-                              </div>
-
-                              {promptOptimizationError && (
-                                <div className="rounded-md border border-border/60 bg-secondary/30 p-2 text-xs">
-                                  {promptOptimizationError}
-                                </div>
-                              )}
-
-                              {promptOptimizations.length > 0 && (
-                                <div className="grid gap-2">
-                                  {promptOptimizations.map((row) => {
-                                    const ts = row.created_at ? safeDate(row.created_at) : undefined;
-                                    const text = row.final_prompt_text || "";
-                                    return (
-                                      <div key={row.id} className="rounded-md border border-border/60 bg-secondary/10 p-2">
-                                        <div className="flex flex-wrap items-center justify-between gap-2">
-                                          <div className="flex flex-wrap items-center gap-2">
-                                            {ts && (
-                                              <Badge variant="outline" className="text-[10px] font-mono">
-                                                {ts.toLocaleString()}
-                                              </Badge>
-                                            )}
-                                            {row.model_used && (
-                                              <Badge variant="outline" className="text-[10px] font-mono">
-                                                model={row.model_used}
-                                              </Badge>
-                                            )}
-                                            {row.framework_version && (
-                                              <Badge variant="outline" className="text-[10px] font-mono">
-                                                fw={row.framework_version}
-                                              </Badge>
-                                            )}
-                                          </div>
-                                          <div className="flex items-center gap-2">
-                                            <Button
-                                              size="sm"
-                                              variant="ghost"
-                                              className="h-7 text-xs"
-                                              onClick={() => copyText("Historical prompt copied", text)}
-                                              disabled={!text}
-                                            >
-                                              Copy
-                                            </Button>
-                                            <Button
-                                              size="sm"
-                                              variant="ghost"
-                                              className="h-7 text-xs"
-                                              onClick={() => {
-                                                setEditedPrompt(text);
-                                                setHasChanges(true);
-                                                toast({ title: "Prompt Updated", description: "Historical prompt copied to the editor." });
-                                              }}
-                                              disabled={!text}
-                                            >
-                                              Use
-                                            </Button>
-                                          </div>
-                                        </div>
-                                        {text && (
-                                          <pre className="mt-2 max-h-[120px] overflow-auto whitespace-pre-wrap break-words rounded bg-background/20 p-2 font-mono text-[11px]">
-                                            {text}
-                                          </pre>
-                                        )}
-                                      </div>
-                                    );
-                                  })}
-                                </div>
-                              )}
-
-                              {!isLoadingPromptOptimizations && !promptOptimizationError && promptOptimizations.length === 0 && (
-                                <div className="rounded-md border border-border/60 bg-secondary/10 p-2 text-xs text-muted-foreground">
-                                  No prompt history available for this scene.
-                                </div>
-                              )}
-                            </div>
-                          )}
-                        </div>
-                      )}
-                      {!debug.prompt &&
-                        !debug.promptFull &&
-                        !promptFromHistory.used &&
-                        !promptFromHistory.full &&
-                        !isLoadingPromptOptimizations &&
-                        !promptOptimizationError && (
-                        <div className="rounded-md border border-border/60 bg-secondary/10 p-2 text-xs text-muted-foreground">
-                          {isLoadingPromptOptimizations ? (
-                            <div className="flex items-center gap-2">
-                              <Loader2 className="h-3 w-3 animate-spin" />
-                              <span>Loading prompt history...</span>
-                            </div>
-                          ) : scene.generation_status === "completed" ? (
-                            "Generation prompt not found."
-                          ) : (
-                            "No generation prompt is available for this scene yet."
-                          )}
-                        </div>
-                      )}
                     </div>
                   </div>
                 </div>
@@ -3142,9 +2616,25 @@ ${debug.upstreamError ? `\n[DEBUG] Upstream Diagnostic:\n${debug.upstreamError}`
           {/* Editable Prompt */}
           <div className="space-y-2">
             <div className="flex items-center justify-between">
-              <Label htmlFor="prompt" className="text-sm font-medium">
-                Image Prompt
-              </Label>
+              <div className="flex items-center gap-2">
+                <Label htmlFor="prompt" className="text-sm font-medium">
+                  Image Prompt
+                </Label>
+                <Button
+                  type="button"
+                  size="sm"
+                  variant="outline"
+                  onClick={() => void handleUpdatePromptWithCharacterStates()}
+                  disabled={!scene || isUpdatingPrompt}
+                >
+                  {isUpdatingPrompt ? (
+                    <Loader2 className="w-4 h-4 mr-2 animate-spin" />
+                  ) : (
+                    <Wand2 className="w-4 h-4 mr-2" />
+                  )}
+                  {isUpdatingPrompt ? "Updating..." : "Update"}
+                </Button>
+              </div>
               {(hasChanges || hasCharacterStateChanges) && (
                 <Badge variant="outline" className="text-yellow-500 border-yellow-500/50">
                   Unsaved changes

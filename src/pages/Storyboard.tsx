@@ -3,10 +3,14 @@ import { useParams, useNavigate } from "react-router-dom";
 import { Layout } from "@/components/layout/Layout";
 import { StyleSelector } from "@/components/storyboard/StyleSelector";
 import { ModelSelector } from "@/components/storyboard/ModelSelector";
+import { imageModels } from "@/components/storyboard/model-data";
 import { SceneDetailModal } from "@/components/storyboard/SceneDetailModal";
 import { Button } from "@/components/ui/button";
 import { Badge } from "@/components/ui/badge";
 import { Card } from "@/components/ui/card";
+import { Label } from "@/components/ui/label";
+import { Slider } from "@/components/ui/slider";
+import { Switch } from "@/components/ui/switch";
 import { 
   Download, 
   Play, 
@@ -51,6 +55,7 @@ import { StorySceneDragDropEditor, type StorySceneAnchors } from "@/components/s
 import { Tabs, TabsContent, TabsList, TabsTrigger } from "@/components/ui/tabs";
 import { CharacterList } from "@/components/storyboard/CharacterList";
 import { Tooltip, TooltipContent, TooltipTrigger } from "@/components/ui/tooltip";
+import { Select, SelectContent, SelectItem, SelectTrigger, SelectValue } from "@/components/ui/select";
 
 export default function Storyboard() {
   const { storyId } = useParams();
@@ -67,7 +72,12 @@ export default function Storyboard() {
   const [generatingSceneId, setGeneratingSceneId] = useState<string | null>(null);
   const [selectedStyle, setSelectedStyle] = useState("cinematic");
   const [selectedModel, setSelectedModel] = useState("venice-sd35");
+  const [selectedResolution, setSelectedResolution] = useState<{width: number, height: number} | undefined>(undefined);
   const [styleIntensity, setStyleIntensity] = useState(70);
+  const [characterIdentityLock, setCharacterIdentityLock] = useState(true);
+  const [characterAnchorStrength, setCharacterAnchorStrength] = useState(70);
+  const [consistencyMode, setConsistencyMode] = useState<"strict" | "balanced" | "flexible">("strict");
+  const [autoCorrectEnabled, setAutoCorrectEnabled] = useState(false);
   const [disabledStyleElementsByStyle, setDisabledStyleElementsByStyle] = useState<Record<string, string[]>>({});
   const [selectedScene, setSelectedScene] = useState<Scene | null>(null);
   const [isModalOpen, setIsModalOpen] = useState(false);
@@ -139,6 +149,27 @@ export default function Storyboard() {
       out[key] = String(v);
     }
     return out;
+  };
+
+  const normalizeArtStyleId = (value: string | null | undefined) => {
+    const trimmed = (value ?? "").trim();
+    if (!trimmed) return "cinematic";
+    const normalized = trimmed
+      .toLowerCase()
+      .replace(/[\s-]+/g, "_")
+      .replace(/[^a-z0-9_]/g, "")
+      .replace(/_+/g, "_");
+    const aliases: Record<string, string> = {
+      no_specific_style: "none",
+      nospecificstyle: "none",
+      no_style: "none",
+      nostyle: "none",
+      comic_book: "comic",
+      comicbook: "comic",
+      oil_painting: "oil",
+      oilpainting: "oil",
+    };
+    return aliases[normalized] ?? normalized;
   };
 
   const readInvokeBodyText = async (value: unknown) => {
@@ -547,7 +578,7 @@ export default function Storyboard() {
       const found = stories.find(s => s.id === storyId);
       if (found) {
         setStory(found);
-        setSelectedStyle(found.art_style || "cinematic");
+        setSelectedStyle(normalizeArtStyleId(found.art_style));
         const settings =
           found.consistency_settings && typeof found.consistency_settings === "object" && !Array.isArray(found.consistency_settings)
             ? (found.consistency_settings as Record<string, unknown>)
@@ -558,6 +589,33 @@ export default function Storyboard() {
         
         const savedModel = settings.model;
         if (typeof savedModel === "string") setSelectedModel(savedModel);
+
+        const lockRaw =
+          typeof settings.character_identity_lock === "boolean"
+            ? settings.character_identity_lock
+            : typeof settings.identity_lock === "boolean"
+              ? settings.identity_lock
+              : typeof settings.identityLock === "boolean"
+                ? settings.identityLock
+                : undefined;
+        setCharacterIdentityLock(lockRaw ?? true);
+
+        const strengthRaw =
+          settings.character_anchor_strength ?? settings.characterAnchorStrength ?? settings.anchor_strength ?? settings.anchorStrength;
+        const strengthNum = typeof strengthRaw === "number" ? strengthRaw : Number(strengthRaw);
+        setCharacterAnchorStrength(Number.isFinite(strengthNum) ? Math.max(0, Math.min(100, strengthNum)) : 70);
+
+        const modeRaw = settings.mode;
+        const mode =
+          modeRaw === "strict" || modeRaw === "balanced" || modeRaw === "flexible"
+            ? modeRaw
+            : typeof modeRaw === "string" && modeRaw.trim() === ""
+              ? "strict"
+              : "strict";
+        setConsistencyMode(mode);
+
+        const autoCorrectRaw = settings.auto_correct;
+        setAutoCorrectEnabled(typeof autoCorrectRaw === "boolean" ? autoCorrectRaw : false);
       }
     }
   }, [storyId, stories]);
@@ -595,7 +653,38 @@ export default function Storyboard() {
 
   const handleModelChange = async (modelId: string) => {
     setSelectedModel(modelId);
+    
+    // Set default resolution if supported
+    const model = imageModels.find(m => m.id === modelId);
+    if (model?.supportedResolutions && model.supportedResolutions.length > 0) {
+        setSelectedResolution({width: model.supportedResolutions[0].width, height: model.supportedResolutions[0].height});
+    } else {
+        setSelectedResolution(undefined);
+    }
+    
     await updateConsistencySettings({ model: modelId });
+  };
+
+  const handleCharacterIdentityLockChange = async (checked: boolean) => {
+    setCharacterIdentityLock(checked);
+    await updateConsistencySettings({ character_identity_lock: checked });
+  };
+
+  const handleCharacterAnchorStrengthChange = async (value: number) => {
+    const clamped = Math.max(0, Math.min(100, value));
+    setCharacterAnchorStrength(clamped);
+    await updateConsistencySettings({ character_anchor_strength: clamped });
+  };
+
+  const handleConsistencyModeChange = async (mode: string) => {
+    const next = mode === "strict" || mode === "balanced" || mode === "flexible" ? mode : "strict";
+    setConsistencyMode(next);
+    await updateConsistencySettings({ mode: next });
+  };
+
+  const handleAutoCorrectChange = async (checked: boolean) => {
+    setAutoCorrectEnabled(checked);
+    await updateConsistencySettings({ auto_correct: checked });
   };
 
   const handleDeleteStory = async () => {
@@ -683,10 +772,15 @@ export default function Storyboard() {
       
       let rawResponse: Response;
       try {
+        const apikey = (import.meta.env.VITE_SUPABASE_PUBLISHABLE_KEY ?? "").trim();
+        if (!apikey) {
+          throw new Error("Missing VITE_SUPABASE_PUBLISHABLE_KEY; cannot call Supabase Functions endpoint");
+        }
         rawResponse = await fetch(functionUrl, {
           method: "POST",
           headers: {
             "Authorization": `Bearer ${token}`,
+            "apikey": apikey,
             "Content-Type": "application/json"
           },
           body: JSON.stringify({ 
@@ -771,7 +865,40 @@ export default function Storyboard() {
                 ? ((bodyObj as Record<string, unknown>).prompt_hash as string)
                 : undefined;
         
-        const errorMsg = String(bodyObj?.error || `HTTP ${responseStatus} ${responseStatusText}`);
+        const requestId =
+          typeof bodyObj?.requestId === "string"
+            ? (bodyObj.requestId as string)
+            : typeof responseHeaders["x-request-id"] === "string"
+              ? responseHeaders["x-request-id"]
+              : undefined;
+        const stage = typeof bodyObj?.stage === "string" ? (bodyObj.stage as string) : undefined;
+        const details =
+          typeof bodyObj?.details === "string"
+            ? (bodyObj.details as string)
+            : bodyObj?.details && typeof bodyObj.details === "object"
+              ? (bodyObj.details as Record<string, unknown>)
+              : undefined;
+        const detailMessage =
+          details && typeof details === "object" && typeof (details as Record<string, unknown>).message === "string"
+            ? String((details as Record<string, unknown>).message)
+            : undefined;
+        const detailText = typeof details === "string" ? details : undefined;
+        let errorMsg = String(bodyObj?.error || `HTTP ${responseStatus} ${responseStatusText}`);
+        if (errorMsg === "Internal Server Error" && detailMessage) {
+          errorMsg = `${errorMsg}: ${detailMessage}`;
+        }
+        if (detailText && !errorMsg.toLowerCase().includes(detailText.toLowerCase())) {
+          errorMsg = `${errorMsg}: ${detailText}`;
+        }
+        if (upstreamError && typeof upstreamError === "string") {
+          const snippet = upstreamError.length > 600 ? `${upstreamError.slice(0, 600)}…` : upstreamError;
+          if (snippet.trim() && !errorMsg.toLowerCase().includes(snippet.trim().toLowerCase())) {
+            errorMsg = `${errorMsg}: ${snippet.trim()}`;
+          }
+        }
+        if (requestId) {
+          errorMsg = `${errorMsg} (requestId=${requestId}${stage ? `, stage=${stage}` : ""})`;
+        }
 
         recordSceneDebugInfo(sceneId, {
           timestamp: new Date(),
@@ -782,7 +909,7 @@ export default function Storyboard() {
           error: errorMsg,
           reasons,
           upstreamError,
-          requestId: (bodyObj?.requestId as string) || responseHeaders["x-request-id"],
+          requestId: requestId ?? responseHeaders["x-request-id"],
           model,
           prompt,
           promptFull,
@@ -811,7 +938,7 @@ export default function Storyboard() {
                       error: errorMsg,
                       reasons,
                       upstream_error: upstreamError,
-                      requestId: (bodyObj?.requestId as string) || responseHeaders["x-request-id"],
+                      requestId: requestId ?? responseHeaders["x-request-id"],
                       model,
                       prompt,
                       prompt_full: promptFull,
@@ -1719,21 +1846,10 @@ export default function Storyboard() {
 
   const handleSavePrompt = async (sceneId: string, newPrompt: string) => {
     try {
-      const { error } = await supabase
-        .from('scenes')
-        .update({ image_prompt: newPrompt })
-        .eq('id', sceneId);
+      const updated = await updateScene(sceneId, { image_prompt: newPrompt });
+      if (!updated) throw new Error("Failed to update scene");
 
-      if (error) throw error;
-
-      setScenes(scenes.map(s => 
-        s.id === sceneId ? { ...s, image_prompt: newPrompt } : s
-      ));
-      
-      // Update selected scene if it's the same
-      if (selectedScene?.id === sceneId) {
-        setSelectedScene({ ...selectedScene, image_prompt: newPrompt });
-      }
+      if (selectedScene?.id === sceneId) setSelectedScene(updated);
 
       toast({
         title: "Prompt saved",
@@ -1785,17 +1901,9 @@ export default function Storyboard() {
         normalizedForScene[name] = state;
       }
 
-      const { error } = await supabase
-        .from("scenes")
-        .update({ character_states: normalizedForScene as Json })
-        .eq("id", sceneId);
-
-      if (error) throw error;
-
-      setScenes((prev) => prev.map((s) => (s.id === sceneId ? { ...s, character_states: normalizedForScene as Json } : s)));
-      if (selectedScene?.id === sceneId) {
-        setSelectedScene({ ...selectedScene, character_states: normalizedForScene as Json });
-      }
+      const updated = await updateScene(sceneId, { character_states: normalizedForScene as Json });
+      if (!updated) throw new Error("Failed to update scene");
+      if (selectedScene?.id === sceneId) setSelectedScene(updated);
 
       const { data: storyCharacters, error: charError } = await supabase
         .from("characters")
@@ -2708,6 +2816,8 @@ export default function Storyboard() {
           <ModelSelector 
             selectedModel={selectedModel}
             onModelChange={handleModelChange}
+            selectedResolution={selectedResolution}
+            onResolutionChange={setSelectedResolution}
           />
         </div>
 
@@ -2720,6 +2830,29 @@ export default function Storyboard() {
             onStyleIntensityChange={handleStyleIntensityChange}
             onDisabledStyleElementsChange={handleDisabledStyleElementsChange}
           />
+        </div>
+
+        <div className="mb-10 rounded-xl border border-border/50 bg-secondary/10 p-4">
+          <div className="grid gap-4">
+            <div className="grid gap-2">
+              <Label className="text-sm text-muted-foreground">Consistency Mode</Label>
+              <Select value={consistencyMode} onValueChange={handleConsistencyModeChange}>
+                <SelectTrigger>
+                  <SelectValue placeholder="Select mode" />
+                </SelectTrigger>
+                <SelectContent>
+                  <SelectItem value="strict">Strict</SelectItem>
+                  <SelectItem value="balanced">Balanced</SelectItem>
+                  <SelectItem value="flexible">Flexible</SelectItem>
+                </SelectContent>
+              </Select>
+            </div>
+
+            <div className="flex items-center justify-between gap-3">
+              <Label className="text-sm text-muted-foreground">Auto-correct minor inconsistencies</Label>
+              <Switch checked={autoCorrectEnabled} onCheckedChange={handleAutoCorrectChange} />
+            </div>
+          </div>
         </div>
 
         <Tabs value={activeTab} onValueChange={setActiveTab} className="w-full">

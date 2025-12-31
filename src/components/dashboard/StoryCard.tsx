@@ -3,6 +3,7 @@ import { Badge } from "@/components/ui/badge";
 import { Button } from "@/components/ui/button";
 import { Tooltip, TooltipContent, TooltipTrigger } from "@/components/ui/tooltip";
 import { Clock, Image, MoreVertical, Play } from "lucide-react";
+import { memo, useEffect, useMemo, useState } from "react";
 
 interface StoryCardProps {
   title: string;
@@ -15,7 +16,9 @@ interface StoryCardProps {
   status: "draft" | "processing" | "complete";
 }
 
-export function StoryCard({
+type CoverImageState = "idle" | "loading" | "loaded" | "error";
+
+export const StoryCard = memo(function StoryCard({
   title,
   author,
   coverImage,
@@ -31,6 +34,11 @@ export function StoryCard({
     complete: "bg-green-500/20 text-green-400",
   };
 
+  const [coverImageState, setCoverImageState] = useState<CoverImageState>(coverImage ? "loading" : "idle");
+  useEffect(() => {
+    setCoverImageState(coverImage ? "loading" : "idle");
+  }, [coverImage]);
+
   const clampedProgress = Number.isFinite(progress) ? Math.max(0, Math.min(100, Math.round(progress))) : 0;
   const barColorClass =
     clampedProgress >= 100 ? "bg-green-500" : clampedProgress > 0 ? "bg-yellow-500" : "bg-red-500";
@@ -39,17 +47,37 @@ export function StoryCard({
       ? Math.max(0, Math.min(sceneCount, Math.round(completedScenes)))
       : Math.max(0, Math.min(sceneCount, Math.round((clampedProgress / 100) * sceneCount)));
   const remaining = Math.max(0, sceneCount - completed);
+  const coverAlt = useMemo(() => {
+    const t = typeof title === "string" ? title.trim() : "";
+    return t ? `${t} cover` : "Story cover";
+  }, [title]);
 
   return (
     <Card variant="interactive" className="group overflow-hidden">
       {/* Cover Image */}
       <div className="relative aspect-[4/3] overflow-hidden">
-        {coverImage ? (
-          <img
-            src={coverImage}
-            alt={title}
-            className="w-full h-full object-cover transition-transform duration-500 group-hover:scale-105"
-          />
+        {coverImage && coverImageState !== "error" ? (
+          <>
+            <img
+              src={coverImage}
+              alt={coverAlt}
+              loading="lazy"
+              decoding="async"
+              onLoad={() => setCoverImageState("loaded")}
+              onError={() => setCoverImageState("error")}
+              className={`w-full h-full object-cover transition-all duration-500 group-hover:scale-105 ${
+                coverImageState === "loaded" ? "opacity-100" : "opacity-0"
+              }`}
+            />
+            <div
+              aria-hidden="true"
+              className={`absolute inset-0 w-full h-full gradient-card flex items-center justify-center transition-opacity duration-300 ${
+                coverImageState === "loaded" ? "opacity-0" : "opacity-100"
+              }`}
+            >
+              <Image className="w-12 h-12 text-muted-foreground/50" />
+            </div>
+          </>
         ) : (
           <div className="w-full h-full gradient-card flex items-center justify-center">
             <Image className="w-12 h-12 text-muted-foreground/50" />
@@ -131,4 +159,4 @@ export function StoryCard({
       </CardContent>
     </Card>
   );
-}
+});

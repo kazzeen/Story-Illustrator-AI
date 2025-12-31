@@ -266,6 +266,36 @@ export type Database = {
           },
         ]
       }
+      credit_transactions: {
+        Row: {
+          id: string
+          user_id: string
+          amount: number
+          transaction_type: string
+          description: string | null
+          metadata: Json | null
+          created_at: string
+        }
+        Insert: {
+          id?: string
+          user_id: string
+          amount: number
+          transaction_type: string
+          description?: string | null
+          metadata?: Json | null
+          created_at?: string
+        }
+        Update: {
+          id?: string
+          user_id?: string
+          amount?: number
+          transaction_type?: string
+          description?: string | null
+          metadata?: Json | null
+          created_at?: string
+        }
+        Relationships: []
+      }
       consistency_logs: {
         Row: {
           check_type: string
@@ -320,6 +350,10 @@ export type Database = {
           preferred_style: string | null
           updated_at: string
           user_id: string
+          credits_balance: number
+          subscription_tier: string
+          subscription_status: string | null
+          next_billing_date: string | null
         }
         Insert: {
           avatar_url?: string | null
@@ -329,6 +363,10 @@ export type Database = {
           preferred_style?: string | null
           updated_at?: string
           user_id: string
+          credits_balance?: number
+          subscription_tier?: string
+          subscription_status?: string | null
+          next_billing_date?: string | null
         }
         Update: {
           avatar_url?: string | null
@@ -338,6 +376,10 @@ export type Database = {
           preferred_style?: string | null
           updated_at?: string
           user_id?: string
+          credits_balance?: number
+          subscription_tier?: string
+          subscription_status?: string | null
+          next_billing_date?: string | null
         }
         Relationships: []
       }

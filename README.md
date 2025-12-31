@@ -1,89 +1,229 @@
-# Welcome to SIAI
-## Project info
+# SIAI
 
-## How can I edit this code?
+![SIAI logo](public/placeholder.svg)
 
-There are several ways of editing your application.
+## 1. Project Title and Logo
 
-Simply visit the [Lovable Project](https://lovable.dev/projects/REPLACE_WITH_PROJECT_ID) and start prompting.
+SIAI (Story Illustrator AI)
 
-Changes made via Lovable will be committed automatically to this repo.
+## 2. Brief Description
 
-**Use your preferred IDE**
+SIAI is a storyboarding web app that turns long-form text into structured scenes and then generates scene illustrations. It combines a React + Vite frontend with Supabase (database, auth, storage, and Edge Functions) to run story analysis, image generation, image editing, and reference-image uploads.
 
-If you want to work locally using your own IDE, you can clone this repo and push changes. Pushed changes will also be reflected in Lovable.
+The project includes compliance and quality controls around character age requirements, prompt construction, and generation diagnostics. See [AGE_COMPLIANCE.md](docs/AGE_COMPLIANCE.md) and [API_COMPLIANCE.md](API_COMPLIANCE.md) for details.
 
-The only requirement is having Node.js & npm installed - [install with nvm](https://github.com/nvm-sh/nvm#installing-and-updating)
+## 3. Key Features
 
-Follow these steps:
+- Import stories (PDF/DOCX/ePub/TXT) and create a storyboard from text
+- Analyze story text into scenes + characters via Edge Function
+- Generate scene images with selectable models and style intensity controls
+- Edit generated images with an in-app editor backed by an Edge Function
+- Upload per-scene reference images with resizing, thumbnails, and signed URLs
+- Scene continuity and consistency checks with debug metadata for failures
+
+## 4. Installation Instructions
+
+### Prerequisites
+
+- Node.js + npm
+- A Supabase project (or Supabase local dev via the Supabase CLI)
+
+### Install and run the frontend
 
 ```sh
-# Step 1: Clone the repository using the project's Git URL.
 git clone <YOUR_GIT_URL>
-
-# Step 2: Navigate to the project directory.
 cd <YOUR_PROJECT_NAME>
+npm install
+```
 
-# Step 3: Install the necessary dependencies.
-npm i
+Create a `.env` file in the repository root:
 
-# Step 4: Start the development server with auto-reloading and an instant preview.
+```sh
+VITE_SUPABASE_URL=https://<YOUR_PROJECT_REF>.supabase.co
+VITE_SUPABASE_PUBLISHABLE_KEY=<YOUR_SUPABASE_ANON_KEY>
+```
+
+Start the dev server:
+
+```sh
 npm run dev
 ```
 
-**Edit a file directly in GitHub**
+### Supabase (database + functions)
 
-- Navigate to the desired file(s).
-- Click the "Edit" button (pencil icon) at the top right of the file view.
-- Make your changes and commit the changes.
+- Migrations live in [supabase/migrations](supabase/migrations).
+- Edge Functions live in [supabase/functions](supabase/functions).
 
-**Use GitHub Codespaces**
+To deploy migrations and functions, use the Supabase CLI for your target environment.
 
-- Navigate to the main page of your repository.
-- Click on the "Code" button (green button) near the top right.
-- Select the "Codespaces" tab.
-- Click on "New codespace" to launch a new Codespace environment.
-- Edit files directly within the Codespace and commit and push your changes once you're done.
+## 5. Usage Examples
 
-## What technologies are used for this project?
+### Local development
 
-This project is built with:
+```sh
+npm run dev
+```
 
-- Vite
-- TypeScript
-- React
-- shadcn-ui
-- Tailwind CSS
+### Build for production
 
-## How can I deploy this project?
+```sh
+npm run build
+```
 
-Simply open [Lovable](https://lovable.dev/projects/REPLACE_WITH_PROJECT_ID) and click on Share -> Publish.
+### Run checks
 
-## Can I connect a custom domain to my Lovable project?
+```sh
+npm run lint
+npm run typecheck
+npm test
+```
 
-Yes, you can!
+### UI behavior notes
 
-To connect a domain, navigate to Project > Settings > Domains and click Connect Domain.
+- `SceneDetailModal` default sizing targets wide storyboards: `max-width: 78.5rem`, `max-height: 95vh`.
+- Scene insertion into story text uses exact-slice matching first, then paragraph-overlap fallback; unplaceable scenes render at the end.
 
-Read more here: [Setting up a custom domain](https://docs.lovable.dev/features/custom-domain#custom-domain)
+## 6. Configuration Options
 
-## UI Style Guide
+### Frontend environment variables
 
-### Scene Modals
+Defined in `.env` and read via `import.meta.env`:
 
-Default `SceneDetailModal` dialog sizing:
+- `VITE_SUPABASE_URL` (required): your Supabase project URL
+- `VITE_SUPABASE_PUBLISHABLE_KEY` (required): your Supabase anon/publishable key
 
-- Width: `max-width: 78.5rem` (40% larger than the previous `max-w-4xl`/`56rem`), with `width: 90vw` on `sm+` and `95vw` on smaller screens.
-- Height: `max-height: 95vh`, with `min-height: 60vh` (base), `70vh` (`sm+`), and `80vh` (`lg+`) to reduce scrolling and prevent truncation.
+### Edge Function environment variables
 
-### Story View
+Set these as Supabase Function secrets/environment variables (not in the frontend `.env`):
 
-Scene insertion rules (story text + generated scene images):
+- `SUPABASE_URL` (required)
+- `SUPABASE_SERVICE_ROLE_KEY` (required)
+- `SUPABASE_ANON_KEY` (required for user validation in some functions)
+- `VENICE_API_KEY` (required for Venice-backed image generation/editing)
+- `GEMINI_API_KEY` (required for Gemini-backed image generation, depending on model)
 
-- Scenes are processed in ascending `scene_number` order.
-- Placement attempts, in order:
-  - Exact text slice matching against `stories.original_content` using the scene’s `original_text` (or `summary` if `original_text` is missing).
-  - Paragraph overlap matching as a fallback when exact matching is not possible.
-- Matching is resilient to whitespace differences, case differences, and common punctuation variants (smart quotes, em/en dashes).
-- A scene is only inserted if its placement would not overlap or go backwards relative to already-inserted scenes.
-- If a scene cannot be confidently placed, it is rendered in an “Unplaced scenes” section at the end of the story view.
+Upload/reference controls used by `upload-reference-image`:
+
+- `ALLOWED_ORIGINS` (optional): comma-separated allowed origins; empty allows all
+- `UPLOAD_RATE_MAX` (default `12`), `UPLOAD_RATE_WINDOW_MS` (default `60000`)
+- `REFERENCE_MAX_DIM` (default `2048`), `REFERENCE_THUMB_MAX_DIM` (default `384`), `REFERENCE_WEBP_QUALITY` (default `85`)
+- `REFERENCE_SIGNED_URL_TTL_SECONDS` (default `604800`)
+- `VIRUS_SCAN_REQUIRED` (default `false`)
+- `VIRUS_SCAN_URL`, `VIRUS_SCAN_TIMEOUT_MS`
+- `VIRUS_SCAN_API_KEY`, `VIRUS_SCAN_API_KEY_HEADER`, `VIRUS_SCAN_AUTH_BEARER`
+
+## 7. API Documentation
+
+SIAI uses Supabase Edge Functions. The HTTP base is:
+
+```txt
+<SUPABASE_URL>/functions/v1/<function-name>
+```
+
+Frontend calls include:
+
+- `Authorization: Bearer <user_access_token>`
+- `apikey: <supabase_anon_key>`
+
+### `analyze-story`
+
+- Auth: required (manual JWT validation in function)
+- Body:
+
+```json
+{ "storyId": "<uuid>" }
+```
+
+- Response: `{ "success": true, "sceneCount": <number>, ... }` (plus additional fields)
+
+### `generate-scene-image`
+
+- Auth: required
+- Body (typical):
+
+```json
+{
+  "sceneId": "<uuid>",
+  "artStyle": "digital_illustration",
+  "styleIntensity": 50,
+  "strictStyle": false,
+  "model": "venice-sd35"
+}
+```
+
+- Response (typical):
+
+```json
+{
+  "success": true,
+  "imageUrl": "https://...",
+  "requestId": "..."
+}
+```
+
+The function also supports resetting all scenes for a story:
+
+```json
+{ "reset": true, "storyId": "<uuid>" }
+```
+
+### `edit-scene-image`
+
+- Auth: required
+- Two modes:
+  - `preview`: runs an edit and returns an edited image payload
+  - `commit`: stores an edited image to storage and updates the scene
+
+Preview request:
+
+```json
+{
+  "mode": "preview",
+  "prompt": "Replace the background with a rainy night street.",
+  "image_url": "https://..."
+}
+```
+
+Commit request:
+
+```json
+{
+  "mode": "commit",
+  "sceneId": "<uuid>",
+  "edited_image_base64": "<base64 or data: URL>",
+  "edited_mime": "image/png"
+}
+```
+
+### `upload-reference-image`
+
+- Auth: required
+- Content-Type: `multipart/form-data`
+- Form fields:
+  - `file` (required): image file
+  - `sceneId` (optional): used to group references under a scene
+  - `bucket` (optional): `reference-images` (default) or `scene-images`
+  - `action` (optional): `upload` (default), `sign`, `delete`
+
+Example upload response includes signed URLs (`url`, `thumbUrl`) plus `objectPath` and `thumbPath`.
+
+## 8. Contribution Guidelines
+
+- Create a feature branch from `main`
+- Keep changes scoped and add/adjust tests when behavior changes
+- Ensure checks pass before opening a PR:
+
+```sh
+npm run lint
+npm run typecheck
+npm test
+```
+
+## 9. License Information
+
+No license file is present in this repository. Until a license is added, default copyright rules apply.
+
+## 10. Badges
+
+![Build](https://img.shields.io/badge/build-not_configured-lightgrey)
+![Coverage](https://img.shields.io/badge/coverage-not_configured-lightgrey)

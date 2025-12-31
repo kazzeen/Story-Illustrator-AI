@@ -10,6 +10,9 @@ export default defineConfig(({ mode }) => ({
     port: 5173,
     strictPort: true,
   },
+  optimizeDeps: {
+    include: ["@radix-ui/react-select", "@radix-ui/react-switch"],
+  },
   plugins: [react(), mode === "development" && componentTagger()].filter(Boolean),
   test: {
     environment: "node",

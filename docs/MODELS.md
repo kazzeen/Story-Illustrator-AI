@@ -1,40 +1,59 @@
-# Supported Venice Image Models
+# Supported Image Models
 
-The system currently supports the following Venice AI image generation models. These models replace all legacy models.
+The system supports a variety of image generation models from different providers.
 
-## 1. Venice SD3.5 (Private)
+## Venice AI Models
+(See existing documentation for Venice models)
+
+## Google Gemini / Imagen Models
+
+The system integrates Google's latest image generation models.
+
+### 1. Gemini 2.5 Flash (Imagen 4.0 Fast)
+*   **Identifier**: `gemini-2.5-flash`
+*   **Provider**: Google
+*   **Description**: High-speed generation optimized for rapid iteration. Maps to `imagen-4.0-fast-generate-001`.
+*   **Strengths**: Speed, Efficiency.
+
+### 2. Gemini 3 Pro (Imagen 4.0)
+*   **Identifier**: `gemini-3-pro`
+*   **Provider**: Google
+*   **Description**: Professional asset production with high detail. Maps to `imagen-4.0-generate-001`.
+*   **Strengths**: Quality, Photorealism.
+
+## Venice SD3.5 (Private)
 *   **Identifier**: `venice-sd35`
 *   **Description**: Private implementation of Stable Diffusion 3.5. Balanced performance with excellent prompt adherence.
 *   **Strengths**: General Purpose, Prompt Adherence.
 
-## 2. HiDream (Private)
+## HiDream (Private)
 *   **Identifier**: `hidream`
 *   **Description**: High-quality generation with validated output standards.
 *   **Strengths**: General Purpose, Quality.
 
-## 3. Lustify SDXL (Private | Uncensored)
+## Lustify SDXL (Private | Uncensored)
 *   **Identifier**: `lustify-sdxl`
 *   **Description**: Uncensored model optimized for character portraits.
 *   **Strengths**: Uncensored, Characters.
 *   **Notes**: Prompts are truncated to 1400 characters for compatibility.
 
-## 4. Lustify v7 (Private | Uncensored)
+## Lustify v7 (Private | Uncensored)
 *   **Identifier**: `lustify-v7`
 *   **Description**: Latest uncensored model with improved parameter tuning.
 *   **Strengths**: Uncensored, Advanced.
 *   **Notes**: Prompts are truncated to 1400 characters for compatibility.
 
-## 5. Qwen (Private)
+## Qwen (Private)
 *   **Identifier**: `qwen-image`
 *   **Description**: Optimized for cultural context and diverse language prompts.
 *   **Strengths**: Cultural Context, Multi-language.
 
-## 6. Anime (WAI) (Private)
+## Anime (WAI) (Private)
 *   **Identifier**: `wai-Illustrious`
 *   **Description**: Specialized for anime style and character consistency.
 *   **Strengths**: Anime, Manga.
 
-## 7. Z-Image Turbo (Private)
+## Z-Image Turbo (Private)
 *   **Identifier**: `z-image-turbo`
 *   **Description**: High-speed generation optimized for rapid iteration.
 *   **Strengths**: Speed, Iteration.
