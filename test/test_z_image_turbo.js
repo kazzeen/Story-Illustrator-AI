@@ -1,26 +1,23 @@
-// test/test_image_models.js
-// Run with: node --env-file=.env test/test_image_models.js
-
+// test/test_z_image_turbo.js
 const apiKey = process.env.VENICE_API_KEY;
 
-const modelsToTest = [
-  "qwen-image"
-];
+const model = "z-image-turbo";
 
-async function testModel(model) {
+async function testZImageTurbo() {
   console.log(`Testing model: ${model}...`);
   if (!apiKey) {
     console.log("Skipping: VENICE_API_KEY is not set.");
     return;
   }
 
-  // Exact payload structure from generate-scene-image/index.ts
+  // Payload mimicking what generate-scene-image sends for z-image-turbo
+  // Note: steps=0, no negative_prompt, style keywords front-loaded
   const payload = {
     model,
-    prompt: "A simple red apple",
+    prompt: "anime style artwork of, cel shading, A warrior standing on a cliff",
     width: 1024,
-    height: 576,
-    steps: 8, // Testing with 8
+    height: 1024,
+    steps: 0, // as per generate-scene-image logic
     cfg_scale: 7.5,
     safe_mode: false,
     hide_watermark: true,
@@ -41,7 +38,11 @@ async function testModel(model) {
         const errorText = await response.text();
         console.error(`[FAIL] ${model}: ${response.status} - ${errorText}`);
     } else {
+        const data = await response.json();
         console.log(`[PASS] ${model}: Success`);
+        if (data.images && data.images.length > 0) {
+            console.log("Image data received (base64 length):", data.images[0].length);
+        }
     }
 
   } catch (error) {
@@ -49,4 +50,4 @@ async function testModel(model) {
   }
 }
 
-testModel("qwen-image");
+testZImageTurbo();

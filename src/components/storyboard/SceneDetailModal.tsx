@@ -38,8 +38,24 @@ interface SceneDetailModalProps {
   onClose: () => void;
   onSavePrompt: (sceneId: string, newPrompt: string) => Promise<void>;
   onSaveCharacterStates?: (sceneId: string, characterStates: Record<string, unknown>) => Promise<void>;
-  onRegenerate: (sceneId: string) => Promise<void>;
-  onRegenerateStrictStyle?: (sceneId: string) => Promise<void>;
+  onRegenerate: (sceneId: string, opts?: { forceFullPrompt?: string }) => Promise<void>;
+  onRegenerateStrictStyle?: (sceneId: string, opts?: { forceFullPrompt?: string }) => Promise<void>;
+  onFetchFullPrompt?: (sceneId: string) => Promise<{
+    requestId?: string;
+    stage?: string;
+    model?: string;
+    prompt?: string;
+    promptFull?: string;
+    promptHash?: string;
+    maxLength?: number;
+    truncated?: boolean;
+    missingSubjects?: string[];
+    parts?: unknown;
+    warnings?: string[];
+    preprocessingSteps?: string[];
+    success?: boolean;
+    error?: string;
+  }>;
   onReportStyleMismatch?: (sceneId: string, message: string) => Promise<void>;
   onImageEdited?: (sceneId: string, imageUrl: string) => void;
   isGenerating?: boolean;
@@ -116,6 +132,23 @@ const mergeHeaders = (...sources: Array<Record<string, string> | null | undefine
   return Object.keys(out).length > 0 ? out : undefined;
 };
 
+const normalizeFullPromptText = (text: string) => {
+  const raw = String(text || "");
+  const normalizedNewlines = raw.replace(/\r\n/g, "\n").replace(/\r/g, "\n");
+  const withoutControls = Array.from(normalizedNewlines)
+    .filter((ch) => {
+      if (ch === "\n") return true;
+      const code = ch.charCodeAt(0);
+      return code >= 32 && code !== 127;
+    })
+    .join("");
+  const collapsedLines = withoutControls
+    .split("\n")
+    .map((line) => line.replace(/\s+/g, " ").trim())
+    .join("\n");
+  return collapsedLines.replace(/\n{3,}/g, "\n\n").trim();
+};
+
 const safeDate = (val: unknown): Date | undefined => {
   if (val instanceof Date) return !isNaN(val.getTime()) ? val : undefined;
   if (typeof val === "string") {
@@ -154,6 +187,7 @@ export function SceneDetailModal({
   onSaveCharacterStates,
   onRegenerate,
   onRegenerateStrictStyle,
+  onFetchFullPrompt,
   onReportStyleMismatch,
   onImageEdited,
   isGenerating = false,
@@ -171,6 +205,24 @@ export function SceneDetailModal({
   const [isUpdatingPrompt, setIsUpdatingPrompt] = useState(false);
   const [isSaving, setIsSaving] = useState(false);
   const [hasChanges, setHasChanges] = useState(false);
+  const [promptEditorMode, setPromptEditorMode] = useState<"base" | "full">("base");
+  const [isLoadingFullPrompt, setIsLoadingFullPrompt] = useState(false);
+  const [fullPromptOriginal, setFullPromptOriginal] = useState("");
+  const [fullPromptEdited, setFullPromptEdited] = useState("");
+  const [fullPromptOverride, setFullPromptOverride] = useState<string | null>(null);
+  const [fullPromptHasChanges, setFullPromptHasChanges] = useState(false);
+  const [fullPromptError, setFullPromptError] = useState<string | null>(null);
+  const [fullPromptMeta, setFullPromptMeta] = useState<{
+    requestId?: string;
+    model?: string;
+    promptHash?: string;
+    maxLength?: number;
+    truncated?: boolean;
+    missingSubjects?: string[];
+    parts?: unknown;
+    warnings?: string[];
+    preprocessingSteps?: string[];
+  } | null>(null);
   const [styleFeedback, setStyleFeedback] = useState("");
   const [isSubmittingFeedback, setIsSubmittingFeedback] = useState(false);
   const [characterStatesDraft, setCharacterStatesDraft] = useState<Record<string, SceneCharacterAppearanceState>>({});
@@ -214,6 +266,14 @@ export function SceneDetailModal({
     if (scene) {
       setEditedPrompt(scene.image_prompt || "");
       setHasChanges(false);
+      setPromptEditorMode("base");
+      setIsLoadingFullPrompt(false);
+      setFullPromptOriginal("");
+      setFullPromptEdited("");
+      setFullPromptOverride(null);
+      setFullPromptHasChanges(false);
+      setFullPromptError(null);
+      setFullPromptMeta(null);
       setStyleFeedback("");
       setIsImageEditorOpen(false);
       setEditTool("inpaint");
@@ -303,6 +363,75 @@ export function SceneDetailModal({
     const next = value.length > PROMPT_CHAR_LIMIT ? value.slice(0, PROMPT_CHAR_LIMIT) : value;
     setEditedPrompt(next);
     setHasChanges(next !== (scene?.image_prompt || ""));
+  };
+
+  const loadFullPrompt = async () => {
+    if (!scene || !onFetchFullPrompt) return;
+    if (isLoadingFullPrompt) return;
+    setIsLoadingFullPrompt(true);
+    setFullPromptError(null);
+    try {
+      const res = await onFetchFullPrompt(scene.id);
+      if (res?.success === false) {
+        throw new Error(res.error || "Failed to fetch full prompt");
+      }
+      const prompt =
+        typeof res?.promptFull === "string" ? res.promptFull : typeof res?.prompt === "string" ? res.prompt : "";
+      if (!prompt.trim()) {
+        throw new Error("Full prompt is empty");
+      }
+      setFullPromptOriginal(prompt);
+      setFullPromptEdited(prompt);
+      setFullPromptOverride(null);
+      setFullPromptHasChanges(false);
+      setFullPromptMeta({
+        requestId: typeof res?.requestId === "string" ? res.requestId : undefined,
+        model: typeof res?.model === "string" ? res.model : undefined,
+        promptHash: typeof res?.promptHash === "string" ? res.promptHash : undefined,
+        maxLength: typeof res?.maxLength === "number" ? res.maxLength : undefined,
+        truncated: typeof res?.truncated === "boolean" ? res.truncated : undefined,
+        missingSubjects: Array.isArray(res?.missingSubjects)
+          ? res.missingSubjects.filter((v): v is string => typeof v === "string")
+          : undefined,
+        parts: "parts" in (res || {}) ? res.parts : undefined,
+        warnings: Array.isArray(res?.warnings) ? res.warnings.filter((v): v is string => typeof v === "string") : undefined,
+        preprocessingSteps: Array.isArray(res?.preprocessingSteps)
+          ? res.preprocessingSteps.filter((v): v is string => typeof v === "string")
+          : undefined,
+      });
+    } catch (e) {
+      const msg = e instanceof Error ? e.message : "Failed to load full prompt";
+      setFullPromptError(msg);
+      toast({ title: "Full prompt failed", description: msg, variant: "destructive" });
+    } finally {
+      setIsLoadingFullPrompt(false);
+    }
+  };
+
+  const saveFullPromptOverride = () => {
+    const normalized = normalizeFullPromptText(fullPromptEdited);
+    if (!normalized) {
+      toast({ title: "Prompt required", description: "Full scene prompt cannot be empty.", variant: "destructive" });
+      return;
+    }
+    const maxLen = fullPromptMeta?.maxLength;
+    const clamped =
+      typeof maxLen === "number" && Number.isFinite(maxLen) && maxLen > 0 && normalized.length > maxLen
+        ? normalized.slice(0, maxLen)
+        : normalized;
+    setFullPromptEdited(clamped);
+    setFullPromptOverride(clamped);
+    setFullPromptHasChanges(false);
+    setFullPromptError(null);
+    toast({ title: "Full prompt saved", description: "Next regeneration will use this full prompt." });
+  };
+
+  const resetFullPromptEditor = (mode?: "keep_tab" | "switch_to_base") => {
+    setFullPromptEdited(fullPromptOriginal);
+    setFullPromptOverride(null);
+    setFullPromptHasChanges(false);
+    setFullPromptError(null);
+    if (mode === "switch_to_base") setPromptEditorMode("base");
   };
 
   const clampPromptPreservingAppearanceAppendix = (value: string) => {
@@ -474,7 +603,8 @@ export function SceneDetailModal({
       await handleSave();
     }
     
-    await onRegenerate(scene.id);
+    const force = fullPromptOverride && fullPromptOverride.trim() ? fullPromptOverride : undefined;
+    await onRegenerate(scene.id, force ? { forceFullPrompt: force } : undefined);
   };
 
   const handleRegenerateStrictStyle = async () => {
@@ -494,7 +624,8 @@ export function SceneDetailModal({
       await handleSave();
     }
 
-    await onRegenerateStrictStyle(scene.id);
+    const force = fullPromptOverride && fullPromptOverride.trim() ? fullPromptOverride : undefined;
+    await onRegenerateStrictStyle(scene.id, force ? { forceFullPrompt: force } : undefined);
   };
 
   const handleSubmitStyleMismatch = async () => {
@@ -2615,43 +2746,180 @@ ${debug.upstreamError ? `\n[DEBUG] Upstream Diagnostic:\n${debug.upstreamError}`
 
           {/* Editable Prompt */}
           <div className="space-y-2">
-            <div className="flex items-center justify-between">
-              <div className="flex items-center gap-2">
-                <Label htmlFor="prompt" className="text-sm font-medium">
-                  Image Prompt
-                </Label>
-                <Button
-                  type="button"
-                  size="sm"
-                  variant="outline"
-                  onClick={() => void handleUpdatePromptWithCharacterStates()}
-                  disabled={!scene || isUpdatingPrompt}
-                >
-                  {isUpdatingPrompt ? (
-                    <Loader2 className="w-4 h-4 mr-2 animate-spin" />
-                  ) : (
-                    <Wand2 className="w-4 h-4 mr-2" />
+            <Tabs value={promptEditorMode} onValueChange={(v) => setPromptEditorMode(v === "full" ? "full" : "base")}>
+              <TabsList className="grid w-full grid-cols-2">
+                <TabsTrigger value="base">Image Prompt</TabsTrigger>
+                <TabsTrigger value="full" disabled={!onFetchFullPrompt}>
+                  Full Scene Prompt
+                </TabsTrigger>
+              </TabsList>
+
+              <TabsContent value="base" className="space-y-2">
+                <div className="flex items-center justify-between">
+                  <div className="flex items-center gap-2">
+                    <Label htmlFor="prompt" className="text-sm font-medium">
+                      Image Prompt
+                    </Label>
+                    <Button
+                      type="button"
+                      size="sm"
+                      variant="outline"
+                      onClick={() => void handleUpdatePromptWithCharacterStates()}
+                      disabled={!scene || isUpdatingPrompt}
+                    >
+                      {isUpdatingPrompt ? (
+                        <Loader2 className="w-4 h-4 mr-2 animate-spin" />
+                      ) : (
+                        <Wand2 className="w-4 h-4 mr-2" />
+                      )}
+                      {isUpdatingPrompt ? "Updating..." : "Update"}
+                    </Button>
+                  </div>
+                  {(hasChanges || hasCharacterStateChanges) && (
+                    <Badge variant="outline" className="text-yellow-500 border-yellow-500/50">
+                      Unsaved changes
+                    </Badge>
                   )}
-                  {isUpdatingPrompt ? "Updating..." : "Update"}
-                </Button>
-              </div>
-              {(hasChanges || hasCharacterStateChanges) && (
-                <Badge variant="outline" className="text-yellow-500 border-yellow-500/50">
-                  Unsaved changes
-                </Badge>
-              )}
-            </div>
-            <Textarea
-              id="prompt"
-              value={editedPrompt}
-              onChange={(e) => handlePromptChange(e.target.value)}
-              placeholder="Enter the prompt used to generate this scene's image..."
-              className="min-h-[120px] resize-none"
-              maxLength={PROMPT_CHAR_LIMIT}
-            />
-            <div className="flex justify-end text-xs text-muted-foreground">
-              {editedPrompt.length}/{PROMPT_CHAR_LIMIT}
-            </div>
+                </div>
+                <Textarea
+                  id="prompt"
+                  value={editedPrompt}
+                  onChange={(e) => handlePromptChange(e.target.value)}
+                  placeholder="Enter the prompt used to generate this scene's image..."
+                  className="min-h-[120px] resize-none"
+                  maxLength={PROMPT_CHAR_LIMIT}
+                />
+                <div className="flex justify-end text-xs text-muted-foreground">
+                  {editedPrompt.length}/{PROMPT_CHAR_LIMIT}
+                </div>
+              </TabsContent>
+
+              <TabsContent value="full" className="space-y-3">
+                <div className="flex flex-wrap items-center justify-between gap-2">
+                  <div className="flex items-center gap-2">
+                    <Label htmlFor="full-prompt" className="text-sm font-medium">
+                      Full Scene Prompt
+                    </Label>
+                    {fullPromptOverride && (
+                      <Badge variant="outline" className="text-green-600 border-green-600/40">
+                        Override active
+                      </Badge>
+                    )}
+                    {fullPromptHasChanges && (
+                      <Badge variant="outline" className="text-yellow-500 border-yellow-500/50">
+                        Unsaved changes
+                      </Badge>
+                    )}
+                  </div>
+                  <div className="flex flex-wrap items-center gap-2">
+                    <Button
+                      type="button"
+                      size="sm"
+                      variant="outline"
+                      onClick={() => void loadFullPrompt()}
+                      disabled={!scene || isLoadingFullPrompt}
+                    >
+                      {isLoadingFullPrompt ? <Loader2 className="w-4 h-4 mr-2 animate-spin" /> : null}
+                      {isLoadingFullPrompt ? "Loading..." : "Load"}
+                    </Button>
+                    <Button
+                      type="button"
+                      size="sm"
+                      variant="outline"
+                      onClick={() => {
+                        const toCopy = fullPromptEdited || fullPromptOriginal;
+                        if (!toCopy.trim()) return;
+                        void navigator.clipboard.writeText(toCopy);
+                        toast({ title: "Copied", description: "Full scene prompt copied to clipboard." });
+                      }}
+                      disabled={!(fullPromptEdited || fullPromptOriginal).trim()}
+                    >
+                      <Copy className="w-4 h-4 mr-2" />
+                      Copy
+                    </Button>
+                    <Button
+                      type="button"
+                      size="sm"
+                      variant="outline"
+                      onClick={() =>
+                        downloadJson(`scene-${scene?.scene_number ?? "prompt"}-full-prompt.json`, {
+                          promptFull: fullPromptEdited || fullPromptOriginal,
+                          model: fullPromptMeta?.model,
+                          maxLength: fullPromptMeta?.maxLength,
+                          promptHash: fullPromptMeta?.promptHash,
+                          truncated: fullPromptMeta?.truncated,
+                          missingSubjects: fullPromptMeta?.missingSubjects,
+                          preprocessingSteps: fullPromptMeta?.preprocessingSteps,
+                          warnings: fullPromptMeta?.warnings,
+                          parts: fullPromptMeta?.parts,
+                          requestId: fullPromptMeta?.requestId,
+                        })
+                      }
+                      disabled={!(fullPromptEdited || fullPromptOriginal).trim()}
+                    >
+                      <Download className="w-4 h-4 mr-2" />
+                      Download
+                    </Button>
+                  </div>
+                </div>
+
+                {(fullPromptMeta?.model || typeof fullPromptMeta?.maxLength === "number" || fullPromptMeta?.promptHash) && (
+                  <div className="flex flex-wrap items-center gap-2 text-xs text-muted-foreground">
+                    {fullPromptMeta?.model && <Badge variant="secondary">Model: {fullPromptMeta.model}</Badge>}
+                    {typeof fullPromptMeta?.maxLength === "number" && <Badge variant="secondary">Max: {fullPromptMeta.maxLength}</Badge>}
+                    {fullPromptMeta?.truncated && <Badge variant="secondary">Truncated</Badge>}
+                    {Array.isArray(fullPromptMeta?.missingSubjects) && fullPromptMeta.missingSubjects.length > 0 && (
+                      <Badge variant="secondary">Missing: {fullPromptMeta.missingSubjects.length}</Badge>
+                    )}
+                    {fullPromptMeta?.promptHash && <Badge variant="secondary">Hash: {fullPromptMeta.promptHash.slice(0, 10)}</Badge>}
+                  </div>
+                )}
+
+                {fullPromptError && <div className="text-xs text-destructive">{fullPromptError}</div>}
+
+                <Textarea
+                  id="full-prompt"
+                  value={fullPromptEdited}
+                  onChange={(e) => {
+                    const next = e.target.value;
+                    setFullPromptEdited(next);
+                    setFullPromptOverride(null);
+                    setFullPromptHasChanges(next !== fullPromptOriginal);
+                  }}
+                  placeholder="Load the fully composed prompt, then edit it before generation..."
+                  className="min-h-[160px] resize-y"
+                />
+                <div className="flex flex-wrap items-center justify-between gap-2">
+                  <div className="text-xs text-muted-foreground">
+                    {(fullPromptEdited || "").length}
+                    {typeof fullPromptMeta?.maxLength === "number" ? `/${fullPromptMeta.maxLength}` : null}
+                  </div>
+                  <div className="flex items-center gap-2">
+                    <Button
+                      type="button"
+                      size="sm"
+                      variant="outline"
+                      onClick={() => resetFullPromptEditor("keep_tab")}
+                      disabled={!fullPromptOriginal.trim()}
+                    >
+                      Reset
+                    </Button>
+                    <Button
+                      type="button"
+                      size="sm"
+                      variant="outline"
+                      onClick={() => resetFullPromptEditor("switch_to_base")}
+                      disabled={!fullPromptOriginal.trim() && !fullPromptEdited.trim() && !fullPromptOverride}
+                    >
+                      Cancel
+                    </Button>
+                    <Button type="button" size="sm" variant="hero" onClick={saveFullPromptOverride} disabled={!fullPromptEdited.trim()}>
+                      Save
+                    </Button>
+                  </div>
+                </div>
+              </TabsContent>
+            </Tabs>
           </div>
 
           {onReportStyleMismatch && (

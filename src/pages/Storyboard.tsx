@@ -92,10 +92,17 @@ export default function Storyboard() {
   const [isRegenerateAllDialogOpen, setIsRegenerateAllDialogOpen] = useState(false);
   const generateAllLockRef = useRef(false);
   const storyPrintResetTimerRef = useRef<number | null>(null);
+  const selectedStyleRef = useRef(selectedStyle);
+  const styleIntensityRef = useRef(styleIntensity);
+  const consistencyModeRef = useRef(consistencyMode);
+  const lastSyncedStoryIdRef = useRef<string | null>(null);
+  const localStyleOverrideRef = useRef<{ storyId: string; styleId: string } | null>(null);
+  const localModelOverrideRef = useRef<{ storyId: string; modelId: string } | null>(null);
   type SceneGenerationDebugInfo = {
     timestamp: Date;
     headers?: Record<string, string>;
     redactedHeaders?: string[];
+    warnings?: string[];
     requestId?: string;
     stage?: string;
     error?: string;
@@ -117,6 +124,9 @@ export default function Storyboard() {
       styleIntensity?: number;
       strictStyle?: boolean;
       disabledStyleElements?: string[];
+      styleGuideId?: string;
+      styleGuideVersion?: number;
+      styleGuideStatus?: string;
     };
   };
 
@@ -168,9 +178,25 @@ export default function Storyboard() {
       comicbook: "comic",
       oil_painting: "oil",
       oilpainting: "oil",
+      digitalillustration: "digital_illustration",
+      realisticcinematic: "realistic_cinematic",
+      animemanga: "anime_manga",
+      manga: "anime_manga",
     };
     return aliases[normalized] ?? normalized;
   };
+
+  useEffect(() => {
+    selectedStyleRef.current = selectedStyle;
+  }, [selectedStyle]);
+
+  useEffect(() => {
+    styleIntensityRef.current = styleIntensity;
+  }, [styleIntensity]);
+
+  useEffect(() => {
+    consistencyModeRef.current = consistencyMode;
+  }, [consistencyMode]);
 
   const readInvokeBodyText = async (value: unknown) => {
     if (typeof value === "string") return value;
@@ -578,7 +604,23 @@ export default function Storyboard() {
       const found = stories.find(s => s.id === storyId);
       if (found) {
         setStory(found);
-        setSelectedStyle(normalizeArtStyleId(found.art_style));
+        const syncedStoryId = lastSyncedStoryIdRef.current;
+        const foundStyle = normalizeArtStyleId(found.art_style);
+        const localOverride = localStyleOverrideRef.current;
+        const localModelOverride = localModelOverrideRef.current;
+
+        if (syncedStoryId !== storyId) {
+          lastSyncedStoryIdRef.current = storyId;
+          localStyleOverrideRef.current = null;
+          localModelOverrideRef.current = null;
+          setSelectedStyle(foundStyle);
+        } else if (localOverride?.storyId === storyId) {
+          if (localOverride.styleId === foundStyle) {
+            localStyleOverrideRef.current = null;
+          }
+        } else {
+          setSelectedStyle(foundStyle);
+        }
         const settings =
           found.consistency_settings && typeof found.consistency_settings === "object" && !Array.isArray(found.consistency_settings)
             ? (found.consistency_settings as Record<string, unknown>)
@@ -588,7 +630,17 @@ export default function Storyboard() {
         setStyleIntensity(Number.isFinite(intensity) ? Math.max(0, Math.min(100, intensity)) : 70);
         
         const savedModel = settings.model;
-        if (typeof savedModel === "string") setSelectedModel(savedModel);
+        if (typeof savedModel === "string") {
+          if (syncedStoryId !== storyId) {
+            setSelectedModel(savedModel);
+          } else if (localModelOverride?.storyId === storyId) {
+            if (localModelOverride.modelId === savedModel) {
+              localModelOverrideRef.current = null;
+            }
+          } else {
+            setSelectedModel(savedModel);
+          }
+        }
 
         const lockRaw =
           typeof settings.character_identity_lock === "boolean"
@@ -632,14 +684,18 @@ export default function Storyboard() {
   };
 
   const handleStyleChange = async (styleId: string) => {
-    setSelectedStyle(styleId);
+    const normalized = normalizeArtStyleId(styleId);
+    selectedStyleRef.current = normalized;
+    setSelectedStyle(normalized);
     if (!storyId) return;
-    const updated = await updateStory(storyId, { art_style: styleId });
+    localStyleOverrideRef.current = { storyId, styleId: normalized };
+    const updated = await updateStory(storyId, { art_style: normalized });
     if (updated) setStory(updated);
   };
 
   const handleStyleIntensityChange = async (intensity: number) => {
     const clamped = Math.max(0, Math.min(100, intensity));
+    styleIntensityRef.current = clamped;
     setStyleIntensity(clamped);
     await updateConsistencySettings({ style_intensity: clamped });
   };
@@ -652,6 +708,7 @@ export default function Storyboard() {
   };
 
   const handleModelChange = async (modelId: string) => {
+    if (storyId) localModelOverrideRef.current = { storyId, modelId };
     setSelectedModel(modelId);
     
     // Set default resolution if supported
@@ -678,6 +735,7 @@ export default function Storyboard() {
 
   const handleConsistencyModeChange = async (mode: string) => {
     const next = mode === "strict" || mode === "balanced" || mode === "flexible" ? mode : "strict";
+    consistencyModeRef.current = next;
     setConsistencyMode(next);
     await updateConsistencySettings({ mode: next });
   };
@@ -705,7 +763,7 @@ export default function Storyboard() {
 
   const handleGenerateImage = async (
     sceneId: string,
-    opts?: { artStyle?: string; styleIntensity?: number; strictStyle?: boolean },
+    opts?: { artStyle?: string; styleIntensity?: number; strictStyle?: boolean; forceFullPrompt?: string },
   ) => {
     if (!user) {
       toast({
@@ -725,6 +783,7 @@ export default function Storyboard() {
         imageUrl?: string;
         generationStatus?: string;
         consistency?: unknown;
+        warnings?: string[];
         headers?: Record<string, string>;
         redactedHeaders?: string[];
         requestId?: string;
@@ -750,17 +809,23 @@ export default function Storyboard() {
         return;
       }
 
-      const artStyle = opts?.artStyle ?? selectedStyle;
-      const intensity = opts?.styleIntensity ?? styleIntensity;
-      const strictStyle = opts?.strictStyle ?? false;
+      const artStyle = opts?.artStyle ?? selectedStyleRef.current;
+      const intensity = opts?.styleIntensity ?? styleIntensityRef.current;
+      const strictStyle = opts?.strictStyle ?? true;
+      const forceFullPrompt = typeof opts?.forceFullPrompt === "string" && opts.forceFullPrompt.trim() ? opts.forceFullPrompt : undefined;
       const disabledStyleElements = disabledStyleElementsByStyle[artStyle] ?? [];
+      const width = selectedResolution?.width;
+      const height = selectedResolution?.height;
 
       requestParams = {
         model: selectedModel,
         artStyle,
         styleIntensity: intensity,
         strictStyle,
+        width,
+        height,
         disabledStyleElements,
+        forceFullPrompt,
       };
 
       // Use direct fetch to bypass supabase-js error wrapping that might obscure headers
@@ -789,7 +854,10 @@ export default function Storyboard() {
             styleIntensity: intensity,
             strictStyle,
             model: selectedModel,
+            width,
+            height,
             disabledStyleElements,
+            forceFullPrompt,
           })
         });
       } catch (netError) {
@@ -1085,12 +1153,13 @@ export default function Storyboard() {
                         model: response?.model,
                         prompt: responsePrompt ?? response?.prompt,
                         prompt_full: responsePromptFull,
-                        preprocessingSteps: response?.preprocessingSteps,
-                        prompt_hash: responsePromptHash ?? response?.promptHash,
-                      },
-                    } as Json,
-                  }
-                : s,
+                      preprocessingSteps: response?.preprocessingSteps,
+                      prompt_hash: responsePromptHash ?? response?.promptHash,
+                      warnings: response?.warnings,
+                    },
+                  } as Json,
+                }
+              : s,
             ),
           );
 
@@ -1112,6 +1181,7 @@ export default function Storyboard() {
                 prompt_full: responsePromptFull,
                 preprocessingSteps: response?.preprocessingSteps,
                 prompt_hash: responsePromptHash ?? response?.promptHash,
+                warnings: response?.warnings,
               },
             } as Json,
           });
@@ -1132,6 +1202,7 @@ export default function Storyboard() {
         timestamp: new Date(),
         headers: Object.keys(finalHeaders).length > 0 ? finalHeaders : undefined,
         redactedHeaders: response?.redactedHeaders,
+        warnings: response?.warnings,
         requestId: response?.requestId,
         stage: response?.stage,
         model: response?.model,
@@ -1192,6 +1263,7 @@ export default function Storyboard() {
                           })(),
                     preprocessingSteps: response?.preprocessingSteps,
                     prompt_hash: responsePromptHash ?? response?.promptHash,
+                    warnings: response?.warnings,
                     requestParams
                   },
                 } as Json,
@@ -1314,12 +1386,21 @@ export default function Storyboard() {
           // Use direct fetch to bypass supabase-js error wrapping that might obscure headers
           const functionUrl = `${import.meta.env.VITE_SUPABASE_URL ?? "https://placeholder.supabase.co"}/functions/v1/generate-scene-image`;
           
+          const artStyle = selectedStyleRef.current;
+          const intensity = styleIntensityRef.current;
+          const strictStyle = consistencyModeRef.current === "strict";
+          const disabledStyleElements = disabledStyleElementsByStyle[artStyle] ?? [];
+          const width = selectedResolution?.width;
+          const height = selectedResolution?.height;
+
           requestParams = {
             model: selectedModel,
-            artStyle: selectedStyle,
-            styleIntensity,
-            strictStyle: false,
-            disabledStyleElements: disabledStyleElementsByStyle[selectedStyle] ?? [],
+            artStyle,
+            styleIntensity: intensity,
+            strictStyle,
+            width,
+            height,
+            disabledStyleElements,
           };
 
           let rawResponse: Response;
@@ -1332,11 +1413,13 @@ export default function Storyboard() {
               },
               body: JSON.stringify({ 
                 sceneId: scene.id, 
-                artStyle: selectedStyle, 
-                styleIntensity, 
-                strictStyle: false,
+                artStyle,
+                styleIntensity: intensity,
+                strictStyle,
                 model: selectedModel,
-                disabledStyleElements: disabledStyleElementsByStyle[selectedStyle] ?? [],
+                width,
+                height,
+                disabledStyleElements,
               })
             });
           } catch (netError) {
@@ -1964,12 +2047,93 @@ export default function Storyboard() {
     }
   };
 
-  const handleModalRegenerate = async (sceneId: string) => {
-    await handleGenerateImage(sceneId);
+  const fetchFullScenePrompt = async (sceneId: string) => {
+    if (!user) {
+      throw new Error("Sign in required");
+    }
+
+    const { data: { session } } = await supabase.auth.getSession();
+    if (!session) {
+      throw new Error("Not authenticated");
+    }
+
+    const artStyle = selectedStyleRef.current;
+    const intensity = styleIntensityRef.current;
+    const strictStyle = true;
+    const disabledStyleElements = disabledStyleElementsByStyle[artStyle] ?? [];
+    const width = selectedResolution?.width;
+    const height = selectedResolution?.height;
+
+    const functionUrl = `${import.meta.env.VITE_SUPABASE_URL ?? "https://placeholder.supabase.co"}/functions/v1/generate-scene-image`;
+    const apikey = (import.meta.env.VITE_SUPABASE_PUBLISHABLE_KEY ?? "").trim();
+    if (!apikey) {
+      throw new Error("Missing VITE_SUPABASE_PUBLISHABLE_KEY; cannot call Supabase Functions endpoint");
+    }
+
+    const rawResponse = await fetch(functionUrl, {
+      method: "POST",
+      headers: {
+        "Authorization": `Bearer ${session.access_token}`,
+        "apikey": apikey,
+        "Content-Type": "application/json",
+      },
+      body: JSON.stringify({
+        sceneId,
+        artStyle,
+        styleIntensity: intensity,
+        strictStyle,
+        model: selectedModel,
+        width,
+        height,
+        disabledStyleElements,
+        promptOnly: true,
+      }),
+    });
+
+    let responseBody: unknown;
+    const text = await rawResponse.text();
+    try {
+      responseBody = JSON.parse(text);
+    } catch {
+      responseBody = text;
+    }
+
+    if (!rawResponse.ok) {
+      const bodyObj = responseBody && typeof responseBody === "object" ? (responseBody as Record<string, unknown>) : null;
+      const errorMsg =
+        typeof bodyObj?.error === "string"
+          ? bodyObj.error
+          : typeof bodyObj?.message === "string"
+            ? bodyObj.message
+            : `HTTP ${rawResponse.status} ${rawResponse.statusText}`;
+      throw new Error(errorMsg);
+    }
+
+    const data = responseBody as Record<string, unknown> | null;
+    if (!data || data.success !== true) {
+      const errorMsg =
+        typeof data?.error === "string"
+          ? data.error
+          : typeof data?.message === "string"
+            ? data.message
+            : "Failed to fetch full prompt";
+      throw new Error(errorMsg);
+    }
+
+    return data;
   };
 
-  const handleModalRegenerateStrictStyle = async (sceneId: string) => {
-    await handleGenerateImage(sceneId, { strictStyle: true, styleIntensity: 100 });
+  const handleModalRegenerate = async (sceneId: string, opts?: { forceFullPrompt?: string }) => {
+    await handleGenerateImage(sceneId, { artStyle: selectedStyleRef.current, forceFullPrompt: opts?.forceFullPrompt });
+  };
+
+  const handleModalRegenerateStrictStyle = async (sceneId: string, opts?: { forceFullPrompt?: string }) => {
+    await handleGenerateImage(sceneId, {
+      artStyle: selectedStyleRef.current,
+      strictStyle: true,
+      styleIntensity: 100,
+      forceFullPrompt: opts?.forceFullPrompt,
+    });
   };
 
   const handleReportStyleMismatch = async (sceneId: string, message: string) => {
@@ -1987,8 +2151,8 @@ export default function Storyboard() {
       {
         created_at: new Date().toISOString(),
         message,
-        requested_style: selectedStyle,
-        style_intensity: styleIntensity,
+        requested_style: selectedStyleRef.current,
+        style_intensity: styleIntensityRef.current,
       },
     ];
 
@@ -3065,6 +3229,7 @@ export default function Storyboard() {
         onSaveCharacterStates={handleSaveCharacterStates}
         onRegenerate={handleModalRegenerate}
         onRegenerateStrictStyle={handleModalRegenerateStrictStyle}
+        onFetchFullPrompt={fetchFullScenePrompt}
         onReportStyleMismatch={handleReportStyleMismatch}
         onImageEdited={(sceneId, imageUrl) => {
           setScenes((prev) => prev.map((s) => (s.id === sceneId ? { ...s, image_url: imageUrl } : s)));

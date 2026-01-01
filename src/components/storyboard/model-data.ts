@@ -70,7 +70,14 @@ export const imageModels: ImageModel[] = [
       resolution: "1024×1024",
       features: ["Private implementation", "Balanced detail"],
       useCase: "General storyboarding, concept art"
-    }
+    },
+    supportedResolutions: [
+      { label: "Square (1024×1024)", width: 1024, height: 1024 },
+      { label: "Widescreen (1024×576)", width: 1024, height: 576 },
+      { label: "Portrait (576×1024)", width: 576, height: 1024 },
+      { label: "Classic (1024×768)", width: 1024, height: 768 },
+      { label: "Tall (768×1024)", width: 768, height: 1024 },
+    ]
   },
   {
     id: "hidream",
@@ -85,7 +92,14 @@ export const imageModels: ImageModel[] = [
       resolution: "1024×1024",
       features: ["Validated output", "Consistent style"],
       useCase: "Polished illustrations"
-    }
+    },
+    supportedResolutions: [
+      { label: "Square (1024×1024)", width: 1024, height: 1024 },
+      { label: "Widescreen (1024×576)", width: 1024, height: 576 },
+      { label: "Portrait (576×1024)", width: 576, height: 1024 },
+      { label: "Classic (1024×768)", width: 1024, height: 768 },
+      { label: "Tall (768×1024)", width: 768, height: 1024 },
+    ]
   },
   {
     id: "lustify-sdxl",
@@ -100,7 +114,14 @@ export const imageModels: ImageModel[] = [
       resolution: "1024×1024",
       features: ["Character focused", "Uncensored"],
       useCase: "Character portraits"
-    }
+    },
+    supportedResolutions: [
+      { label: "Square (1024×1024)", width: 1024, height: 1024 },
+      { label: "Widescreen (1024×576)", width: 1024, height: 576 },
+      { label: "Portrait (576×1024)", width: 576, height: 1024 },
+      { label: "Classic (1024×768)", width: 1024, height: 768 },
+      { label: "Tall (768×1024)", width: 768, height: 1024 },
+    ]
   },
   {
     id: "lustify-v7",
@@ -115,7 +136,14 @@ export const imageModels: ImageModel[] = [
       resolution: "1024×1024",
       features: ["Advanced tuning", "Uncensored"],
       useCase: "Complex character scenes"
-    }
+    },
+    supportedResolutions: [
+      { label: "Square (1024×1024)", width: 1024, height: 1024 },
+      { label: "Widescreen (1024×576)", width: 1024, height: 576 },
+      { label: "Portrait (576×1024)", width: 576, height: 1024 },
+      { label: "Classic (1024×768)", width: 1024, height: 768 },
+      { label: "Tall (768×1024)", width: 768, height: 1024 },
+    ]
   },
   {
     id: "qwen-image",
@@ -130,7 +158,14 @@ export const imageModels: ImageModel[] = [
       resolution: "1024×1024",
       features: ["Multilingual prompt support", "Cultural awareness"],
       useCase: "Global content, diverse settings"
-    }
+    },
+    supportedResolutions: [
+      { label: "Square (1024×1024)", width: 1024, height: 1024 },
+      { label: "Widescreen (1024×576)", width: 1024, height: 576 },
+      { label: "Portrait (576×1024)", width: 576, height: 1024 },
+      { label: "Classic (1024×768)", width: 1024, height: 768 },
+      { label: "Tall (768×1024)", width: 768, height: 1024 },
+    ]
   },
   {
     id: "wai-Illustrious",
@@ -145,7 +180,14 @@ export const imageModels: ImageModel[] = [
       resolution: "1024×1024",
       features: ["Anime aesthetic", "Character consistency"],
       useCase: "Anime/Manga style stories"
-    }
+    },
+    supportedResolutions: [
+      { label: "Square (1024×1024)", width: 1024, height: 1024 },
+      { label: "Widescreen (1024×576)", width: 1024, height: 576 },
+      { label: "Portrait (576×1024)", width: 576, height: 1024 },
+      { label: "Classic (1024×768)", width: 1024, height: 768 },
+      { label: "Tall (768×1024)", width: 768, height: 1024 },
+    ]
   },
   {
     id: "z-image-turbo",
@@ -160,6 +202,9 @@ export const imageModels: ImageModel[] = [
       resolution: "512×512",
       features: ["Ultra-fast generation", "Low cost"],
       useCase: "Rapid brainstorming"
-    }
+    },
+    supportedResolutions: [
+      { label: "Square (512×512)", width: 512, height: 512 },
+    ]
   },
 ];

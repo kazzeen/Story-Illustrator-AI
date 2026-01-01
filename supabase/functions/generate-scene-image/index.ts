@@ -1,20 +1,27 @@
 import { serve } from "https://deno.land/std@0.168.0/http/server.ts";
 import { createClient } from "https://esm.sh/@supabase/supabase-js@2.49.2";
 import { ensureClothingColors, validateClothingColorCoverage } from "../_shared/clothing-colors.ts";
+import {
+  buildCharacterAppearanceAppendix,
+  buildStoryStyleGuideGuidance,
+  buildStyleGuidance,
+  clampNumber,
+  coerceRequestedResolution,
+  computeStyleCfgScaleForStyle,
+  computeStyleStepsForStyle,
+  getStyleCategory,
+  getAspectRatioLabel,
+  splitCommaParts,
+  stripKnownStylePhrases,
+  STYLE_CONFLICTS,
+  validateStyleApplication,
+} from "../_shared/style-prompts.ts";
+import { assemblePrompt, sanitizePrompt } from "../_shared/prompt-assembly.ts";
 
 const GOOGLE_MODELS: Record<string, string> = {
   "gemini-2.5-flash": "imagen-4.0-generate-001",
   "gemini-3-pro": "imagen-4.0-generate-001",
 };
-
-function getGoogleAspectRatio(width: number, height: number): string {
-  const ratio = width / height;
-  if (ratio >= 1.7) return "16:9";
-  if (ratio >= 1.3) return "4:3";
-  if (ratio <= 0.6) return "9:16";
-  if (ratio <= 0.8) return "3:4";
-  return "1:1";
-}
 
 const corsHeaders = {
   "Access-Control-Allow-Origin": "*",
@@ -67,7 +74,13 @@ type CharacterRow = {
   active_reference_sheet_id: string | null;
 };
 
-type StyleGuideRow = { id: string; guide: unknown };
+type StyleGuideRow = {
+  id: string;
+  story_id: string;
+  version: number;
+  status: string;
+  guide: unknown;
+};
 
 type SceneCharacterStateRow = { character_id: string; state: unknown; source?: unknown };
 
@@ -172,29 +185,7 @@ async function sha256Hex(text: string): Promise<string> {
   return hashArray.map((b) => b.toString(16).padStart(2, "0")).join("");
 }
 
-function truncateText(text: string, maxLength: number) {
-  if (text.length <= maxLength) return text;
-  return text.slice(0, maxLength) + "...";
-}
 
-function sanitizePrompt(text: string): string {
-  const cleaned = Array.from(text)
-    .filter((ch) => {
-      const code = ch.charCodeAt(0);
-      return code >= 32 && code !== 127;
-    })
-    .join("");
-  return cleaned.replace(/\s+/g, " ").trim();
-}
-
-function computeUsedPromptForModel(prompt: string, model: string): string {
-  // Truncate prompt based on model limits
-  const limitedModels = ["hidream", "qwen-image", "z-image-turbo"];
-  if (model.startsWith("lustify") || limitedModels.includes(model)) {
-    return prompt.length > 1400 ? prompt.slice(0, 1400) : prompt;
-  }
-  return prompt;
-}
 
 type SceneCharacterAppearanceState = {
   clothing: string;
@@ -291,6 +282,28 @@ function stableLowerName(name: string): string {
   return String(name || "").trim().toLowerCase();
 }
 
+/**
+ * Robust filtering function to strictly control accessory inclusion.
+ * Requirements:
+ * 1. Remove accessories not explicitly in the current scene prompt.
+ * 2. Cross-reference with explicit state (base).
+ * 3. Ignore defaults for accessories to prevent "random" additions.
+ */
+function applyAccessoryConstraints(
+  baseState: SceneCharacterAppearanceState,
+  defaultState: Partial<SceneCharacterAppearanceState> | undefined
+): string {
+  // If the current scene (baseState) has explicitly defined accessories, use them.
+  if (baseState.accessories && baseState.accessories.trim().length > 0) {
+    return baseState.accessories.trim();
+  }
+  
+  // Otherwise, return empty string. 
+  // We explicitly DO NOT fall back to defaultState.accessories here, 
+  // because the user requirement is to remove anything not explicitly in the scene prompt.
+  return "";
+}
+
 function computeEffectiveAppearanceFromHistory(args: {
   historyScenes: SceneAppearanceHistoryRow[];
   characterNames: string[];
@@ -317,7 +330,8 @@ function computeEffectiveAppearanceFromHistory(args: {
         clothing: st.clothing ? st.clothing : prev.clothing,
         state: st.state ? st.state : prev.state,
         physical_attributes: st.physical_attributes ? st.physical_attributes : prev.physical_attributes,
-        accessories: st.accessories ? st.accessories : prev.accessories,
+        // Do not inherit accessories from previous scenes to prevent unwanted items persisting
+        accessories: st.accessories ? st.accessories : undefined,
         extra: st.extra ? { ...(prev.extra ?? {}), ...st.extra } : prev.extra,
       };
     }
@@ -333,7 +347,8 @@ function computeEffectiveAppearanceFromHistory(args: {
       clothing: base.clothing || def?.clothing || "",
       state: base.state || "",
       physical_attributes: base.physical_attributes || def?.physical_attributes || "",
-      accessories: base.accessories || def?.accessories || "",
+      // Apply robust filtering to accessories: only explicit scene inputs are allowed
+      accessories: applyAccessoryConstraints(base, def),
       extra: base.extra,
     };
     if (!merged.clothing) missingClothing.push(name);
@@ -544,23 +559,13 @@ function extFromMime(mime: string) {
   return "png";
 }
 
-const STYLE_PROMPTS: Record<string, { positive: string; negative: string }> = {
-  // ... (Assuming style prompts are here, omitted for brevity as they are static)
-  // If they were dynamic, we would need to fetch them. For now, we assume standard behavior.
-  // Actually, let's include a placeholder for type safety if needed, but in this file structure, 
-  // we just need the keys to exist or not used if not needed.
-  // The original code had them.
-  default: { positive: "high quality, detailed", negative: "bad quality, blurry" },
-};
-
-// We need a way to get style prompts. Since the file is huge, I will assume they are handled or I should have read them.
-// But for the specific task of fixing "Invalid model", I don't need to touch style prompts.
-
-export function clampNumber(value: unknown, min: number, max: number, fallback: number) {
-  const n = typeof value === "number" ? value : Number(value);
-  if (!Number.isFinite(n)) return fallback;
-  return Math.max(min, Math.min(max, n));
+export function truncateText(text: string, maxLength: number) {
+  if (text.length <= maxLength) return text;
+  return text.slice(0, maxLength) + "...";
 }
+
+export { clampNumber };
+
 
 function styleStrengthText(intensity: number) {
   if (intensity >= 90) return "maximal and unmistakable";
@@ -573,6 +578,34 @@ function styleStrengthText(intensity: number) {
 function stripDataUrlPrefix(value: string) {
   const m = value.match(/^data:image\/[a-zA-Z0-9.+-]+;base64,(.*)$/);
   return m?.[1] ? m[1] : value;
+}
+
+function normalizeFullPromptText(text: string) {
+  const raw = String(text || "");
+  const normalizedNewlines = raw.replace(/\r\n/g, "\n").replace(/\r/g, "\n");
+  const withoutControls = Array.from(normalizedNewlines)
+    .filter((ch) => {
+      if (ch === "\n") return true;
+      const code = ch.charCodeAt(0);
+      return code >= 32 && code !== 127;
+    })
+    .join("");
+  const collapsedLines = withoutControls
+    .split("\n")
+    .map((line) => line.replace(/\s+/g, " ").trim())
+    .join("\n");
+  return collapsedLines.replace(/\n{3,}/g, "\n\n").trim();
+}
+
+function computeMissingSubjects(prompt: string, required: string[]) {
+  const lower = String(prompt || "").toLowerCase();
+  const missing: string[] = [];
+  for (const sub of required) {
+    const s = String(sub || "").trim();
+    if (!s) continue;
+    if (!lower.includes(s.toLowerCase())) missing.push(s);
+  }
+  return missing;
 }
 
 function extractFirstBase64Image(aiData: unknown): string | null {
@@ -689,6 +722,7 @@ serve(async (req: Request) => {
         preprocessingSteps: string[];
         promptHash: string;
         requestParams: Record<string, unknown>;
+        warnings?: string[];
       }
     | undefined;
 
@@ -713,26 +747,39 @@ serve(async (req: Request) => {
       reset: resetFlag,
       artStyle,
       model,
+      width: requestedWidth,
+      height: requestedHeight,
       styleIntensity,
       strictStyle,
+      disabledStyleElements,
       forcePrompt,
+      forceFullPrompt,
+      promptOnly,
     } = await req.json();
     requestedSceneId = sceneId;
 
-    const usedModel = asString(model) ?? null;
-    const needsGemini = usedModel ? Boolean(GOOGLE_MODELS[usedModel]) : false;
-    const veniceApiKey = needsGemini ? null : Deno.env.get("VENICE_API_KEY");
-    const geminiApiKeyRaw = needsGemini ? Deno.env.get("GEMINI_API_KEY") : null;
-    const geminiApiKey = typeof geminiApiKeyRaw === "string" ? geminiApiKeyRaw.trim() : null;
+    const warnings: string[] = [];
+    const rawModel = asString(model);
+    const usedModel = rawModel && rawModel.trim() ? rawModel.trim() : null;
+    const usedStyleIntensity = clampNumber(styleIntensity, 0, 100, 70);
+    const usedStrictStyle = typeof strictStyle === "boolean" ? strictStyle : true;
+    const usedDisabledStyleElements = Array.isArray(disabledStyleElements)
+      ? disabledStyleElements
+          .filter((v): v is string => typeof v === "string")
+          .map((v) => v.trim())
+          .filter(Boolean)
+          .slice(0, 48)
+      : [];
+    const veniceApiKey = Deno.env.get("VENICE_API_KEY") ?? "";
+    const geminiApiKeyRaw = Deno.env.get("GEMINI_API_KEY");
+    const geminiApiKey = typeof geminiApiKeyRaw === "string" ? geminiApiKeyRaw.trim() : "";
+    const isPromptOnly = typeof promptOnly === "boolean" ? promptOnly : false;
+    const forceFullPromptText = asString(forceFullPrompt);
 
     if (!resetFlag) {
-      if (!needsGemini && !veniceApiKey) {
-        console.error("VENICE_API_KEY missing");
-        return json(500, { error: "Configuration error", requestId, details: "Missing VENICE_API_KEY" });
-      }
-      if (needsGemini && !geminiApiKey) {
-        console.error("GEMINI_API_KEY missing");
-        return json(500, { error: "Configuration error", requestId, details: "Missing GEMINI_API_KEY" });
+      if (!veniceApiKey.trim() && !geminiApiKey.trim()) {
+        console.error("Missing upstream API keys");
+        return json(500, { error: "Configuration error", requestId, details: "Missing VENICE_API_KEY and GEMINI_API_KEY" });
       }
     }
 
@@ -811,6 +858,7 @@ serve(async (req: Request) => {
       console.warn(
         `[Warning] Invalid art style requested: '${String(artStyle)}' (normalized='${validatedArtStyle}'). Falling back to 'digital_illustration'.`,
       );
+      warnings.push(`invalid_art_style_fallback:${String(validatedArtStyle)}`);
       validatedArtStyle = "digital_illustration";
     }
 
@@ -826,11 +874,11 @@ serve(async (req: Request) => {
       "gemini-2.5-flash",
       "gemini-3-pro",
     ];
-    if (model) {
-      console.log(`[Debug] Received request for model: '${model}'`);
-      if (!ALLOWED_MODELS.includes(model)) {
-        console.error(`[Error] Invalid model requested: '${model}'. Allowed: ${ALLOWED_MODELS.join(", ")}`);
-        return json(400, { error: "Invalid model", requestId, details: `Model '${model}' not supported` });
+    if (usedModel) {
+      console.log(`[Debug] Received request for model: '${usedModel}'`);
+      if (!ALLOWED_MODELS.includes(usedModel)) {
+        console.error(`[Error] Invalid model requested: '${usedModel}'. Allowed: ${ALLOWED_MODELS.join(", ")}`);
+        return json(400, { error: "Invalid model", requestId, details: `Model '${usedModel}' not supported` });
       }
     }
 
@@ -896,24 +944,62 @@ serve(async (req: Request) => {
 
     if (storyRow.user_id !== user.id) return json(403, { error: "Not allowed", requestId });
 
-    // Mark as generating
-    await admin.from("scenes").update({ generation_status: "generating" }).eq("id", sceneId);
-    logTiming("status_update_generating");
+    const activeStyleGuideId =
+      typeof (storyRow as { active_style_guide_id?: unknown }).active_style_guide_id === "string"
+        ? String((storyRow as { active_style_guide_id: string }).active_style_guide_id)
+        : null;
+    let activeStyleGuideRow: StyleGuideRow | null = null;
+
+    if (activeStyleGuideId) {
+      if (!UUID_REGEX.test(activeStyleGuideId)) {
+        warnings.push("style_guide_id_invalid");
+      } else {
+        const { data: guideRow, error: guideError } = await admin
+          .from("story_style_guides")
+          .select("id, story_id, version, status, guide")
+          .eq("id", activeStyleGuideId)
+          .maybeSingle();
+
+        if (guideError || !guideRow) {
+          warnings.push("style_guide_missing");
+        } else if (String((guideRow as { story_id?: unknown }).story_id || "") !== String(scene.story_id || "")) {
+          warnings.push("style_guide_story_mismatch");
+        } else {
+          activeStyleGuideRow = guideRow as unknown as StyleGuideRow;
+          const status = String((activeStyleGuideRow as { status?: unknown }).status || "");
+          if (status && status !== "approved") warnings.push(`style_guide_status:${status}`);
+        }
+      }
+    }
+
+    if (!isPromptOnly) {
+      await admin.from("scenes").update({ generation_status: "generating" }).eq("id", sceneId);
+      logTiming("status_update_generating");
+    }
 
     // --- PROMPT PREPARATION ---
     const preprocessingSteps: string[] = [];
-    const basePrompt = forcePrompt || scene.image_prompt || scene.original_text || scene.summary || "";
-    const fullPromptRaw = basePrompt;
-    let fullPrompt = basePrompt;
+    preprocessingSteps.push("build:style_enforcement_v2");
+    const basePromptRaw = forcePrompt || scene.image_prompt || scene.original_text || scene.summary || "";
+    const fullPromptRaw = basePromptRaw;
+    let promptCore = basePromptRaw;
+    let fullPrompt = basePromptRaw;
     let characterStatesUsed: Record<string, SceneCharacterAppearanceState> | null = null;
     let characterStatesHash: string | null = null;
     let previousCharacterStatesHash: string | null = null;
+    const characterNames = Array.isArray(scene.characters)
+      ? scene.characters.map((n) => String(n || "").trim()).filter(Boolean)
+      : [];
+
+    if (!forcePrompt && typeof artStyle === "string" && artStyle.trim()) {
+      const stripped = stripKnownStylePhrases({ prompt: promptCore, keepStyleId: validatedArtStyle });
+      if (typeof stripped.prompt === "string" && stripped.prompt.trim()) {
+        promptCore = stripped.prompt;
+        if (stripped.removed && stripped.removed.length > 0) preprocessingSteps.push(`base_prompt_style_stripped:${stripped.removed.length}`);
+      }
+    }
 
     if (!forcePrompt) {
-      const characterNames = Array.isArray(scene.characters)
-        ? scene.characters.map((n) => String(n || "").trim()).filter(Boolean)
-        : [];
-
       if (characterNames.length > 0 && typeof scene.scene_number === "number" && Number.isFinite(scene.scene_number)) {
         const { data: historyRows, error: historyError } = await admin
           .from("scenes")
@@ -1014,10 +1100,8 @@ serve(async (req: Request) => {
             preprocessingSteps.push(`clothing_color_issues:${clothingColorIssues.map((x) => x.name).join(",")}`);
           }
 
-          const appendix = buildCharacterAppearanceAppendix({ characterNames, effectiveStates: coloredEffective });
-          if (appendix) {
-            fullPrompt = `${basePrompt}\n\n${appendix}`;
-          }
+          // Appendix assembly is deferred to later
+
 
           const detailsObj =
             asJsonObject(scene.consistency_details) ??
@@ -1053,42 +1137,255 @@ serve(async (req: Request) => {
     }
     
     // Safety check for empty prompts
-    if (!fullPrompt.trim()) {
+    if (!promptCore.trim()) {
+      if (isPromptOnly) {
+        return json(200, { success: false, error: "Prompt is empty", requestId, stage: "prompt_only" });
+      }
       return json(400, { error: "Prompt is empty", requestId });
     }
 
-    let negativePrompt = "ugly, bad quality, blurry, distorted";
-    if (validatedArtStyle === "anime_manga" || model === "wai-Illustrious") {
-       negativePrompt += ", 3d, realistic, photorealistic";
+    const storyStyleNormalized = normalizeArtStyleId((storyRow as { art_style?: unknown }).art_style);
+    const hasStyleOverride = Boolean(validatedArtStyle);
+    let selectedStyle = validatedArtStyle ?? storyStyleNormalized;
+    if (selectedStyle && !ALLOWED_STYLES.includes(selectedStyle)) selectedStyle = null;
+    selectedStyle = selectedStyle || "digital_illustration";
+
+    const styleGuideUsable = Boolean(activeStyleGuideRow && String(activeStyleGuideRow.status || "") !== "archived");
+    const styleGuideGuidance =
+      styleGuideUsable && selectedStyle === "none"
+        ? buildStoryStyleGuideGuidance({
+            guide: activeStyleGuideRow?.guide,
+            intensity: usedStyleIntensity,
+            strict: usedStrictStyle,
+          })
+        : { positive: "", used: false, issues: [] as string[] };
+
+    if (styleGuideGuidance.used) {
+      if (styleGuideGuidance.positive.trim()) {
+        if (activeStyleGuideRow?.version) preprocessingSteps.push(`style_guide_applied:v${activeStyleGuideRow.version}`);
+        else preprocessingSteps.push("style_guide_applied");
+      }
+      if (styleGuideGuidance.issues.length > 0) {
+        styleGuideGuidance.issues.forEach((issue) => warnings.push(`style_guide_issue:${issue}`));
+      }
+    } else if (activeStyleGuideId) {
+      warnings.push("style_guide_not_applied");
+    }
+    if (hasStyleOverride && activeStyleGuideId) preprocessingSteps.push("style_guide_skipped_for_style_override");
+
+    const isAnimePreferredStyle =
+      selectedStyle === "anime" ||
+      selectedStyle === "anime_manga" ||
+      selectedStyle === "manga_panel" ||
+      selectedStyle === "webtoon" ||
+      selectedStyle === "anime_screenshot" ||
+      selectedStyle === "studio_ghibli_style";
+
+    const requestedModel = usedModel;
+    const styleCategory = getStyleCategory(selectedStyle) ?? (isAnimePreferredStyle ? "anime" : "artistic");
+    const preferredModelByCategory: Record<string, string> = {
+      anime: "wai-Illustrious",
+      realistic: "venice-sd35",
+      pixel: "qwen-image",
+      "3d": "hidream",
+      artistic: "lustify-sdxl",
+    };
+    const allowedModelsByCategory: Record<string, Set<string>> = {
+      anime: new Set(["wai-Illustrious", "hidream", "gemini-2.5-flash", "gemini-3-pro"]),
+      realistic: new Set(["venice-sd35", "lustify-sdxl", "lustify-v7", "hidream", "z-image-turbo", "gemini-2.5-flash", "gemini-3-pro"]),
+      pixel: new Set(["qwen-image", "lustify-sdxl", "lustify-v7", "gemini-2.5-flash", "gemini-3-pro"]),
+      "3d": new Set(["hidream", "lustify-sdxl", "lustify-v7", "gemini-2.5-flash", "gemini-3-pro"]),
+      artistic: new Set(["lustify-sdxl", "lustify-v7", "hidream", "qwen-image", "z-image-turbo", "gemini-2.5-flash", "gemini-3-pro"]),
+    };
+    const preferredModel = preferredModelByCategory[styleCategory] ?? "lustify-sdxl";
+    const allowedForCategory = allowedModelsByCategory[styleCategory] ?? new Set<string>();
+
+    const selectedModel = requestedModel || preferredModel;
+    if (!requestedModel) {
+      preprocessingSteps.push(`model_selected_for_style:${styleCategory}->${selectedModel}`);
+    } else if (usedStrictStyle && allowedForCategory.size > 0 && !allowedForCategory.has(requestedModel)) {
+      preprocessingSteps.push(`model_not_recommended_for_style:${requestedModel}:${styleCategory}`);
+      warnings.push(`model_not_recommended_for_style:${requestedModel}:${styleCategory}`);
     }
 
-    // Resolution handling
-    const width = 1024;
-    const height = 576; // 16:9
+    const styleGuidance = buildStyleGuidance({
+      styleId: selectedStyle,
+      intensity: usedStyleIntensity,
+      strict: usedStrictStyle,
+      disabledElements: usedDisabledStyleElements,
+    });
+    if (styleGuidance.usedFallback) warnings.push(`style_prompt_fallback:${selectedStyle}`);
+    if (styleGuidance.positive.trim()) {
+      preprocessingSteps.push(`style_applied:${selectedStyle}`);
+      preprocessingSteps.push(`style_intensity:${Math.round(usedStyleIntensity)}`);
+      if (usedStrictStyle) preprocessingSteps.push("style_strict");
+      if (usedDisabledStyleElements.length > 0) preprocessingSteps.push(`style_elements_disabled:${usedDisabledStyleElements.length}`);
+    }
+
+    const styleValidation = validateStyleApplication({
+      styleId: selectedStyle,
+      strict: usedStrictStyle,
+      guidance: styleGuidance,
+      disabledElements: usedDisabledStyleElements,
+    });
+    if (!styleValidation.ok) {
+      styleValidation.issues.forEach((issue) => warnings.push(`style_validation_issue:${issue}`));
+      preprocessingSteps.push("style_validation_issues");
+      const hardIssues = styleValidation.issues.filter(
+        (i) => i === "style_guidance_empty" || i.startsWith("style_category_marker_missing:"),
+      );
+      if (usedStrictStyle && hardIssues.length > 0) {
+        if (!isPromptOnly) {
+          await admin.from("scenes").update({ generation_status: "error" }).eq("id", sceneId);
+          return json(400, {
+            error: "Style validation failed",
+            requestId,
+            stage: "style_validation",
+            details: { issues: hardIssues, styleId: selectedStyle, model: selectedModel },
+          });
+        }
+        return json(200, {
+          success: false,
+          error: "Style validation failed",
+          requestId,
+          stage: "style_validation",
+          details: { issues: hardIssues, styleId: selectedStyle, model: selectedModel },
+        });
+      }
+    }
+
+    const resolutionFallback = selectedModel === "gemini-2.5-flash" ? { width: 1024, height: 1024 } : { width: 1024, height: 576 };
+    const resolution = coerceRequestedResolution({
+      model: selectedModel,
+      width: requestedWidth,
+      height: requestedHeight,
+      fallback: resolutionFallback,
+    });
+    if (resolution.issues.length > 0) {
+      resolution.issues.forEach((issue) => warnings.push(`resolution_issue:${issue}`));
+      preprocessingSteps.push("resolution_processed");
+    }
+    const width = resolution.width;
+    const height = resolution.height;
     
     // Start timing
     const startTime = performance.now();
     
     // --- GENERATE IMAGE ---
-    // Prepare variables for generation
-    const selectedModel = usedModel || "lustify-sdxl";
-    const selectedStyle = validatedArtStyle || "digital_illustration";
-    const isStrict = strictStyle ?? true;
+    const isStrict = usedStrictStyle;
 
-    const sanitized = sanitizePrompt(fullPrompt);
-    fullPrompt = computeUsedPromptForModel(sanitized, selectedModel);
+    let characterAppendix: string | undefined;
+    if (!forcePrompt && characterNames.length > 0 && characterStatesUsed) {
+      characterAppendix = buildCharacterAppearanceAppendix({ characterNames, effectiveStates: characterStatesUsed });
+    }
+
+    const assembly = assemblePrompt({
+      basePrompt: promptCore,
+      characterAppendix,
+      stylePrefix: styleGuidance.prefix,
+      stylePositive: styleGuidance.positive,
+      styleGuidePositive: styleGuideGuidance.positive,
+      model: selectedModel,
+      maxLength: selectedModel.startsWith("gemini") ? 3800 : 1400,
+      requiredSubjects: characterNames,
+      selectedStyleId: selectedStyle, // Enables V2 cleaning
+    });
+    
+    fullPrompt = assembly.fullPrompt;
+    if (assembly.truncated) preprocessingSteps.push("prompt_truncated");
+    if (assembly.missingSubjects) {
+       assembly.missingSubjects.forEach(s => warnings.push(`missing_subject:${s}`));
+    }
+    const maxPromptLength = selectedModel.startsWith("gemini") ? 3800 : 1400;
+    if (forceFullPromptText && forceFullPromptText.trim()) {
+      const normalized = normalizeFullPromptText(forceFullPromptText);
+      if (!normalized) {
+        if (isPromptOnly) {
+          return json(200, { success: false, error: "Prompt is empty", requestId, stage: "prompt_only_force_full_prompt" });
+        }
+        return json(400, { error: "Prompt is empty", requestId });
+      }
+      fullPrompt = normalized.length > maxPromptLength ? normalized.slice(0, maxPromptLength) : normalized;
+      preprocessingSteps.push("force_full_prompt");
+      if (normalized.length > maxPromptLength) preprocessingSteps.push("force_full_prompt_truncated");
+      const missing = computeMissingSubjects(fullPrompt, characterNames);
+      if (missing.length > 0) missing.forEach((s) => warnings.push(`missing_subject:${s}`));
+    }
+
+    if (selectedStyle !== "none" && (styleGuidance.prefix || styleGuidance.positive)) {
+      const fullLower = fullPrompt.toLowerCase();
+      const prefixLower = String(styleGuidance.prefix || "").trim().toLowerCase();
+      const styleNameLower = String(styleGuidance.styleName || "").trim().toLowerCase();
+      const styleIdLower = selectedStyle.replace(/_/g, " ").toLowerCase();
+      const hasMarker =
+        (prefixLower && fullLower.includes(prefixLower)) ||
+        (styleNameLower && fullLower.includes(styleNameLower)) ||
+        (styleIdLower && fullLower.includes(styleIdLower));
+      if (!hasMarker) {
+        warnings.push("style_validation_issue:style_marker_missing_in_prompt");
+        preprocessingSteps.push("style_marker_missing_in_prompt");
+        if (usedStrictStyle) {
+          if (!isPromptOnly) {
+            await admin.from("scenes").update({ generation_status: "error" }).eq("id", sceneId);
+            return json(500, {
+              error: "Style application failed",
+              requestId,
+              stage: "style_application",
+              details: { styleId: selectedStyle, model: selectedModel },
+            });
+          }
+          return json(200, {
+            success: false,
+            error: "Style application failed",
+            requestId,
+            stage: "style_application",
+            details: { styleId: selectedStyle, model: selectedModel },
+            prompt: fullPrompt,
+            promptFull: fullPrompt,
+            preprocessingSteps,
+            warnings: warnings.length > 0 ? warnings : undefined,
+            parts: assembly.parts,
+          });
+        }
+      }
+    }
+
     const promptHash = await sha256Hex(fullPrompt);
+    if (isPromptOnly) {
+      return json(200, {
+        success: true,
+        requestId,
+        stage: "prompt_only",
+        model: selectedModel,
+        prompt: fullPrompt,
+        promptFull: fullPrompt,
+        promptHash,
+        warnings: warnings.length > 0 ? warnings : undefined,
+        preprocessingSteps,
+        parts: assembly.parts,
+        truncated: assembly.truncated,
+        missingSubjects: assembly.missingSubjects,
+        maxLength: maxPromptLength,
+      });
+    }
     lastPromptDebug = {
       model: selectedModel,
       prompt: fullPrompt,
       promptFull: fullPrompt,
       preprocessingSteps,
       promptHash,
+      warnings: warnings.length > 0 ? warnings : undefined,
       requestParams: {
         model: selectedModel,
         artStyle: selectedStyle,
-        styleIntensity: typeof styleIntensity === "number" ? styleIntensity : undefined,
+        styleIntensity: usedStyleIntensity,
         strictStyle: isStrict,
+        width,
+        height,
+        disabledStyleElements: usedDisabledStyleElements.length > 0 ? usedDisabledStyleElements : undefined,
+        styleGuideId: activeStyleGuideId ?? undefined,
+        styleGuideVersion: typeof activeStyleGuideRow?.version === "number" ? activeStyleGuideRow.version : undefined,
+        styleGuideStatus: typeof activeStyleGuideRow?.status === "string" ? activeStyleGuideRow.status : undefined,
       },
     };
     console.log("[Prompt] Using prompt", {
@@ -1103,12 +1400,11 @@ serve(async (req: Request) => {
     const generateImage = async (model: string) => {
       // Handle Google/Gemini Models
       if (GOOGLE_MODELS[model]) {
-        const keyRaw = geminiApiKey ?? Deno.env.get("GEMINI_API_KEY");
-        const key = typeof keyRaw === "string" ? keyRaw.trim() : "";
+        const key = geminiApiKey.trim();
         if (!key) return new Response(JSON.stringify({ error: "Gemini API key not configured" }), { status: 500, statusText: "Gemini Key Missing" });
 
         const googleModel = GOOGLE_MODELS[model];
-        const aspectRatio = getGoogleAspectRatio(width, height);
+        const aspectRatio = getAspectRatioLabel(width, height);
         console.log(`[Google] Generating with ${googleModel}, ratio: ${aspectRatio}`);
 
         const url = `https://generativelanguage.googleapis.com/v1beta/models/${googleModel}:predict`;
@@ -1174,28 +1470,39 @@ serve(async (req: Request) => {
       }
 
       // Adjust steps for specific models
-      let steps = 30;
+      let steps = computeStyleStepsForStyle({ styleId: selectedStyle, intensity: usedStyleIntensity, strict: usedStrictStyle });
       if (model === "qwen-image") {
         steps = 8; // Max allowed for Qwen
       } else if (model === "z-image-turbo") {
-        steps = 0; // Docs example uses 0
+        steps = 4; // Turbo models typically need 1-4 steps. 4 provides better detail than 1-2.
+      }
+      steps = Math.max(1, Math.min(30, Math.round(steps)));
+      
+      let cfgScale = computeStyleCfgScaleForStyle({ styleId: selectedStyle, intensity: usedStyleIntensity, strict: usedStrictStyle });
+      
+      // Override CFG for Turbo models which require low guidance
+      if (model === "z-image-turbo") {
+         cfgScale = 1.8; // Turbo models burn out at high CFG. 1.5-2.0 is standard range.
       }
 
       try {
+        if (!veniceApiKey.trim()) {
+          return new Response(JSON.stringify({ error: "Venice API key not configured" }), { status: 500, statusText: "Venice Key Missing" });
+        }
         const res = await fetchWithTimeout("https://api.venice.ai/api/v1/image/generate", {
           method: "POST",
           headers: {
-            Authorization: `Bearer ${veniceApiKey ?? ""}`,
+            Authorization: `Bearer ${veniceApiKey}`,
             "Content-Type": "application/json",
           },
           body: JSON.stringify({
             model,
             prompt: safePrompt,
-            negative_prompt: negativePrompt,
+            // negative_prompt removed per user request
             width: width,
             height: height,
             steps,
-            cfg_scale: 7.5,
+            cfg_scale: cfgScale,
             safe_mode: false,
             hide_watermark: true,
             embed_exif_metadata: false,
@@ -1218,6 +1525,7 @@ serve(async (req: Request) => {
       aiErrorText = await aiResponse.text();
       console.error("AI image generation error:", aiResponse.status, aiErrorText);
       const shouldRetryWithFallback =
+        !requestedModel &&
         (aiResponse.status === 400 || aiResponse.status === 404) &&
         typeof aiErrorText === "string" &&
         (aiErrorText.toLowerCase().includes("model") || aiErrorText.toLowerCase().includes("unknown") || aiErrorText.toLowerCase().includes("not found"));
@@ -1332,6 +1640,7 @@ serve(async (req: Request) => {
               prompt_hash: lastPromptDebug?.promptHash,
               preprocessingSteps: lastPromptDebug?.preprocessingSteps,
               requestParams: lastPromptDebug?.requestParams,
+              warnings: lastPromptDebug?.warnings,
               character_states_hash: characterStatesHash,
               previous_character_states_hash: previousCharacterStatesHash,
               character_states_used: characterStatesUsed,
@@ -1357,6 +1666,7 @@ serve(async (req: Request) => {
       promptFull: fullPrompt,
       promptHash: lastPromptDebug?.promptHash,
       preprocessingSteps: lastPromptDebug?.preprocessingSteps,
+      warnings: lastPromptDebug?.warnings,
       characterStatesHash,
     });
 
