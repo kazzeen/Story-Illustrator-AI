@@ -1,5 +1,7 @@
 import { serve } from "https://deno.land/std@0.168.0/http/server.ts";
 import { createClient } from "https://esm.sh/@supabase/supabase-js@2.49.2";
+import { encode as encodeBase64 } from "https://deno.land/std@0.168.0/encoding/base64.ts";
+import { Image } from "https://deno.land/x/imagescript@1.3.0/mod.ts";
 import { ensureClothingColors, validateClothingColorCoverage } from "../_shared/clothing-colors.ts";
 import {
   buildCharacterAppearanceAppendix,
@@ -38,6 +40,7 @@ type ConsistencySettings = {
   auto_correct?: boolean;
   character_identity_lock?: boolean;
   character_anchor_strength?: number;
+  character_image_reference_enabled?: boolean;
 };
 
 type StoryJoinRow = {
@@ -166,7 +169,7 @@ function normalizeArtStyleId(value: unknown): string | null {
   return ART_STYLE_ALIASES[normalized] ?? normalized;
 }
 
-function asConsistencySettings(val: unknown): ConsistencySettings | null {
+export function asConsistencySettings(val: unknown): ConsistencySettings | null {
   const obj = asJsonObject(val);
   if (!obj) return null;
   return {
@@ -174,6 +177,16 @@ function asConsistencySettings(val: unknown): ConsistencySettings | null {
     auto_correct: typeof obj.auto_correct === "boolean" ? obj.auto_correct : undefined,
     character_identity_lock: typeof obj.character_identity_lock === "boolean" ? obj.character_identity_lock : undefined,
     character_anchor_strength: typeof obj.character_anchor_strength === "number" ? obj.character_anchor_strength : undefined,
+    character_image_reference_enabled:
+      typeof obj.character_image_reference_enabled === "boolean"
+        ? obj.character_image_reference_enabled
+        : typeof obj.characterImageReferenceEnabled === "boolean"
+          ? obj.characterImageReferenceEnabled
+          : typeof obj.character_image_reference === "boolean"
+            ? obj.character_image_reference
+            : typeof obj.characterImageReference === "boolean"
+              ? obj.characterImageReference
+              : undefined,
   };
 }
 
@@ -183,6 +196,313 @@ async function sha256Hex(text: string): Promise<string> {
   const hashBuffer = await crypto.subtle.digest("SHA-256", data);
   const hashArray = Array.from(new Uint8Array(hashBuffer));
   return hashArray.map((b) => b.toString(16).padStart(2, "0")).join("");
+}
+
+const CHARACTER_IMAGE_REFERENCE_MAX_SIDE = 512;
+const CHARACTER_IMAGE_REFERENCE_JPEG_QUALITY = 85;
+const CHARACTER_IMAGE_REFERENCE_CACHE_TTL_MS = 6 * 60 * 60 * 1000;
+const CHARACTER_IMAGE_REFERENCE_CACHE_MAX_ITEMS = 64;
+
+type CachedRefImage = { base64Jpeg: string; width: number; height: number; byteSize: number; lastAccess: number };
+type CachedVision = { text: string; lastAccess: number };
+
+const characterRefImageCache = new Map<string, CachedRefImage>();
+const characterVisionCache = new Map<string, CachedVision>();
+
+function nowMs() {
+  return Date.now();
+}
+
+function evictOldest(map: Map<string, { lastAccess: number }>, maxItems: number) {
+  if (map.size <= maxItems) return;
+  const entries = Array.from(map.entries());
+  entries.sort((a, b) => a[1].lastAccess - b[1].lastAccess);
+  for (let i = 0; i < entries.length && map.size > maxItems; i += 1) {
+    map.delete(entries[i][0]);
+  }
+}
+
+function readCache<T extends { lastAccess: number }>(map: Map<string, T>, key: string, ttlMs: number): T | null {
+  const hit = map.get(key);
+  if (!hit) return null;
+  const age = nowMs() - hit.lastAccess;
+  if (age > ttlMs) {
+    map.delete(key);
+    return null;
+  }
+  hit.lastAccess = nowMs();
+  return hit;
+}
+
+function writeCache<T extends { lastAccess: number }>(map: Map<string, T>, key: string, value: Omit<T, "lastAccess">) {
+  map.set(key, { ...value, lastAccess: nowMs() } as T);
+  evictOldest(map, CHARACTER_IMAGE_REFERENCE_CACHE_MAX_ITEMS);
+}
+
+async function fetchBytesWithTimeout(url: string, timeoutMs: number) {
+  const controller = new AbortController();
+  const timer = setTimeout(() => controller.abort(), timeoutMs);
+  try {
+    const res = await fetch(url, { signal: controller.signal });
+    if (!res.ok) {
+      const body = await res.text().catch(() => "");
+      throw new Error(`HTTP ${res.status} ${res.statusText}${body ? `: ${body.slice(0, 200)}` : ""}`);
+    }
+    const ct = (res.headers.get("content-type") || "").toLowerCase();
+    const buf = new Uint8Array(await res.arrayBuffer());
+    return { bytes: buf, contentType: ct };
+  } finally {
+    clearTimeout(timer);
+  }
+}
+
+function normalizeAllowedImageMime(contentType: string): "image/png" | "image/jpeg" | null {
+  const ct = (contentType || "").split(";")[0].trim().toLowerCase();
+  if (ct === "image/jpeg" || ct === "image/jpg") return "image/jpeg";
+  if (ct === "image/png") return "image/png";
+  return null;
+}
+
+async function prepareCharacterReferenceImage(args: { url: string; timeoutMs: number }) {
+  const cached = readCache(characterRefImageCache, args.url, CHARACTER_IMAGE_REFERENCE_CACHE_TTL_MS);
+  if (cached) return cached;
+
+  const { bytes, contentType } = await fetchBytesWithTimeout(args.url, args.timeoutMs);
+  const mime = normalizeAllowedImageMime(contentType);
+  if (!mime) {
+    throw new Error(`Unsupported image type: ${contentType || "unknown"}`);
+  }
+
+  const decoded = await Image.decode(bytes);
+  const iw = decoded.width;
+  const ih = decoded.height;
+  const maxSide = Math.max(iw, ih);
+  if (maxSide > CHARACTER_IMAGE_REFERENCE_MAX_SIDE) {
+    const scale = CHARACTER_IMAGE_REFERENCE_MAX_SIDE / maxSide;
+    const tw = Math.max(1, Math.round(iw * scale));
+    const th = Math.max(1, Math.round(ih * scale));
+    decoded.resize(tw, th);
+  }
+
+  const encoded = await decoded.encodeJPEG(CHARACTER_IMAGE_REFERENCE_JPEG_QUALITY);
+  const base64Jpeg = encodeBase64(encoded);
+  const out: CachedRefImage = {
+    base64Jpeg,
+    width: decoded.width,
+    height: decoded.height,
+    byteSize: encoded.byteLength,
+    lastAccess: nowMs(),
+  };
+  writeCache(characterRefImageCache, args.url, {
+    base64Jpeg: out.base64Jpeg,
+    width: out.width,
+    height: out.height,
+    byteSize: out.byteSize,
+  });
+  return out;
+}
+
+async function describeCharactersFromReferenceImages(args: {
+  veniceApiKey: string;
+  requestId: string;
+  characters: Array<{ name: string; imageUrl: string }>;
+  timeoutMs: number;
+}) {
+  const warnings: string[] = [];
+  const byName: Record<string, string> = {};
+  const missing: Array<{ name: string; imageUrl: string }> = [];
+
+  for (const item of args.characters) {
+    const cached = readCache(characterVisionCache, item.imageUrl, CHARACTER_IMAGE_REFERENCE_CACHE_TTL_MS);
+    if (cached) {
+      byName[item.name] = cached.text;
+    } else {
+      missing.push(item);
+    }
+  }
+
+  if (missing.length === 0) return { byName, warnings };
+  if (!args.veniceApiKey.trim()) {
+    warnings.push("character_image_reference_skipped:missing_venice_api_key");
+    return { byName, warnings };
+  }
+
+  const prepared: Array<{ name: string; imageUrl: string; dataUrl: string }> = [];
+  for (const item of missing.slice(0, 8)) {
+    try {
+      const img = await prepareCharacterReferenceImage({ url: item.imageUrl, timeoutMs: args.timeoutMs });
+      prepared.push({ name: item.name, imageUrl: item.imageUrl, dataUrl: `data:image/jpeg;base64,${img.base64Jpeg}` });
+    } catch (e) {
+      warnings.push(`character_image_reference_failed:${item.name}`);
+      void e;
+    }
+  }
+
+  if (prepared.length === 0) return { byName, warnings };
+
+  const content: Array<Record<string, unknown>> = [
+    {
+      type: "text",
+      text:
+        `For each character image, summarize stable visual traits visible in the image (face shape, hair style/color, eye color if clear, skin tone, distinctive marks, clothing items and their colors/patterns, accessories). ` +
+        `Avoid subjective adjectives. Output one line per character in the exact format "Name: traits". Keep each line under 40 words.`,
+    },
+  ];
+
+  for (const item of prepared) {
+    content.push({ type: "text", text: `Name: ${item.name}` });
+    content.push({ type: "image_url", image_url: { url: item.dataUrl } });
+  }
+
+  const controller = new AbortController();
+  const timer = setTimeout(() => controller.abort(), args.timeoutMs);
+  try {
+    const res = await fetch("https://api.venice.ai/api/v1/chat/completions", {
+      method: "POST",
+      headers: {
+        Authorization: `Bearer ${args.veniceApiKey}`,
+        "Content-Type": "application/json",
+      },
+      body: JSON.stringify({
+        model: "mistral-31-24b",
+        safe_mode: false,
+        messages: [{ role: "user", content }],
+      }),
+      signal: controller.signal,
+    });
+
+    if (!res.ok) {
+      const t = await res.text().catch(() => "");
+      warnings.push(`character_image_reference_vision_http_${res.status}`);
+      void t;
+      return { byName, warnings };
+    }
+
+    const data = (await res.json().catch(() => null)) as Record<string, unknown> | null;
+    const choices = Array.isArray(data?.choices) ? (data!.choices as unknown[]) : [];
+    const first = choices.length > 0 && isRecord(choices[0]) ? (choices[0] as Record<string, unknown>) : null;
+    const message = first && isRecord(first.message) ? (first.message as Record<string, unknown>) : null;
+    const text = message && typeof message.content === "string" ? (message.content as string) : "";
+    const lines = text
+      .split(/\r?\n/)
+      .map((l) => l.trim())
+      .filter(Boolean);
+
+    for (const line of lines) {
+      const idx = line.indexOf(":");
+      if (idx <= 0) continue;
+      const name = line.slice(0, idx).trim();
+      const traits = line.slice(idx + 1).trim();
+      if (!name || !traits) continue;
+      byName[name] = traits;
+    }
+
+    for (const item of prepared) {
+      const found = byName[item.name];
+      if (typeof found === "string" && found.trim()) {
+        writeCache(characterVisionCache, item.imageUrl, { text: found });
+      }
+    }
+
+    return { byName, warnings };
+  } finally {
+    clearTimeout(timer);
+  }
+}
+
+async function fetchCharacterReferenceInputs(args: {
+  admin: ReturnType<typeof createClient>;
+  storyId: string;
+  characterNames: string[];
+  requestId: string;
+}): Promise<{
+  byName: Record<string, { imageUrl: string | null; promptSnippet: string | null }>;
+  warnings: string[];
+}> {
+  const warnings: string[] = [];
+  const wanted = new Set(args.characterNames.map((n) => stableLowerName(n)));
+  if (wanted.size === 0) return { byName: {}, warnings };
+
+  const { data: chars, error: charError } = await args.admin
+    .from("characters")
+    .select("id, name, active_reference_sheet_id")
+    .eq("story_id", args.storyId);
+
+  if (charError) {
+    warnings.push("character_image_reference_failed:characters_fetch");
+    return { byName: {}, warnings };
+  }
+
+  const matched = (chars || [])
+    .map((c) => {
+      const id = typeof (c as { id?: unknown }).id === "string" ? String((c as { id: string }).id) : "";
+      const name = typeof (c as { name?: unknown }).name === "string" ? String((c as { name: string }).name) : "";
+      const activeRefId =
+        typeof (c as { active_reference_sheet_id?: unknown }).active_reference_sheet_id === "string"
+          ? String((c as { active_reference_sheet_id: string }).active_reference_sheet_id)
+          : "";
+      return { id, name, lower: stableLowerName(name), activeRefId };
+    })
+    .filter((c) => c.id && c.name && wanted.has(c.lower));
+
+  if (matched.length === 0) return { byName: {}, warnings };
+
+  const byCharId: Record<string, { name: string; activeRefId?: string }> = {};
+  matched.forEach((c) => {
+    byCharId[c.id] = { name: c.name, activeRefId: c.activeRefId && UUID_REGEX.test(c.activeRefId) ? c.activeRefId : undefined };
+  });
+
+  const activeRefIds = Array.from(
+    new Set(
+      matched
+        .map((c) => (c.activeRefId && UUID_REGEX.test(c.activeRefId) ? c.activeRefId : null))
+        .filter((v): v is string => typeof v === "string"),
+    ),
+  );
+
+  const sheetsById: Record<string, CharacterReferenceSheetRow> = {};
+  if (activeRefIds.length > 0) {
+    const { data: activeSheets, error: activeErr } = await args.admin
+      .from("character_reference_sheets")
+      .select("id, character_id, version, status, prompt_snippet, reference_image_url")
+      .in("id", activeRefIds);
+    if (activeErr) warnings.push("character_image_reference_failed:active_reference_fetch");
+    (activeSheets || []).forEach((row) => {
+      const id = typeof (row as { id?: unknown }).id === "string" ? String((row as { id: string }).id) : "";
+      if (!id) return;
+      sheetsById[id] = row as unknown as CharacterReferenceSheetRow;
+    });
+  }
+
+  const characterIds = matched.map((c) => c.id);
+  const { data: approvedSheets, error: approvedErr } = await args.admin
+    .from("character_reference_sheets")
+    .select("id, character_id, version, status, prompt_snippet, reference_image_url")
+    .in("character_id", characterIds)
+    .eq("status", "approved")
+    .order("version", { ascending: false });
+
+  if (approvedErr) warnings.push("character_image_reference_failed:approved_reference_fetch");
+
+  const latestApprovedByCharacterId: Record<string, CharacterReferenceSheetRow> = {};
+  (approvedSheets || []).forEach((row) => {
+    const cid = typeof (row as { character_id?: unknown }).character_id === "string" ? String((row as { character_id: string }).character_id) : "";
+    if (!cid) return;
+    if (!latestApprovedByCharacterId[cid]) latestApprovedByCharacterId[cid] = row as unknown as CharacterReferenceSheetRow;
+  });
+
+  const byName: Record<string, { imageUrl: string | null; promptSnippet: string | null }> = {};
+  for (const c of matched) {
+    const meta = byCharId[c.id];
+    const activeSheet = meta?.activeRefId ? sheetsById[meta.activeRefId] : undefined;
+    const approvedSheet = latestApprovedByCharacterId[c.id];
+    const picked = activeSheet && activeSheet.reference_image_url ? activeSheet : approvedSheet;
+    const imageUrl = picked && typeof picked.reference_image_url === "string" ? picked.reference_image_url : null;
+    const promptSnippet = picked && typeof picked.prompt_snippet === "string" ? picked.prompt_snippet : null;
+    byName[c.name] = { imageUrl, promptSnippet };
+  }
+
+  return { byName, warnings };
 }
 
 
@@ -741,6 +1061,7 @@ serve(async (req: Request) => {
       return json(500, { error: "Configuration error", requestId, details: "Missing SUPABASE_URL or SUPABASE_SERVICE_ROLE_KEY" });
     }
 
+    const requestBody = await req.json();
     const {
       sceneId,
       storyId,
@@ -755,7 +1076,9 @@ serve(async (req: Request) => {
       forcePrompt,
       forceFullPrompt,
       promptOnly,
-    } = await req.json();
+      characterImageReferenceEnabled,
+      character_image_reference_enabled: characterImageReferenceEnabledSnake,
+    } = requestBody as Record<string, unknown>;
     requestedSceneId = sceneId;
 
     const warnings: string[] = [];
@@ -943,6 +1266,16 @@ serve(async (req: Request) => {
     }
 
     if (storyRow.user_id !== user.id) return json(403, { error: "Not allowed", requestId });
+
+    const storyConsistency = asConsistencySettings((storyRow as { consistency_settings?: unknown }).consistency_settings) ?? {};
+    const characterImageReferenceEnabledEffective =
+      typeof characterImageReferenceEnabled === "boolean"
+        ? characterImageReferenceEnabled
+        : typeof characterImageReferenceEnabledSnake === "boolean"
+          ? characterImageReferenceEnabledSnake
+          : typeof storyConsistency.character_image_reference_enabled === "boolean"
+            ? storyConsistency.character_image_reference_enabled
+            : false;
 
     const activeStyleGuideId =
       typeof (storyRow as { active_style_guide_id?: unknown }).active_style_guide_id === "string"
@@ -1279,6 +1612,68 @@ serve(async (req: Request) => {
       characterAppendix = buildCharacterAppearanceAppendix({ characterNames, effectiveStates: characterStatesUsed });
     }
 
+    if (!forcePrompt && characterImageReferenceEnabledEffective && characterNames.length > 0) {
+      const refInputs = await fetchCharacterReferenceInputs({
+        admin,
+        storyId: scene.story_id,
+        characterNames,
+        requestId,
+      });
+      if (refInputs.warnings.length > 0) warnings.push(...refInputs.warnings);
+
+      const refByLowerName: Record<string, { imageUrl: string | null; promptSnippet: string | null }> = {};
+      Object.entries(refInputs.byName).forEach(([name, meta]) => {
+        refByLowerName[stableLowerName(name)] = meta;
+      });
+
+      const visionCandidates = characterNames
+        .map((name) => {
+          const meta = refByLowerName[stableLowerName(name)];
+          const imageUrl = meta?.imageUrl;
+          return imageUrl ? { name, imageUrl } : null;
+        })
+        .filter(Boolean) as Array<{ name: string; imageUrl: string }>;
+
+      if (visionCandidates.length === 0) {
+        preprocessingSteps.push("character_image_reference:no_images");
+      } else {
+        const vision = await describeCharactersFromReferenceImages({
+          veniceApiKey,
+          requestId,
+          characters: visionCandidates,
+          timeoutMs: 25000,
+        });
+        if (vision.warnings.length > 0) warnings.push(...vision.warnings);
+
+        const traitsByLowerName: Record<string, string> = {};
+        Object.entries(vision.byName).forEach(([name, traits]) => {
+          if (typeof traits === "string" && traits.trim()) traitsByLowerName[stableLowerName(name)] = traits.trim();
+        });
+
+        const parts: string[] = [];
+        for (const name of characterNames) {
+          const lower = stableLowerName(name);
+          const traits = traitsByLowerName[lower];
+          const snippet = refByLowerName[lower]?.promptSnippet ?? null;
+          const text = traits || (typeof snippet === "string" && snippet.trim() ? snippet.trim() : "");
+          if (!text) continue;
+          const stripped = stripKnownStylePhrases({ prompt: text }).prompt;
+          const cleaned = sanitizePrompt(stripped);
+          const finalText = cleaned.trim() ? cleaned : sanitizePrompt(text);
+          parts.push(`${name}: ${truncateText(finalText, 220)}`);
+        }
+
+        if (parts.length > 0) {
+          const appendixRaw = `Character image reference: ${parts.join(" | ")}`;
+          const appendix = sanitizePrompt(appendixRaw);
+          characterAppendix = characterAppendix ? `${characterAppendix} ${appendix}` : appendix;
+          preprocessingSteps.push(`character_image_reference:applied:${Math.min(visionCandidates.length, 8)}`);
+        } else {
+          preprocessingSteps.push("character_image_reference:no_traits");
+        }
+      }
+    }
+
     const assembly = assemblePrompt({
       basePrompt: promptCore,
       characterAppendix,
@@ -1380,6 +1775,7 @@ serve(async (req: Request) => {
         artStyle: selectedStyle,
         styleIntensity: usedStyleIntensity,
         strictStyle: isStrict,
+        characterImageReferenceEnabled: characterImageReferenceEnabledEffective,
         width,
         height,
         disabledStyleElements: usedDisabledStyleElements.length > 0 ? usedDisabledStyleElements : undefined,

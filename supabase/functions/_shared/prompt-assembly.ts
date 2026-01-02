@@ -1,4 +1,4 @@
-import { getStyleCategory, STYLE_CONFLICTS } from "./style-prompts.ts";
+import { getStyleCategory, stripKnownStylePhrases, STYLE_CONFLICTS } from "./style-prompts.ts";
 
 export const MAX_PROMPT_LENGTH_DEFAULT = 1400;
 
@@ -35,6 +35,33 @@ function splitStyleParts(text: string): string[] {
     .filter(Boolean);
 }
 
+function dedupePhraseAllButFirst(text: string, phrase: string): string {
+  const p = String(phrase || "").trim();
+  if (!p) return text;
+  const tokens = p.split(/\s+/g).map((t) => t.trim()).filter(Boolean);
+  const body = tokens.map(escapeRegExp).join("(?:\\s+|[-_]+)");
+  const re = new RegExp(`\\b${body}\\b`, "gi");
+  let match: RegExpExecArray | null = null;
+  let seen = false;
+  let lastIndex = 0;
+  let out = "";
+
+  while ((match = re.exec(text)) !== null) {
+    if (!seen) {
+      seen = true;
+      continue;
+    }
+    const start = match.index;
+    const end = start + match[0].length;
+    out += text.slice(lastIndex, start);
+    lastIndex = end;
+  }
+
+  if (!seen) return text;
+  out += text.slice(lastIndex);
+  return out;
+}
+
 function joinComma(parts: string[]): string {
   return parts
     .map((p) => String(p || "").replace(/\s+/g, " ").trim())
@@ -48,7 +75,11 @@ function uniqParts(parts: string[]): string[] {
   for (const raw of parts) {
     const p = String(raw || "").replace(/\s+/g, " ").trim();
     if (!p) continue;
-    const key = p.toLowerCase();
+    const key = p
+      .toLowerCase()
+      .replace(/[-_]+/g, " ")
+      .replace(/\s+/g, " ")
+      .trim();
     if (seen.has(key)) continue;
     seen.add(key);
     out.push(p);
@@ -89,9 +120,20 @@ function styleLabelFromId(styleId?: string): string {
   return id.replace(/_/g, " ").trim();
 }
 
+function containsLoosePhrase(text: string, phrase: string): boolean {
+  const hay = String(text || "");
+  const p = String(phrase || "").trim();
+  if (!hay || !p) return false;
+  const tokens = p.split(/\s+/g).map((t) => t.trim()).filter(Boolean);
+  if (tokens.length === 0) return false;
+  const body = tokens.map(escapeRegExp).join("(?:\\s+|[-_]+)");
+  const re = new RegExp(`\\b${body}\\b`, "i");
+  return re.test(hay);
+}
+
 function buildStyledSubject(stylePrefix: string, base: string): string {
   const p = sanitizePrompt(stylePrefix);
-  const b = sanitizePrompt(base);
+  const b = sanitizePrompt(base).replace(/^[,\s]+/g, "").replace(/[,\s]+$/g, "").trim();
   if (!p) return b;
   if (!b) return p;
   if (/\bof$/i.test(p)) return `${p} ${b}`.trim();
@@ -125,18 +167,36 @@ export function assemblePrompt(opts: PromptAssemblyOptions): {
 
   const selectedStyleId = String(opts.selectedStyleId || "").trim();
   const styleLabel = styleLabelFromId(selectedStyleId);
-  const styleMarker = styleLabel ? `${styleLabel} style` : "";
+  const styleDescriptor = styleLabel ? `${styleLabel} style` : "";
 
-  const baseClean = cleanPromptForStyle(sanitizePrompt(opts.basePrompt), selectedStyleId);
-  const charsClean = sanitizePrompt(opts.characterAppendix || "");
+  const baseSanitized = sanitizePrompt(opts.basePrompt);
+  const baseWithoutStyleNoise = selectedStyleId
+    ? stripKnownStylePhrases({ prompt: baseSanitized }).prompt
+    : baseSanitized;
+  const baseClean = cleanPromptForStyle(baseWithoutStyleNoise, selectedStyleId);
+  const charsSanitized = sanitizePrompt(opts.characterAppendix || "");
+  const charsWithoutStyleNoise = selectedStyleId ? stripKnownStylePhrases({ prompt: charsSanitized }).prompt : charsSanitized;
+  const charsClean = sanitizePrompt(charsWithoutStyleNoise);
   const guideClean = sanitizePrompt(opts.styleGuidePositive || "");
 
-  const styleParts = uniqParts([...splitStyleParts(opts.stylePositive || ""), ...splitStyleParts(guideClean)]);
-
   const stylePrefixClean = sanitizePrompt(opts.stylePrefix || "");
+  const styleMarker = !stylePrefixClean && styleLabel ? `${styleLabel} style` : "";
   const styledSubject = buildStyledSubject(stylePrefixClean, baseClean);
 
-  const head = joinComma(uniqParts([...(styleMarker ? [styleMarker] : []), styledSubject, ...styleParts]));
+  const rawStyleParts = uniqParts([...splitStyleParts(opts.stylePositive || ""), ...splitStyleParts(guideClean)]);
+  const styleParts = stylePrefixClean && styleDescriptor
+    ? rawStyleParts.filter((p) => !containsLoosePhrase(p, styleDescriptor))
+    : rawStyleParts;
+
+  let head = joinComma(uniqParts([...(styleMarker ? [styleMarker] : []), styledSubject, ...styleParts]));
+  if (styleDescriptor) {
+    head = dedupePhraseAllButFirst(head, styleDescriptor)
+      .replace(/,\s*,+/g, ", ")
+      .replace(/\s+,/g, ",")
+      .replace(/,\s+/g, ", ")
+      .replace(/\s+/g, " ")
+      .trim();
+  }
 
   let full = head;
   let partsStyle = joinComma(uniqParts([...(styleMarker ? [styleMarker] : []), ...styleParts]));
@@ -145,7 +205,6 @@ export function assemblePrompt(opts: PromptAssemblyOptions): {
   let partsChars = charsClean;
 
   if (partsChars) full = `${full}\n\n${partsChars}`;
-  if (styleMarker) full = `${full}\n\n${styleMarker}`;
 
   let truncated = false;
   if (full.length > limit) {
@@ -153,27 +212,13 @@ export function assemblePrompt(opts: PromptAssemblyOptions): {
     const workingStyleParts = styleParts.slice();
     let workingBase = styledSubject;
     let workingChars = partsChars;
-    let includeTailMarker = Boolean(styleMarker);
 
     const assemble = () => {
       const core = joinComma(uniqParts([...(styleMarker ? [styleMarker] : []), workingBase, ...workingStyleParts]));
-      const withChars = workingChars ? `${core}\n\n${workingChars}` : core;
-      return includeTailMarker && styleMarker ? `${withChars}\n\n${styleMarker}` : withChars;
+      return workingChars ? `${core}\n\n${workingChars}` : core;
     };
 
     let out = assemble();
-    if (out.length > limit && includeTailMarker) {
-      includeTailMarker = false;
-      out = assemble();
-    }
-
-    if (out.length > limit && workingChars) {
-      const withoutTail = out;
-      const coreLen = withoutTail.replace(/\n\n[\s\S]*$/g, "").length;
-      const remaining = Math.max(0, limit - coreLen - 2);
-      workingChars = truncateAtWordBoundary(workingChars, remaining);
-      out = assemble();
-    }
 
     while (out.length > limit && workingStyleParts.length > 0) {
       workingStyleParts.pop();
@@ -184,6 +229,13 @@ export function assemblePrompt(opts: PromptAssemblyOptions): {
       const head = joinComma(uniqParts([...(styleMarker ? [styleMarker] : []), ...workingStyleParts]));
       const budgetForBase = Math.max(0, limit - head.length - 2);
       workingBase = truncateAtWordBoundary(workingBase, budgetForBase);
+      out = assemble();
+    }
+
+    if (out.length > limit && workingChars) {
+      const coreLen = out.replace(/\n\n[\s\S]*$/g, "").length;
+      const remaining = Math.max(0, limit - coreLen - 2);
+      workingChars = truncateAtWordBoundary(workingChars, remaining);
       out = assemble();
     }
 

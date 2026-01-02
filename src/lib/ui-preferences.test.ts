@@ -73,4 +73,15 @@ describe("ui preferences", () => {
     expect(source).toContain("if (!isModalOpen || !selectedScene?.id) return;");
     expect(source).toContain("void hydrateSceneDebugFromDb(selectedScene.id)");
   });
+
+  test("CharacterList mirrors the scene card regeneration button styles", () => {
+    const characterListPath = new URL("../components/storyboard/CharacterList.tsx", import.meta.url);
+    const source = fs.readFileSync(characterListPath, "utf8");
+
+    expect(source).toContain('className="absolute top-2 right-2 bg-background/80 backdrop-blur-sm h-8 w-8"');
+    expect(source).toContain("<RefreshCw");
+    expect(source).toContain("e.stopPropagation();");
+    expect(source).toContain("handleRegenerateCharacterImage");
+    expect(source).toContain("generate-character-reference");
+  });
 });

@@ -430,7 +430,7 @@ const KNOWN_STYLE_PHRASES: Array<{ styleId: string; variants: string[]; prefixes
   const addVariant = (styleId: string, raw: string) => {
     const v = String(raw || "")
       .toLowerCase()
-      .replace(/[_\s]+/g, " ")
+      .replace(/[_\s-]+/g, " ")
       .replace(/\s+/g, " ")
       .trim();
     if (!v) return;
@@ -604,6 +604,20 @@ export function stripKnownStylePhrases(args: {
 
   const keepRaw = typeof args.keepStyleId === "string" ? args.keepStyleId.trim().toLowerCase() : "";
   const keepStyleId = keepRaw ? (STYLE_ID_ALIASES[keepRaw] ?? keepRaw) : "";
+  const WORD_SEP = "(?:\\s+|[-_]+)";
+  const normalizePhrase = (raw: string) =>
+    String(raw || "")
+      .toLowerCase()
+      .replace(/[-_]+/g, " ")
+      .replace(/\s+/g, " ")
+      .trim();
+  const loosePattern = (raw: string) =>
+    normalizePhrase(raw)
+      .split(" ")
+      .map((w) => w.trim())
+      .filter(Boolean)
+      .map(escapeRegExp)
+      .join(WORD_SEP);
 
   const normalizePrompt = (raw: string) =>
     raw
@@ -627,7 +641,7 @@ export function stripKnownStylePhrases(args: {
     if (keepStyleId && entry.styleId === keepStyleId) continue;
 
     for (const prefix of entry.prefixes) {
-      const re = new RegExp(`^\\s*${escapeRegExp(prefix)}(?:\\b|\\s|,|:|;|\\.)\\s*`, "i");
+      const re = new RegExp(`^\\s*${loosePattern(prefix)}(?:\\b|\\s|,|:|;|\\.)\\s*`, "i");
       if (re.test(prompt)) {
         prompt = prompt.replace(re, "");
         removed.push(prefix);
@@ -635,14 +649,20 @@ export function stripKnownStylePhrases(args: {
     }
 
     for (const v of entry.variants) {
-      const variant = escapeRegExp(v);
+      const variant = loosePattern(v);
 
-      removeWithRegex(new RegExp(`(^|[\\s,;:(\\[])(?:in\\s+(?:the\\s+)?)?style\\s+of\\s+(?:an?\\s+)?${variant}\\b`, "ig"), v);
-      removeWithRegex(new RegExp(`(^|[\\s,;:(\\[])(?:in\\s+)?(?:an?\\s+)?${variant}\\s+style\\b`, "ig"), v);
+      removeWithRegex(
+        new RegExp(
+          `(^|[\\s,;:(\\[])(?:in\\s+(?:the\\s+)?)?style${WORD_SEP}of${WORD_SEP}(?:an?\\s+)?${variant}\\b`,
+          "ig",
+        ),
+        v,
+      );
+      removeWithRegex(new RegExp(`(^|[\\s,;:(\\[])(?:in\\s+)?(?:an?\\s+)?${variant}${WORD_SEP}style\\b`, "ig"), v);
       removeWithRegex(new RegExp(`(^|[\\s,;:(\\[])style\\s*:\\s*(?:an?\\s+)?${variant}\\b`, "ig"), v);
       removeWithRegex(
         new RegExp(
-          `(^|[\\s,;:(\\[])(?:inspired\\s+by|influence(?:d)?\\s+by)\\s+(?:an?\\s+)?${variant}\\b`,
+          `(^|[\\s,;:(\\[])(?:inspired${WORD_SEP}by|influence(?:d)?${WORD_SEP}by)${WORD_SEP}(?:an?\\s+)?${variant}\\b`,
           "ig",
         ),
         v,
@@ -686,26 +706,44 @@ export function buildStyleGuidance(args: {
   const countComp = intensity >= 70 ? 2 : 1;
   const countCtx = intensity >= 85 ? 2 : intensity >= 35 ? 1 : 0;
 
-  const pickedElements = elementsAll.slice(0, countElements);
-  const pickedPalettes = paletteAll.slice(0, countPalette).map((p) => `color palette: ${p}`);
-  const pickedComp = compAll.slice(0, countComp).map((c) => `composition: ${c}`);
-  const pickedCtx = ctxAll.slice(0, countCtx).map((c) => `influenced by: ${c}`);
+  const readableName = styleId.replace(/_/g, " ").trim();
+  const baseName = resolved.appendStyleName
+    ? (/\bstyle\b/i.test(readableName) ? readableName : `${readableName} style`)
+    : "";
+
+  const baseNameLower = baseName.toLowerCase();
+  const readableLower = readableName.toLowerCase();
+  const prefixLower = String(def.prefix || "").toLowerCase();
+
+  const pickedElementsRaw = elementsAll.slice(0, countElements);
+  const pickedElements = pickedElementsRaw.filter((e) => {
+    const el = String(e || "").trim();
+    if (!el) return false;
+
+    const elLower = el.toLowerCase();
+    if (baseNameLower && elLower === baseNameLower) return false;
+
+    if (readableLower && prefixLower.includes(readableLower) && prefixLower.includes("style")) {
+      if (elLower.includes(readableLower) && elLower.includes("style")) return false;
+    }
+
+    return true;
+  });
+  const pickedPalettes = paletteAll.slice(0, countPalette);
+  const pickedComp = compAll.slice(0, countComp);
+  const pickedCtx = ctxAll.slice(0, countCtx);
 
   const mustInclude = (def.quality?.mustInclude ?? []).map((x) => String(x || "").trim()).filter(Boolean);
   const mustIncludeText = mustInclude.length > 0 ? mustInclude.join(", ") : "";
   const strictBlock = strict
     ? joinCommaParts([
-        `strict ${def.name} style`,
-        `consistent ${def.name} parameters`,
+        `strict ${def.name}`,
+        `consistent parameters`,
         `${strength} stylization`,
-        mustIncludeText ? `style markers: ${mustIncludeText}` : "",
+        mustIncludeText ? `markers: ${mustIncludeText}` : "",
       ])
     : "";
 
-  const readableName = styleId.replace(/_/g, " ").trim();
-  const baseName = resolved.appendStyleName
-    ? (/\bstyle\b/i.test(readableName) ? readableName : `${readableName} style`)
-    : "";
   const out = joinCommaParts([
     baseName,
     joinCommaParts(pickedElements),

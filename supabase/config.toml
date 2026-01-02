@@ -11,3 +11,6 @@ verify_jwt = false
 
 [functions.upload-reference-image]
 verify_jwt = true
+
+[functions.generate-character-reference]
+verify_jwt = false

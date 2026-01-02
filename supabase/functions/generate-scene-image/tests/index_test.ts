@@ -1,5 +1,5 @@
 import { assertEquals } from "https://deno.land/std@0.168.0/testing/asserts.ts";
-import { clampNumber, detectImageMime, STYLE_LIBRARY } from "../index.ts";
+import { asConsistencySettings, clampNumber, detectImageMime, truncateText } from "../index.ts";
 
 Deno.test("clampNumber should restrict values within range", () => {
   assertEquals(clampNumber(50, 0, 100, 70), 50);
@@ -8,11 +8,23 @@ Deno.test("clampNumber should restrict values within range", () => {
   assertEquals(clampNumber("invalid", 0, 100, 70), 70);
 });
 
-Deno.test("STYLE_LIBRARY should contain 'none' style", () => {
-  const noneStyle = STYLE_LIBRARY["none"];
-  assertEquals(noneStyle !== undefined, true);
-  assertEquals(noneStyle.id, "none");
-  assertEquals(noneStyle.name, "No Specific Style");
+Deno.test("truncateText should add ellipsis when truncated", () => {
+  assertEquals(truncateText("hello", 10), "hello");
+  assertEquals(truncateText("hello world", 5), "hello...");
+});
+
+Deno.test("asConsistencySettings should parse character image reference toggle", () => {
+  const a = asConsistencySettings({ character_image_reference_enabled: true });
+  assertEquals(a?.character_image_reference_enabled, true);
+
+  const b = asConsistencySettings({ characterImageReferenceEnabled: true });
+  assertEquals(b?.character_image_reference_enabled, true);
+
+  const c = asConsistencySettings({ character_image_reference: true });
+  assertEquals(c?.character_image_reference_enabled, true);
+
+  const d = asConsistencySettings({ characterImageReference: true });
+  assertEquals(d?.character_image_reference_enabled, true);
 });
 
 Deno.test("detectImageMime should identify PNG signature", () => {

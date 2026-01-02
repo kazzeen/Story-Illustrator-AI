@@ -151,6 +151,51 @@ describe("style-accuracy", () => {
     expect(validation.issues.length).toBe(0);
   });
 
+  it("produces style-stable prompts for varied character archetypes", () => {
+    const archetypes = [
+      "a photorealistic warrior with detailed armor",
+      "a cinematic portrait of an elderly wizard",
+      "a cute anime child astronaut",
+      "a 3d render of a robot detective",
+      "a pixel art knight in a castle",
+    ];
+
+    primaryStyles.forEach((styleId) => {
+      if (styleId === "none") return;
+      const guidance = buildStyleGuidance({ styleId, intensity: 80, strict: true });
+      const validation = validateStyleApplication({
+        styleId,
+        strict: true,
+        guidance,
+        disabledElements: [],
+      });
+      expect(validation.ok).toBe(true);
+
+      archetypes.forEach((base) => {
+        const out = assemblePrompt({
+          basePrompt: base,
+          stylePrefix: guidance.prefix,
+          stylePositive: guidance.positive,
+          selectedStyleId: styleId,
+        });
+
+        const lower = out.fullPrompt.toLowerCase();
+        expect(lower).toContain(styleId.replace(/_/g, " ").toLowerCase());
+
+        const category = getStyleCategory(styleId);
+        if (category) {
+          const conflicts = STYLE_CONFLICTS[category] || [];
+          conflicts.forEach((term) => {
+            const t = term.toLowerCase();
+            if (base.toLowerCase().includes(t)) {
+              expect(lower).not.toContain(t);
+            }
+          });
+        }
+      });
+    });
+  });
+
   it("fails validation when mustInclude is disabled in strict mode", () => {
     const guidance = buildStyleGuidance({ styleId: "anime", intensity: 70, strict: true });
     const validation = validateStyleApplication({

@@ -143,6 +143,20 @@
   }
 }
 
+.character-edit-button {
+  background-color: #d3d3d3 !important;
+  color: #111827 !important;
+  border: 1px solid rgba(0, 0, 0, 0.25) !important;
+}
+
+.character-edit-button:hover {
+  background-color: #c6c6c6 !important;
+}
+
+.character-edit-button:active {
+  background-color: #bdbdbd !important;
+}
+
 @keyframes float {
   0%, 100% { transform: translateY(0px); }
   50% { transform: translateY(-10px); }

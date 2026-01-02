@@ -24,7 +24,7 @@ describe("style-prompts", () => {
     const low = buildStyleGuidance({ styleId: "watercolor", intensity: 10, strict: false });
     const high = buildStyleGuidance({ styleId: "watercolor", intensity: 95, strict: false });
     expect(splitCommaParts(high.positive).length).toBeGreaterThanOrEqual(splitCommaParts(low.positive).length);
-    expect(high.positive).toMatch(/color palette:/i);
+    expect(high.positive).toMatch(/airy pastel-to-mid tones/i);
   });
 
   it("supports no-style mode", () => {
@@ -36,8 +36,8 @@ describe("style-prompts", () => {
     const out = buildStyleGuidance({ styleId: "ukiyo_e", intensity: 70, strict: true });
     expect(out.usedFallback).toBe(true);
     expect(out.positive).toMatch(/ukiyo e style/i);
-    expect(out.positive).toMatch(/color palette:/i);
-    expect(out.positive).toMatch(/composition:/i);
+    expect(out.positive).toMatch(/palette inspired by ukiyo e/i);
+    expect(out.positive).toMatch(/clear focal subject/i);
   });
 
   it("aliases related styles onto known templates without fallback", () => {
@@ -45,6 +45,12 @@ describe("style-prompts", () => {
     expect(out.usedFallback).toBe(false);
     expect(out.prefix).toMatch(/anime style/i);
     expect(out.positive).toMatch(/studio ghibli style/i);
+  });
+
+  it("does not repeat the selected style phrase inside positive elements", () => {
+    const out = buildStyleGuidance({ styleId: "anime", intensity: 70, strict: true });
+    expect(out.prefix).toMatch(/anime style/i);
+    expect(out.positive).not.toMatch(/\banime\s+style\b/i);
   });
 
   it("removes disabled elements from positive directives", () => {
@@ -206,5 +212,15 @@ describe("style-prompts", () => {
     });
     expect(strippedPrefix.prompt.toLowerCase()).not.toContain("watercolor painting of");
     expect(strippedPrefix.prompt.toLowerCase()).toContain("castle");
+  });
+
+  it("strips hyphenated and underscored style descriptors", () => {
+    const out = stripKnownStylePhrases({
+      prompt: "anime-style artwork of a castle, in_the style-of watercolor, influenced-by comic-book",
+    });
+    const lower = out.prompt.toLowerCase();
+    expect(lower).toContain("castle");
+    expect(lower).not.toMatch(/\banime\b(?:\s+|[-_]+)style\b/);
+    expect(lower).not.toMatch(/\bstyle\b(?:\s+|[-_]+)of\b/);
   });
 });

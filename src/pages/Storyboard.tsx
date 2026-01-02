@@ -78,6 +78,7 @@ export default function Storyboard() {
   const [characterAnchorStrength, setCharacterAnchorStrength] = useState(70);
   const [consistencyMode, setConsistencyMode] = useState<"strict" | "balanced" | "flexible">("strict");
   const [autoCorrectEnabled, setAutoCorrectEnabled] = useState(false);
+  const [characterImageReferenceEnabled, setCharacterImageReferenceEnabled] = useState(false);
   const [disabledStyleElementsByStyle, setDisabledStyleElementsByStyle] = useState<Record<string, string[]>>({});
   const [selectedScene, setSelectedScene] = useState<Scene | null>(null);
   const [isModalOpen, setIsModalOpen] = useState(false);
@@ -123,6 +124,7 @@ export default function Storyboard() {
       artStyle?: string;
       styleIntensity?: number;
       strictStyle?: boolean;
+      characterImageReference?: boolean;
       disabledStyleElements?: string[];
       styleGuideId?: string;
       styleGuideVersion?: number;
@@ -668,6 +670,13 @@ export default function Storyboard() {
 
         const autoCorrectRaw = settings.auto_correct;
         setAutoCorrectEnabled(typeof autoCorrectRaw === "boolean" ? autoCorrectRaw : false);
+
+        const characterImageReferenceRaw =
+          settings.character_image_reference_enabled ??
+          settings.characterImageReferenceEnabled ??
+          settings.character_image_reference ??
+          settings.characterImageReference;
+        setCharacterImageReferenceEnabled(typeof characterImageReferenceRaw === "boolean" ? characterImageReferenceRaw : false);
       }
     }
   }, [storyId, stories]);
@@ -743,6 +752,11 @@ export default function Storyboard() {
   const handleAutoCorrectChange = async (checked: boolean) => {
     setAutoCorrectEnabled(checked);
     await updateConsistencySettings({ auto_correct: checked });
+  };
+
+  const handleCharacterImageReferenceChange = async (checked: boolean) => {
+    setCharacterImageReferenceEnabled(checked);
+    await updateConsistencySettings({ character_image_reference_enabled: checked });
   };
 
   const handleDeleteStory = async () => {
@@ -826,6 +840,7 @@ export default function Storyboard() {
         height,
         disabledStyleElements,
         forceFullPrompt,
+        characterImageReferenceEnabled,
       };
 
       // Use direct fetch to bypass supabase-js error wrapping that might obscure headers
@@ -858,6 +873,7 @@ export default function Storyboard() {
             height,
             disabledStyleElements,
             forceFullPrompt,
+            characterImageReferenceEnabled,
           })
         });
       } catch (netError) {
@@ -1401,6 +1417,7 @@ export default function Storyboard() {
             width,
             height,
             disabledStyleElements,
+            characterImageReferenceEnabled,
           };
 
           let rawResponse: Response;
@@ -1420,6 +1437,7 @@ export default function Storyboard() {
                 width,
                 height,
                 disabledStyleElements,
+                characterImageReferenceEnabled,
               })
             });
           } catch (netError) {
@@ -2086,6 +2104,7 @@ export default function Storyboard() {
         width,
         height,
         disabledStyleElements,
+        characterImageReferenceEnabled,
         promptOnly: true,
       }),
     });
@@ -3016,6 +3035,20 @@ export default function Storyboard() {
               <Label className="text-sm text-muted-foreground">Auto-correct minor inconsistencies</Label>
               <Switch checked={autoCorrectEnabled} onCheckedChange={handleAutoCorrectChange} />
             </div>
+
+            <div className="flex items-center justify-between gap-3">
+              <Tooltip>
+                <TooltipTrigger asChild>
+                  <div className="flex items-center gap-2">
+                    <Label className="text-sm text-muted-foreground">Character Image Reference</Label>
+                  </div>
+                </TooltipTrigger>
+                <TooltipContent>
+                  <p>Use character images as visual references when generating scene illustrations.</p>
+                </TooltipContent>
+              </Tooltip>
+              <Switch checked={characterImageReferenceEnabled} onCheckedChange={handleCharacterImageReferenceChange} />
+            </div>
           </div>
         </div>
 
@@ -3036,7 +3069,16 @@ export default function Storyboard() {
           </TabsList>
 
           <TabsContent value="characters">
-            {storyId && <CharacterList storyId={storyId} />}
+            {storyId && (
+              <CharacterList 
+                storyId={storyId} 
+                selectedArtStyle={selectedStyle}
+                selectedModel={selectedModel}
+                styleIntensity={styleIntensity}
+                strictStyle={consistencyMode === "strict"}
+                disabledStyleElements={disabledStyleElementsByStyle[selectedStyle] ?? []}
+              />
+            )}
           </TabsContent>
 
           <TabsContent value="scenes">

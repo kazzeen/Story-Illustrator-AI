@@ -23,6 +23,15 @@ import {
 import { cn } from "@/lib/utils";
 import { Link } from "react-router-dom";
 
+export function formatUsd(value: number, locale: string = "en-US") {
+  return new Intl.NumberFormat(locale, {
+    style: "currency",
+    currency: "USD",
+    minimumFractionDigits: 2,
+    maximumFractionDigits: 2,
+  }).format(value);
+}
+
 const plans = [
   {
     name: "Free",
@@ -183,6 +192,8 @@ const creditPackages = [
 export default function Pricing() {
   const [isAnnual, setIsAnnual] = useState(true);
 
+  const starterCreditCost = formatUsd(isAnnual ? 0.08 : 0.1);
+
   const calculatePrice = (price: number) => {
     if (price === 0) return "Free";
     if (isAnnual) return `$${(price * 0.8).toFixed(2)}`;
@@ -244,9 +255,12 @@ export default function Pricing() {
                 <div className="mt-4">
                   <span className="text-4xl font-bold">{calculatePrice(plan.price)}</span>
                   {plan.price > 0 && <span className="text-muted-foreground">/mo</span>}
-                  {plan.valueText && (
-                    <div className="text-sm text-muted-foreground mt-1 font-medium text-green-600 dark:text-green-400">
-                      {plan.valueText}
+                  {(plan.valueText || plan.name === "Starter") && (
+                    <div
+                      key={plan.name === "Starter" ? (isAnnual ? "annual" : "monthly") : plan.valueText}
+                      className="text-sm text-muted-foreground mt-1 font-medium text-green-600 dark:text-green-400 animate-in fade-in duration-200"
+                    >
+                      {plan.name === "Starter" ? `${starterCreditCost} per credit` : plan.valueText}
                     </div>
                   )}
                 </div>

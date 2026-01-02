@@ -73,7 +73,7 @@ export function Navbar() {
                   <Link to="/pricing">
                     <Button variant="ghost" size="sm" className="hidden sm:flex items-center gap-2">
                       <CreditCard className="w-4 h-4" />
-                      <span className="font-semibold">{profile.credits_balance}</span>
+                      <span className="font-semibold">{profile.credits_balance ?? 0}</span>
                       <span className="text-muted-foreground text-xs">credits</span>
                     </Button>
                   </Link>

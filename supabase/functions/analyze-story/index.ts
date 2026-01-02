@@ -1,5 +1,6 @@
 import { serve } from "https://deno.land/std@0.168.0/http/server.ts";
 import { createClient } from "https://esm.sh/@supabase/supabase-js@2.49.2";
+import { ensureHairEyeColorAttributes, type HairEyeAutogenConfig } from "../_shared/clothing-colors.ts";
 
 const corsHeaders = {
   "Access-Control-Allow-Origin": "*",
@@ -60,6 +61,10 @@ function asString(value: unknown): string | null {
   return typeof value === "string" ? value : null;
 }
 
+function asBoolean(value: unknown): boolean | null {
+  return typeof value === "boolean" ? value : null;
+}
+
 function asStringArray(value: unknown): string[] | null {
   if (!Array.isArray(value)) return null;
   const out: string[] = [];
@@ -71,6 +76,79 @@ function asStringArray(value: unknown): string[] | null {
 
 function asJsonObject(value: unknown): JsonObject | null {
   return isRecord(value) ? (value as JsonObject) : null;
+}
+
+function getNested(root: unknown, path: string[]): unknown {
+  let curr: unknown = root;
+  for (const key of path) {
+    if (!isRecord(curr) || !(key in curr)) return undefined;
+    curr = (curr as Record<string, unknown>)[key];
+  }
+  return curr;
+}
+
+function asHairEyeOverrides(value: unknown): HairEyeAutogenConfig["overrides"] | undefined {
+  if (!isRecord(value)) return undefined;
+  const out: NonNullable<HairEyeAutogenConfig["overrides"]> = {};
+  for (const [rawName, rawEntry] of Object.entries(value)) {
+    const nameKey = String(rawName || "").trim().toLowerCase();
+    if (!nameKey) continue;
+    if (!isRecord(rawEntry)) continue;
+    const hairColor = asString((rawEntry as Record<string, unknown>).hairColor) ?? asString((rawEntry as Record<string, unknown>).hair_color);
+    const eyeColor = asString((rawEntry as Record<string, unknown>).eyeColor) ?? asString((rawEntry as Record<string, unknown>).eye_color);
+    const normalized: { hairColor?: string; eyeColor?: string } = {};
+    if (hairColor && hairColor.trim()) normalized.hairColor = hairColor.trim();
+    if (eyeColor && eyeColor.trim()) normalized.eyeColor = eyeColor.trim();
+    if (Object.keys(normalized).length > 0) out[nameKey] = normalized;
+  }
+  return Object.keys(out).length > 0 ? out : undefined;
+}
+
+function readHairEyeAutogenConfig(consistencySettings: unknown): Partial<HairEyeAutogenConfig> {
+  const root = isRecord(consistencySettings) ? (consistencySettings as Record<string, unknown>) : {};
+  const nested =
+    (asJsonObject(getNested(root, ["hair_eye_autogen"])) as Record<string, unknown> | null) ||
+    (asJsonObject(getNested(root, ["hairEyeAutogen"])) as Record<string, unknown> | null) ||
+    {};
+
+  const pick = (key: string) =>
+    key in nested ? nested[key] : key in root ? root[key] : root[key.replace(/([A-Z])/g, "_$1").toLowerCase()];
+
+  const enabled =
+    asBoolean(pick("enabled")) ??
+    asBoolean(pick("hair_eye_autogen_enabled")) ??
+    asBoolean(pick("hairEyeAutogenEnabled")) ??
+    undefined;
+  const allowFantasyColors =
+    asBoolean(pick("allowFantasyColors")) ??
+    asBoolean(pick("allow_fantasy_colors")) ??
+    asBoolean(pick("hair_eye_autogen_allow_fantasy_colors")) ??
+    undefined;
+  const allowRareEyeColors =
+    asBoolean(pick("allowRareEyeColors")) ??
+    asBoolean(pick("allow_rare_eye_colors")) ??
+    asBoolean(pick("hair_eye_autogen_allow_rare_eye_colors")) ??
+    undefined;
+  const overrideWins =
+    asBoolean(pick("overrideWins")) ??
+    asBoolean(pick("override_wins")) ??
+    asBoolean(pick("hair_eye_autogen_override_wins")) ??
+    undefined;
+
+  const preferredHairColors = asStringArray(pick("preferredHairColors")) ?? asStringArray(pick("preferred_hair_colors")) ?? undefined;
+  const preferredEyeColors = asStringArray(pick("preferredEyeColors")) ?? asStringArray(pick("preferred_eye_colors")) ?? undefined;
+
+  const overrides = asHairEyeOverrides(pick("overrides")) ?? asHairEyeOverrides(pick("hair_eye_autogen_overrides")) ?? undefined;
+
+  return {
+    enabled,
+    allowFantasyColors,
+    allowRareEyeColors,
+    overrideWins,
+    preferredHairColors,
+    preferredEyeColors,
+    overrides,
+  };
 }
 
 function json(status: number, body: unknown) {
@@ -126,7 +204,7 @@ serve(async (req: Request) => {
 
     const { data: story, error: storyError } = await admin
       .from("stories")
-      .select("id, user_id, original_content")
+      .select("id, user_id, original_content, consistency_settings")
       .eq("id", storyId)
       .maybeSingle();
 
@@ -141,6 +219,8 @@ serve(async (req: Request) => {
     await admin.from("stories").update({ status: "analyzing" }).eq("id", storyId);
 
     const storyContent = story.original_content || "";
+    const consistencySettings = (story as { consistency_settings?: unknown }).consistency_settings;
+    const hairEyeConfig = readHairEyeAutogenConfig(consistencySettings);
     
     // Validate content length before processing
     if (storyContent.length > 100000) {
@@ -282,15 +362,46 @@ Aim for 8-15 scenes depending on story length. Focus on visually interesting and
       return json(500, { error: "Failed to parse story analysis. Please try again." });
     }
 
+    const hairEyeAutogenItems: Array<Record<string, unknown>> = [];
+
     const charactersToInsert = characters
       .map((char) => {
         const name = asString(char.name);
         if (!name) return null;
+        const autogen = ensureHairEyeColorAttributes({
+          storyId,
+          storyText: storyContent,
+          characterName: name,
+          description: asString(char.description),
+          physicalAttributes: asString(char.physical_attributes),
+          config: hairEyeConfig,
+        });
+
+        const enabled = autogen.configUsed.enabled;
+        if (enabled) {
+          hairEyeAutogenItems.push({
+            character: name,
+            added: autogen.added,
+            skipped: autogen.skipped,
+            final: autogen.final,
+            issues: autogen.issues,
+            inferred: autogen.context,
+            config: {
+              enabled: autogen.configUsed.enabled,
+              allowFantasyColors: autogen.configUsed.allowFantasyColors,
+              allowRareEyeColors: autogen.configUsed.allowRareEyeColors,
+              overrideWins: autogen.configUsed.overrideWins,
+              preferredHairColors: autogen.configUsed.preferredHairColors,
+              preferredEyeColors: autogen.configUsed.preferredEyeColors,
+              hasOverrides: Boolean(autogen.configUsed.overrides && Object.keys(autogen.configUsed.overrides).length > 0),
+            },
+          });
+        }
         return {
           story_id: storyId,
           name,
           description: asString(char.description),
-          physical_attributes: asString(char.physical_attributes),
+          physical_attributes: autogen.physicalAttributes || null,
           clothing: asString(char.clothing),
           accessories: asString(char.accessories),
           personality: asString(char.personality),
@@ -305,6 +416,21 @@ Aim for 8-15 scenes depending on story length. Focus on visually interesting and
       if (charError) {
         console.error("Character insert error:", charError);
         // We continue even if character insert fails, as scenes are primary
+      } else if (hairEyeAutogenItems.length > 0) {
+        const status = hairEyeAutogenItems.some((i) => {
+          const issues = (i.issues as unknown) as unknown[];
+          return Array.isArray(issues) && issues.length > 0;
+        })
+          ? "warn"
+          : "pass";
+        const { error: logErr } = await admin.from("consistency_logs").insert({
+          story_id: storyId,
+          scene_id: null,
+          check_type: "character_attribute_autogen",
+          status,
+          details: { type: "hair_eye_color", items: hairEyeAutogenItems },
+        });
+        if (logErr) console.error("Auto-generation log insert error:", logErr);
       }
     }
 
