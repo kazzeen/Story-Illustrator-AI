@@ -13,6 +13,8 @@ declare module "https://esm.sh/@supabase/supabase-js@2.49.2" {
     select(...args: unknown[]): PostgrestBuilderLike;
     eq(...args: unknown[]): PostgrestBuilderLike;
     in(...args: unknown[]): PostgrestBuilderLike;
+    not(...args: unknown[]): PostgrestBuilderLike;
+    lte(...args: unknown[]): PostgrestBuilderLike;
     order(...args: unknown[]): PostgrestBuilderLike;
     limit(...args: unknown[]): PostgrestBuilderLike;
     update(...args: unknown[]): PostgrestBuilderLike;
@@ -44,9 +46,24 @@ declare module "https://esm.sh/@supabase/supabase-js@2.49.2" {
     auth: AuthLike;
     from(table: string): PostgrestBuilderLike;
     storage: StorageLike;
+    rpc(fn: string, args?: any): Promise<PostgrestResult>;
   };
 
   export function createClient(url: string, key: string, options?: unknown): SupabaseClientLike;
+}
+
+declare module "https://deno.land/std@0.168.0/encoding/base64.ts" {
+  export function encode(data: Uint8Array): string;
+}
+
+declare module "https://deno.land/x/imagescript@1.3.0/mod.ts" {
+  export class Image {
+    static decode(bytes: Uint8Array): Promise<Image>;
+    width: number;
+    height: number;
+    resize(width: number, height: number): void;
+    encodeJPEG(quality?: number): Promise<Uint8Array>;
+  }
 }
 
 declare module "https://deno.land/std@0.168.0/testing/asserts.ts" {

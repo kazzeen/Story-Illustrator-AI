@@ -1,4 +1,4 @@
-import { useState } from "react";
+import { Fragment, useEffect, useState } from "react";
 import { Layout } from "@/components/layout/Layout";
 import { Button } from "@/components/ui/button";
 import { Card, CardContent, CardDescription, CardFooter, CardHeader, CardTitle } from "@/components/ui/card";
@@ -22,6 +22,9 @@ import {
 } from "@/components/ui/accordion";
 import { cn } from "@/lib/utils";
 import { Link } from "react-router-dom";
+import { useAuth } from "@/hooks/useAuth";
+import { useToast } from "@/hooks/use-toast";
+import { SUPABASE_KEY, SUPABASE_URL, supabase } from "@/integrations/supabase/client";
 
 export function formatUsd(value: number, locale: string = "en-US") {
   return new Intl.NumberFormat(locale, {
@@ -119,7 +122,7 @@ const featuresComparison = [
   {
     category: "Generation",
     features: [
-      { name: "Monthly Credits", free: "5 (one-time)", starter: "50-70", creator: "200-300", pro: "Unlimited" },
+      { name: "Monthly Credits", free: "5 / month", starter: "50-70", creator: "200-300", pro: "Unlimited" },
       { name: "Story Generations", free: "1", starter: "5", creator: "25", pro: "Unlimited" },
       { name: "Bonus Credits", free: "-", starter: "20", creator: "100", pro: "-" },
     ]
@@ -191,14 +194,183 @@ const creditPackages = [
 
 export default function Pricing() {
   const [isAnnual, setIsAnnual] = useState(true);
+  const [checkoutPlan, setCheckoutPlan] = useState<"starter" | "creator" | null>(null);
+  const [checkoutPack, setCheckoutPack] = useState<"small" | "medium" | "large" | null>(null);
+  const { user, refreshProfile } = useAuth();
+  const { toast } = useToast();
 
   const starterCreditCost = formatUsd(isAnnual ? 0.08 : 0.1);
+
+  const formatCheckoutErrorDetails = (value: unknown) => {
+    if (typeof value === "string") return value;
+    try {
+      return JSON.stringify(value);
+    } catch {
+      return String(value);
+    }
+  };
 
   const calculatePrice = (price: number) => {
     if (price === 0) return "Free";
     if (isAnnual) return `$${(price * 0.8).toFixed(2)}`;
     return `$${price}`;
   };
+
+  const getReturnBase = () => {
+    const baseUrl = typeof import.meta.env.BASE_URL === "string" ? import.meta.env.BASE_URL : "/";
+    return `${window.location.origin}${baseUrl}`.replace(/\/$/, "");
+  };
+
+  const fetchCheckoutUrl = async (functionName: string, body: Record<string, unknown>) => {
+    const apikey = typeof SUPABASE_KEY === "string" ? SUPABASE_KEY.trim() : "";
+    if (!apikey) throw new Error("Missing Supabase publishable key");
+
+    const { data: { session } } = await supabase.auth.getSession();
+    const token = session?.access_token ?? null;
+    if (!token) throw new Error("Not authenticated - please sign in again.");
+
+    const functionUrl = `${SUPABASE_URL.replace(/\/$/, "")}/functions/v1/${functionName}`;
+    const controller = new AbortController();
+    const timeoutId = window.setTimeout(() => controller.abort(), 15000);
+    try {
+      const resp = await fetch(functionUrl, {
+        method: "POST",
+        headers: {
+          Authorization: `Bearer ${token}`,
+          apikey,
+          "Content-Type": "application/json",
+        },
+        body: JSON.stringify(body),
+        signal: controller.signal,
+      });
+
+      const text = await resp.text();
+      let parsed: unknown = null;
+      try {
+        parsed = text ? JSON.parse(text) : null;
+      } catch {
+        parsed = null;
+      }
+
+      if (!resp.ok) {
+        if (parsed && typeof parsed === "object") {
+          const rec = parsed as Record<string, unknown>;
+          const details = rec.details ?? rec.error ?? rec.message ?? null;
+          const message = details ? formatCheckoutErrorDetails(details) : text || `HTTP ${resp.status}`;
+          throw new Error(message);
+        }
+        throw new Error(text || `HTTP ${resp.status}`);
+      }
+
+      const url =
+        parsed && typeof parsed === "object" && "url" in (parsed as Record<string, unknown>)
+          ? (parsed as Record<string, unknown>).url
+          : null;
+      const urlStr = typeof url === "string" ? url : null;
+      if (!urlStr) throw new Error("Checkout URL missing");
+      return urlStr;
+    } catch (e) {
+      if (e instanceof DOMException && e.name === "AbortError") {
+        throw new Error("Checkout request timed out. Please retry.");
+      }
+      throw e;
+    } finally {
+      window.clearTimeout(timeoutId);
+    }
+  };
+
+  const startMembershipCheckout = async (tier: "starter" | "creator") => {
+    if (!user) {
+      toast({ title: "Sign in required", description: "Please sign in to start checkout.", variant: "destructive" });
+      return;
+    }
+    if (checkoutPlan) return;
+
+    setCheckoutPlan(tier);
+    try {
+      const functionName = tier === "starter" ? "create-starter-membership-checkout" : "create-creator-membership-checkout";
+      const urlStr = await fetchCheckoutUrl(functionName, { interval: isAnnual ? "year" : "month", returnBase: getReturnBase() });
+
+      try {
+        window.location.assign(urlStr);
+      } catch {
+        window.location.href = urlStr;
+      }
+    } catch (e) {
+      toast({
+        title: "Checkout failed",
+        description: e instanceof Error ? e.message : "Unexpected error",
+        variant: "destructive",
+      });
+    } finally {
+      setCheckoutPlan(null);
+    }
+  };
+
+  const startCreditPackCheckout = async (pack: "small" | "medium" | "large") => {
+    if (!user) {
+      toast({ title: "Sign in required", description: "Please sign in to buy credits.", variant: "destructive" });
+      return;
+    }
+    if (checkoutPlan || checkoutPack) return;
+
+    setCheckoutPack(pack);
+    try {
+      const urlStr = await fetchCheckoutUrl("create-credit-pack-checkout", { pack, returnBase: getReturnBase() });
+
+      try {
+        window.location.assign(urlStr);
+      } catch {
+        window.location.href = urlStr;
+      }
+    } catch (e) {
+      toast({
+        title: "Checkout failed",
+        description: e instanceof Error ? e.message : "Unexpected error",
+        variant: "destructive",
+      });
+    } finally {
+      setCheckoutPack(null);
+    }
+  };
+
+  useEffect(() => {
+    const params = new URLSearchParams(window.location.search);
+    const creditsStatus = params.get("credits_checkout");
+    const membershipStatus = params.get("checkout");
+    const status = creditsStatus ?? membershipStatus;
+    if (!status) return;
+
+    if (status === "success") {
+      toast({
+        title: creditsStatus ? "Purchase successful" : "Checkout successful",
+        description: creditsStatus ? "Your credits will appear shortly." : "Your membership will update shortly.",
+      });
+    } else if (status === "cancel") {
+      toast({
+        title: "Checkout canceled",
+        description: "No charge was made.",
+      });
+    }
+
+    params.delete("credits_checkout");
+    params.delete("checkout");
+    params.delete("session_id");
+    const nextSearch = params.toString();
+    const nextUrl = `${window.location.pathname}${nextSearch ? `?${nextSearch}` : ""}${window.location.hash}`;
+    window.history.replaceState({}, "", nextUrl);
+
+    if (status !== "success" || !user) return;
+
+    const t0 = window.setTimeout(() => void refreshProfile(), 0);
+    const t1 = window.setTimeout(() => void refreshProfile(), 1500);
+    const t2 = window.setTimeout(() => void refreshProfile(), 4000);
+    return () => {
+      window.clearTimeout(t0);
+      window.clearTimeout(t1);
+      window.clearTimeout(t2);
+    };
+  }, [refreshProfile, toast, user]);
 
   return (
     <Layout>
@@ -284,14 +456,21 @@ export default function Pricing() {
               </CardContent>
 
               <CardFooter>
-                <Button 
-                  className="w-full" 
-                  variant={plan.ctaVariant}
-                  size="lg"
-                  asChild
-                >
-                  <Link to={plan.href}>{plan.cta}</Link>
-                </Button>
+                {user && (plan.name === "Starter" || plan.name === "Creator") ? (
+                  <Button
+                    className="w-full"
+                    variant={plan.ctaVariant}
+                    size="lg"
+                    onClick={() => startMembershipCheckout(plan.name === "Starter" ? "starter" : "creator")}
+                    disabled={checkoutPlan !== null}
+                  >
+                    {checkoutPlan === (plan.name === "Starter" ? "starter" : "creator") ? "Redirecting..." : plan.cta}
+                  </Button>
+                ) : (
+                  <Button className="w-full" variant={plan.ctaVariant} size="lg" asChild>
+                    <Link to={plan.href}>{plan.cta}</Link>
+                  </Button>
+                )}
               </CardFooter>
             </Card>
           ))}
@@ -336,9 +515,22 @@ export default function Pricing() {
                   </div>
                 </CardContent>
                 <CardFooter>
-                  <Button variant="outline" className="w-full" asChild>
-                    <Link to="/auth?mode=signup">Buy {pack.credits} Credits</Link>
-                  </Button>
+                  {user ? (
+                    <Button
+                      variant="outline"
+                      className="w-full"
+                      onClick={() => startCreditPackCheckout(pack.name.toLowerCase() as "small" | "medium" | "large")}
+                      disabled={checkoutPlan !== null || checkoutPack !== null}
+                    >
+                      {checkoutPack === (pack.name.toLowerCase() as "small" | "medium" | "large")
+                        ? "Redirecting..."
+                        : `Buy ${pack.credits} Credits`}
+                    </Button>
+                  ) : (
+                    <Button variant="outline" className="w-full" asChild>
+                      <Link to="/auth?mode=signup">Buy {pack.credits} Credits</Link>
+                    </Button>
+                  )}
                 </CardFooter>
               </Card>
             ))}
@@ -365,7 +557,7 @@ export default function Pricing() {
               </TableHeader>
               <TableBody>
                 {featuresComparison.map((section) => (
-                  <>
+                  <Fragment key={section.category}>
                     <TableRow key={section.category} className="bg-secondary/10 hover:bg-secondary/10">
                       <TableCell colSpan={5} className="font-semibold text-muted-foreground pl-4 py-2">
                         {section.category}
@@ -408,7 +600,7 @@ export default function Pricing() {
                         </TableCell>
                       </TableRow>
                     ))}
-                  </>
+                  </Fragment>
                 ))}
               </TableBody>
             </Table>

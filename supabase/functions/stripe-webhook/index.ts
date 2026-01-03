@@ -1,0 +1,325 @@
+import { serve } from "https://deno.land/std@0.168.0/http/server.ts";
+import { createClient } from "https://esm.sh/@supabase/supabase-js@2.49.2";
+
+const corsHeaders = {
+  "Access-Control-Allow-Origin": "*",
+  "Access-Control-Allow-Headers": "authorization, x-client-info, apikey, content-type, stripe-signature",
+  "Access-Control-Allow-Methods": "POST, OPTIONS",
+};
+
+type JsonObject = Record<string, unknown>;
+
+function json(status: number, body: unknown) {
+  return new Response(JSON.stringify(body), {
+    status,
+    headers: { ...corsHeaders, "Content-Type": "application/json" },
+  });
+}
+
+function isRecord(value: unknown): value is Record<string, unknown> {
+  return typeof value === "object" && value !== null && !Array.isArray(value);
+}
+
+function asString(value: unknown): string | null {
+  return typeof value === "string" ? value : null;
+}
+
+function timingSafeEqual(a: Uint8Array, b: Uint8Array) {
+  if (a.length !== b.length) return false;
+  let diff = 0;
+  for (let i = 0; i < a.length; i++) diff |= a[i] ^ b[i];
+  return diff === 0;
+}
+
+function hexToBytes(hex: string) {
+  const clean = hex.trim().toLowerCase();
+  if (clean.length % 2 !== 0) return null;
+  const out = new Uint8Array(clean.length / 2);
+  for (let i = 0; i < out.length; i++) {
+    const byte = Number.parseInt(clean.slice(i * 2, i * 2 + 2), 16);
+    if (!Number.isFinite(byte)) return null;
+    out[i] = byte;
+  }
+  return out;
+}
+
+async function hmacSha256(key: string, data: string) {
+  const enc = new TextEncoder();
+  const cryptoKey = await crypto.subtle.importKey(
+    "raw",
+    enc.encode(key),
+    { name: "HMAC", hash: "SHA-256" },
+    false,
+    ["sign"],
+  );
+  const sig = await crypto.subtle.sign("HMAC", cryptoKey, enc.encode(data));
+  return new Uint8Array(sig);
+}
+
+async function verifyStripeSignature(params: { payload: string; header: string; secret: string }) {
+  const { payload, header, secret } = params;
+  const parts = header.split(",").map((p) => p.trim()).filter(Boolean);
+  const tPart = parts.find((p) => p.startsWith("t="));
+  const v1Parts = parts.filter((p) => p.startsWith("v1="));
+  const t = tPart ? tPart.slice("t=".length) : null;
+  const timestamp = t && /^\d+$/.test(t) ? Number(t) : null;
+  if (!timestamp) return { ok: false as const, reason: "invalid_signature_header" };
+
+  const signed = `${t}.${payload}`;
+  const expected = await hmacSha256(secret, signed);
+
+  for (const v1 of v1Parts) {
+    const sigHex = v1.slice("v1=".length);
+    const sigBytes = hexToBytes(sigHex);
+    if (!sigBytes) continue;
+    if (timingSafeEqual(sigBytes, expected)) return { ok: true as const, timestamp };
+  }
+  return { ok: false as const, reason: "signature_mismatch" };
+}
+
+type StripeEvent = {
+  id: string;
+  type: string;
+  data?: { object?: unknown };
+};
+
+function resolveTierFromPriceId(priceId: string, env: Record<string, string | undefined>) {
+  const starterIds = [env.STRIPE_PRICE_STARTER_ID, env.STRIPE_PRICE_STARTER_ANNUAL_ID].filter(Boolean) as string[];
+  const creatorIds = [env.STRIPE_PRICE_CREATOR_ID, env.STRIPE_PRICE_CREATOR_ANNUAL_ID].filter(Boolean) as string[];
+  const professionalIds = [env.STRIPE_PRICE_PROFESSIONAL_ID, env.STRIPE_PRICE_PROFESSIONAL_ANNUAL_ID].filter(Boolean) as string[];
+  if (starterIds.includes(priceId)) return "starter";
+  if (creatorIds.includes(priceId)) return "creator";
+  if (professionalIds.includes(priceId)) return "professional";
+  return null;
+}
+
+function parsePositiveInt(value: unknown) {
+  if (typeof value === "number" && Number.isFinite(value) && value > 0 && Number.isInteger(value)) return value;
+  if (typeof value === "string" && /^\d+$/.test(value)) {
+    const n = Number(value);
+    if (Number.isFinite(n) && n > 0) return n;
+  }
+  return null;
+}
+
+serve(async (req: Request) => {
+  if (req.method === "OPTIONS") return new Response(null, { headers: corsHeaders });
+  if (req.method !== "POST") return json(405, { error: "Method not allowed" });
+
+  const supabaseUrl = Deno.env.get("SUPABASE_URL");
+  const supabaseServiceKey = Deno.env.get("SUPABASE_SERVICE_ROLE_KEY");
+  const webhookSecret = Deno.env.get("STRIPE_WEBHOOK_SECRET");
+  if (!supabaseUrl || !supabaseServiceKey || !webhookSecret) return json(500, { error: "Configuration error" });
+
+  const sigHeader = req.headers.get("stripe-signature") ?? req.headers.get("Stripe-Signature");
+  if (!sigHeader) return json(400, { error: "Missing stripe-signature header" });
+
+  const payload = await req.text();
+  const sigOk = await verifyStripeSignature({ payload, header: sigHeader, secret: webhookSecret });
+  if (!sigOk.ok) return json(400, { error: "Invalid signature", reason: sigOk.reason });
+
+  let event: StripeEvent;
+  try {
+    event = JSON.parse(payload);
+  } catch {
+    return json(400, { error: "Invalid JSON payload" });
+  }
+  if (!event?.id || !event?.type) return json(400, { error: "Invalid event shape" });
+
+  const admin = createClient(supabaseUrl, supabaseServiceKey);
+
+  const { error: dedupeErr } = await admin.from("stripe_webhook_events").insert({ event_id: event.id });
+  if (dedupeErr) return json(200, { received: true, deduped: true });
+
+  const obj = isRecord(event.data) ? event.data.object : null;
+  const objRec = isRecord(obj) ? obj : null;
+
+  const env = {
+    STRIPE_PRICE_STARTER_ID: Deno.env.get("STRIPE_PRICE_STARTER_ID"),
+    STRIPE_PRICE_STARTER_ANNUAL_ID: Deno.env.get("STRIPE_PRICE_STARTER_ANNUAL_ID"),
+    STRIPE_PRICE_CREATOR_ID: Deno.env.get("STRIPE_PRICE_CREATOR_ID"),
+    STRIPE_PRICE_CREATOR_ANNUAL_ID: Deno.env.get("STRIPE_PRICE_CREATOR_ANNUAL_ID"),
+    STRIPE_PRICE_PROFESSIONAL_ID: Deno.env.get("STRIPE_PRICE_PROFESSIONAL_ID"),
+    STRIPE_PRICE_PROFESSIONAL_ANNUAL_ID: Deno.env.get("STRIPE_PRICE_PROFESSIONAL_ANNUAL_ID"),
+  };
+
+  const handleSubscriptionState = async (params: {
+    userId: string;
+    tier: string;
+    customerId: string | null;
+    subscriptionId: string | null;
+    priceId: string | null;
+    cycleStart: number | null;
+    cycleEnd: number | null;
+    invoiceId: string | null;
+    resetUsage: boolean;
+  }) => {
+    const cycleStart = params.cycleStart ? new Date(params.cycleStart * 1000).toISOString() : new Date().toISOString();
+    const cycleEnd = params.cycleEnd ? new Date(params.cycleEnd * 1000).toISOString() : new Date(Date.now() + 30 * 24 * 60 * 60 * 1000).toISOString();
+    const { data, error } = await admin.rpc("apply_stripe_subscription_state", {
+      p_user_id: params.userId,
+      p_tier: params.tier,
+      p_customer_id: params.customerId,
+      p_subscription_id: params.subscriptionId,
+      p_price_id: params.priceId,
+      p_cycle_start: cycleStart,
+      p_cycle_end: cycleEnd,
+      p_event_id: event.id,
+      p_invoice_id: params.invoiceId,
+      p_reset_usage: params.resetUsage,
+    });
+    return { data, error };
+  };
+
+  const findUserId = async (params: { customerId?: string | null; subscriptionId?: string | null; metadataUserId?: string | null }) => {
+    const metadataUserId = params.metadataUserId;
+    if (metadataUserId) return metadataUserId;
+
+    const bySub = params.subscriptionId
+      ? await admin.from("user_credits").select("user_id").eq("stripe_subscription_id", params.subscriptionId).maybeSingle()
+      : null;
+    if (bySub?.data?.user_id) return bySub.data.user_id as string;
+
+    const byCustomer = params.customerId
+      ? await admin.from("user_credits").select("user_id").eq("stripe_customer_id", params.customerId).maybeSingle()
+      : null;
+    if (byCustomer?.data?.user_id) return byCustomer.data.user_id as string;
+
+    return null;
+  };
+
+  const subscriptionObjectToParams = (sub: Record<string, unknown>) => {
+    const customerId = asString(sub.customer);
+    const subscriptionId = asString(sub.id);
+    const currentPeriodStart = typeof sub.current_period_start === "number" ? sub.current_period_start : null;
+    const currentPeriodEnd = typeof sub.current_period_end === "number" ? sub.current_period_end : null;
+    const meta = isRecord(sub.metadata) ? sub.metadata : null;
+    const metadataUserId = meta ? asString(meta.supabase_user_id ?? meta.user_id) : null;
+
+    let priceId: string | null = null;
+    const items = isRecord(sub.items) ? sub.items : null;
+    const dataArr = items && Array.isArray(items.data) ? items.data : null;
+    const firstItem = dataArr && dataArr.length > 0 && isRecord(dataArr[0]) ? (dataArr[0] as Record<string, unknown>) : null;
+    const price = firstItem && isRecord(firstItem.price) ? (firstItem.price as Record<string, unknown>) : null;
+    if (price) priceId = asString(price.id);
+
+    return { customerId, subscriptionId, currentPeriodStart, currentPeriodEnd, priceId, metadataUserId };
+  };
+
+  if (event.type === "checkout.session.completed") {
+    if (!objRec) return json(400, { error: "Missing event object" });
+    const mode = asString(objRec.mode);
+    const paymentStatus = asString(objRec.payment_status);
+    if (mode !== "payment" || paymentStatus !== "paid") return json(200, { received: true, ignored: true, reason: "not_paid" });
+
+    const sessionId = asString(objRec.id);
+    const customerId = asString(objRec.customer);
+    const paymentIntentId = asString(objRec.payment_intent);
+    const meta = isRecord(objRec.metadata) ? objRec.metadata : null;
+    const userId = meta ? asString(meta.supabase_user_id ?? meta.user_id) : null;
+    const credits = meta ? parsePositiveInt(meta.credits) : null;
+    const pack = meta ? asString(meta.pack) : null;
+    const priceId = meta ? asString(meta.price_id) : null;
+
+    if (!userId || !credits || (credits !== 50 && credits !== 200 && credits !== 400)) {
+      return json(200, { received: true, ignored: true, reason: "missing_metadata" });
+    }
+
+    const { data, error } = await admin.rpc("admin_adjust_bonus_credits", {
+      p_user_id: userId,
+      p_amount: credits,
+      p_reason: "Stripe credit pack purchase",
+      p_metadata: {
+        source: "stripe",
+        pack,
+        credits,
+        price_id: priceId,
+        checkout_session_id: sessionId,
+        payment_intent_id: paymentIntentId,
+        customer_id: customerId,
+        stripe_event_id: event.id,
+        stripe_event_type: event.type,
+      },
+      p_created_by: null,
+    });
+    if (error) return json(500, { error: "Failed to apply credit purchase", details: error });
+    return json(200, { received: true, result: data });
+  }
+
+  if (event.type === "customer.subscription.created" || event.type === "customer.subscription.updated") {
+    if (!objRec) return json(400, { error: "Missing event object" });
+    const subParams = subscriptionObjectToParams(objRec);
+    const userId = await findUserId({ customerId: subParams.customerId, subscriptionId: subParams.subscriptionId, metadataUserId: subParams.metadataUserId });
+    if (!userId) return json(200, { received: true, ignored: true, reason: "user_not_found" });
+    const tier = subParams.priceId ? resolveTierFromPriceId(subParams.priceId, env) : null;
+    if (!tier) return json(200, { received: true, ignored: true, reason: "unknown_price" });
+
+    const { error } = await handleSubscriptionState({
+      userId,
+      tier,
+      customerId: subParams.customerId,
+      subscriptionId: subParams.subscriptionId,
+      priceId: subParams.priceId,
+      cycleStart: subParams.currentPeriodStart,
+      cycleEnd: subParams.currentPeriodEnd,
+      invoiceId: null,
+      resetUsage: false,
+    });
+    if (error) return json(500, { error: "Failed to apply subscription state", details: error });
+    return json(200, { received: true });
+  }
+
+  if (event.type === "invoice.paid") {
+    if (!objRec) return json(400, { error: "Missing event object" });
+    const customerId = asString(objRec.customer);
+    const invoiceId = asString(objRec.id);
+    const subscriptionId = asString(objRec.subscription);
+    const lines = isRecord(objRec.lines) ? objRec.lines : null;
+    const dataArr = lines && Array.isArray(lines.data) ? lines.data : null;
+    const firstLine = dataArr && dataArr.length > 0 && isRecord(dataArr[0]) ? (dataArr[0] as Record<string, unknown>) : null;
+    const price = firstLine && isRecord(firstLine.price) ? (firstLine.price as Record<string, unknown>) : null;
+    const priceId = price ? asString(price.id) : null;
+    const period = firstLine && isRecord(firstLine.period) ? (firstLine.period as Record<string, unknown>) : null;
+    const cycleStart = period && typeof period.start === "number" ? period.start : null;
+    const cycleEnd = period && typeof period.end === "number" ? period.end : null;
+
+    const meta = isRecord(objRec.metadata) ? objRec.metadata : null;
+    const metadataUserId = meta ? asString(meta.supabase_user_id ?? meta.user_id) : null;
+
+    const userId = await findUserId({ customerId, subscriptionId, metadataUserId });
+    if (!userId) return json(200, { received: true, ignored: true, reason: "user_not_found" });
+    const tier = priceId ? resolveTierFromPriceId(priceId, env) : null;
+    if (!tier) return json(200, { received: true, ignored: true, reason: "unknown_price" });
+
+    const { error } = await handleSubscriptionState({
+      userId,
+      tier,
+      customerId,
+      subscriptionId,
+      priceId,
+      cycleStart,
+      cycleEnd,
+      invoiceId,
+      resetUsage: true,
+    });
+    if (error) return json(500, { error: "Failed to apply invoice grant", details: error });
+    return json(200, { received: true });
+  }
+
+  if (event.type === "customer.subscription.deleted") {
+    if (!objRec) return json(400, { error: "Missing event object" });
+    const subParams = subscriptionObjectToParams(objRec);
+    const userId = await findUserId({ customerId: subParams.customerId, subscriptionId: subParams.subscriptionId, metadataUserId: subParams.metadataUserId });
+    if (!userId) return json(200, { received: true, ignored: true, reason: "user_not_found" });
+
+    const { data, error } = await admin.rpc("apply_stripe_subscription_canceled", {
+      p_user_id: userId,
+      p_event_id: event.id,
+      p_subscription_id: subParams.subscriptionId,
+    });
+    if (error) return json(500, { error: "Failed to cancel subscription", details: error });
+    return json(200, { received: true, result: data });
+  }
+
+  return json(200, { received: true, ignored: true });
+});
