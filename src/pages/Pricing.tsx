@@ -38,7 +38,8 @@ export function formatUsd(value: number, locale: string = "en-US") {
 const plans = [
   {
     name: "Free",
-    price: 0,
+    priceMonthly: 0,
+    priceAnnual: 0,
     description: "Perfect for trying out SIAI",
     features: [
       "5 free onboarding images",
@@ -59,12 +60,13 @@ const plans = [
   },
   {
     name: "Starter",
-    price: 4.99,
+    priceMonthly: 9.99,
+    priceAnnual: 7.99,
     description: "For hobbyists and beginners",
     features: [
-      "50-70 images/credits per month",
+      "100 images/credits per month",
       "20 first-time bonus credits",
-      "5 story generations",
+      "10 story generations",
       "Nano Banana Standard Model",
       "Standard art styles",
       "Commercial rights"
@@ -78,12 +80,13 @@ const plans = [
   },
   {
     name: "Creator",
-    price: 14.99,
+    priceMonthly: 19.99,
+    priceAnnual: 14.99,
     description: "For serious storytellers",
     features: [
-      "200-300 images/credits per month",
+      "300 images/credits per month",
       "100 first-time bonus credits",
-      "25 story generations",
+      "50 story generations",
       "All Models (Nano Banana Pro, Venice.ai)",
       "All Art Styles available",
       "Priority generation queue"
@@ -98,15 +101,16 @@ const plans = [
   },
   {
     name: "Professional",
-    price: 39.99,
+    priceMonthly: 39.99,
     description: "Power users and studios",
     features: [
-      "Unlimited images & stories",
+      "1000 images/credits per month",
+      "Unlimited stories",
       "All Models & Art Styles",
       "Dedicated support",
       "Custom feature requests",
       "Early access to new features",
-      "API Access (beta)"
+  
     ],
     cta: "Go Professional",
     ctaVariant: "default" as const,
@@ -122,8 +126,8 @@ const featuresComparison = [
   {
     category: "Generation",
     features: [
-      { name: "Monthly Credits", free: "5 / month", starter: "50-70", creator: "200-300", pro: "Unlimited" },
-      { name: "Story Generations", free: "1", starter: "5", creator: "25", pro: "Unlimited" },
+      { name: "Monthly Credits", free: "5 / month", starter: "100", creator: "300", pro: "1000" },
+      { name: "Story Generations", free: "1", starter: "20", creator: "50", pro: "Unlimited" },
       { name: "Bonus Credits", free: "-", starter: "20", creator: "100", pro: "-" },
     ]
   },
@@ -194,7 +198,7 @@ const creditPackages = [
 
 export default function Pricing() {
   const [isAnnual, setIsAnnual] = useState(true);
-  const [checkoutPlan, setCheckoutPlan] = useState<"starter" | "creator" | null>(null);
+  const [checkoutPlan, setCheckoutPlan] = useState<"starter" | "creator" | "professional" | null>(null);
   const [checkoutPack, setCheckoutPack] = useState<"small" | "medium" | "large" | null>(null);
   const { user, refreshProfile } = useAuth();
   const { toast } = useToast();
@@ -210,10 +214,10 @@ export default function Pricing() {
     }
   };
 
-  const calculatePrice = (price: number) => {
-    if (price === 0) return "Free";
-    if (isAnnual) return `$${(price * 0.8).toFixed(2)}`;
-    return `$${price}`;
+  const calculatePrice = (plan: (typeof plans)[number]) => {
+    if (plan.priceMonthly === 0) return "Free";
+    const computed = isAnnual ? (plan.priceAnnual ?? plan.priceMonthly * 0.8) : plan.priceMonthly;
+    return `$${computed.toFixed(2)}`;
   };
 
   const getReturnBase = () => {
@@ -279,7 +283,7 @@ export default function Pricing() {
     }
   };
 
-  const startMembershipCheckout = async (tier: "starter" | "creator") => {
+  const startMembershipCheckout = async (tier: "starter" | "creator" | "professional") => {
     if (!user) {
       toast({ title: "Sign in required", description: "Please sign in to start checkout.", variant: "destructive" });
       return;
@@ -289,7 +293,12 @@ export default function Pricing() {
     setCheckoutPlan(tier);
     try {
       const functionName = tier === "starter" ? "create-starter-membership-checkout" : "create-creator-membership-checkout";
-      const urlStr = await fetchCheckoutUrl(functionName, { interval: isAnnual ? "year" : "month", returnBase: getReturnBase() });
+      const urlStr = await fetchCheckoutUrl(
+        functionName,
+        tier === "starter"
+          ? { interval: isAnnual ? "year" : "month", returnBase: getReturnBase() }
+          : { tier: tier === "professional" ? "professional" : "creator", interval: isAnnual ? "year" : "month", returnBase: getReturnBase() },
+      );
 
       try {
         window.location.assign(urlStr);
@@ -425,8 +434,8 @@ export default function Pricing() {
                 </CardTitle>
                 <CardDescription>{plan.description}</CardDescription>
                 <div className="mt-4">
-                  <span className="text-4xl font-bold">{calculatePrice(plan.price)}</span>
-                  {plan.price > 0 && <span className="text-muted-foreground">/mo</span>}
+                  <span className="text-4xl font-bold">{calculatePrice(plan)}</span>
+                  {plan.priceMonthly > 0 && <span className="text-muted-foreground">/mo</span>}
                   {(plan.valueText || plan.name === "Starter") && (
                     <div
                       key={plan.name === "Starter" ? (isAnnual ? "annual" : "monthly") : plan.valueText}
@@ -456,15 +465,21 @@ export default function Pricing() {
               </CardContent>
 
               <CardFooter>
-                {user && (plan.name === "Starter" || plan.name === "Creator") ? (
+                {user && (plan.name === "Starter" || plan.name === "Creator" || plan.name === "Professional") ? (
                   <Button
                     className="w-full"
                     variant={plan.ctaVariant}
                     size="lg"
-                    onClick={() => startMembershipCheckout(plan.name === "Starter" ? "starter" : "creator")}
+                    onClick={() =>
+                      startMembershipCheckout(
+                        plan.name === "Starter" ? "starter" : plan.name === "Creator" ? "creator" : "professional",
+                      )
+                    }
                     disabled={checkoutPlan !== null}
                   >
-                    {checkoutPlan === (plan.name === "Starter" ? "starter" : "creator") ? "Redirecting..." : plan.cta}
+                    {checkoutPlan === (plan.name === "Starter" ? "starter" : plan.name === "Creator" ? "creator" : "professional")
+                      ? "Redirecting..."
+                      : plan.cta}
                   </Button>
                 ) : (
                   <Button className="w-full" variant={plan.ctaVariant} size="lg" asChild>

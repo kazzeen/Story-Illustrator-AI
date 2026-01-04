@@ -15,7 +15,7 @@ import { Tabs, TabsContent, TabsList, TabsTrigger } from "@/components/ui/tabs";
 import { Progress } from "@/components/ui/progress";
 import { cn } from "@/lib/utils";
 import { validateSceneReferenceImageCandidate } from "@/lib/reference-images";
-import { supabase } from "@/integrations/supabase/client";
+import { SUPABASE_KEY, SUPABASE_URL, supabase } from "@/integrations/supabase/client";
 import { buildVeniceEditPrompt, type ImageEditTool, inferImageMimeFromUrl, normalizeImageMime, type NormalizedRect, validateVeniceImageConstraints } from "@/lib/venice-image-edit";
 import { Save, X, RefreshCw, Wand2, Copy, Download, Edit3, Undo2, Redo2, Check, Square, Loader2, Upload, Trash2, ZoomIn, ZoomOut, RotateCcw, ChevronDown } from "lucide-react";
 import { Scene } from "@/hooks/useStories";
@@ -1122,8 +1122,8 @@ export function SceneDetailModal({
     const session = sessionData.session;
     if (!session) throw new Error("Not authenticated");
 
-    const supabaseUrl = import.meta.env.VITE_SUPABASE_URL as string | undefined;
-    const supabaseAnonKey = import.meta.env.VITE_SUPABASE_ANON_KEY as string | undefined;
+    const supabaseUrl = (import.meta.env.VITE_SUPABASE_URL ?? SUPABASE_URL) as string | undefined;
+    const supabaseAnonKey = (import.meta.env.VITE_SUPABASE_ANON_KEY ?? import.meta.env.VITE_SUPABASE_PUBLISHABLE_KEY ?? SUPABASE_KEY) as string | undefined;
     if (!supabaseUrl || !supabaseAnonKey) throw new Error("Missing Supabase configuration");
 
     const endpoint = `${supabaseUrl.replace(/\/$/, "")}/functions/v1/upload-reference-image`;
@@ -1240,8 +1240,8 @@ export function SceneDetailModal({
     const session = sessionData.session;
     if (!session) throw new Error("Not authenticated");
 
-    const supabaseUrl = import.meta.env.VITE_SUPABASE_URL as string | undefined;
-    const supabaseAnonKey = import.meta.env.VITE_SUPABASE_ANON_KEY as string | undefined;
+    const supabaseUrl = (import.meta.env.VITE_SUPABASE_URL ?? SUPABASE_URL) as string | undefined;
+    const supabaseAnonKey = (import.meta.env.VITE_SUPABASE_ANON_KEY ?? import.meta.env.VITE_SUPABASE_PUBLISHABLE_KEY ?? SUPABASE_KEY) as string | undefined;
     if (!supabaseUrl || !supabaseAnonKey) throw new Error("Missing Supabase configuration");
 
     const endpoint = `${supabaseUrl.replace(/\/$/, "")}/functions/v1/upload-reference-image`;

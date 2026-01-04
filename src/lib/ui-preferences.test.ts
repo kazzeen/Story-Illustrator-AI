@@ -83,5 +83,6 @@ describe("ui preferences", () => {
     expect(source).toContain("e.stopPropagation();");
     expect(source).toContain("handleRegenerateCharacterImage");
     expect(source).toContain("generate-character-reference");
+    expect(source).toContain("forceRegenerate: true");
   });
 });

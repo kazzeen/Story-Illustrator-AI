@@ -274,6 +274,14 @@ export type Database = {
           transaction_type: string
           description: string | null
           metadata: Json | null
+          pool: Database["public"]["Enums"]["credit_pool"] | null
+          balance_monthly_after: number | null
+          balance_bonus_after: number | null
+          stripe_event_id: string | null
+          stripe_invoice_id: string | null
+          stripe_subscription_id: string | null
+          request_id: string | null
+          created_by: string | null
           created_at: string
         }
         Insert: {
@@ -283,6 +291,14 @@ export type Database = {
           transaction_type: string
           description?: string | null
           metadata?: Json | null
+          pool?: Database["public"]["Enums"]["credit_pool"] | null
+          balance_monthly_after?: number | null
+          balance_bonus_after?: number | null
+          stripe_event_id?: string | null
+          stripe_invoice_id?: string | null
+          stripe_subscription_id?: string | null
+          request_id?: string | null
+          created_by?: string | null
           created_at?: string
         }
         Update: {
@@ -292,6 +308,14 @@ export type Database = {
           transaction_type?: string
           description?: string | null
           metadata?: Json | null
+          pool?: Database["public"]["Enums"]["credit_pool"] | null
+          balance_monthly_after?: number | null
+          balance_bonus_after?: number | null
+          stripe_event_id?: string | null
+          stripe_invoice_id?: string | null
+          stripe_subscription_id?: string | null
+          request_id?: string | null
+          created_by?: string | null
           created_at?: string
         }
         Relationships: []
@@ -354,6 +378,7 @@ export type Database = {
           subscription_tier: string
           subscription_status: string | null
           next_billing_date: string | null
+          is_admin: boolean
         }
         Insert: {
           avatar_url?: string | null
@@ -367,6 +392,7 @@ export type Database = {
           subscription_tier?: string
           subscription_status?: string | null
           next_billing_date?: string | null
+          is_admin?: boolean
         }
         Update: {
           avatar_url?: string | null
@@ -380,6 +406,7 @@ export type Database = {
           subscription_tier?: string
           subscription_status?: string | null
           next_billing_date?: string | null
+          is_admin?: boolean
         }
         Relationships: []
       }
@@ -671,6 +698,60 @@ export type Database = {
           },
         ]
       }
+      user_credits: {
+        Row: {
+          user_id: string
+          tier: Database["public"]["Enums"]["credit_tier"]
+          monthly_credits_per_cycle: number
+          monthly_credits_used: number
+          bonus_credits_total: number
+          bonus_credits_used: number
+          cycle_start_at: string
+          cycle_end_at: string
+          cycle_source: string
+          stripe_customer_id: string | null
+          stripe_subscription_id: string | null
+          stripe_price_id: string | null
+          bonus_granted: boolean
+          created_at: string
+          updated_at: string
+        }
+        Insert: {
+          user_id: string
+          tier?: Database["public"]["Enums"]["credit_tier"]
+          monthly_credits_per_cycle?: number
+          monthly_credits_used?: number
+          bonus_credits_total?: number
+          bonus_credits_used?: number
+          cycle_start_at: string
+          cycle_end_at: string
+          cycle_source?: string
+          stripe_customer_id?: string | null
+          stripe_subscription_id?: string | null
+          stripe_price_id?: string | null
+          bonus_granted?: boolean
+          created_at?: string
+          updated_at?: string
+        }
+        Update: {
+          user_id?: string
+          tier?: Database["public"]["Enums"]["credit_tier"]
+          monthly_credits_per_cycle?: number
+          monthly_credits_used?: number
+          bonus_credits_total?: number
+          bonus_credits_used?: number
+          cycle_start_at?: string
+          cycle_end_at?: string
+          cycle_source?: string
+          stripe_customer_id?: string | null
+          stripe_subscription_id?: string | null
+          stripe_price_id?: string | null
+          bonus_granted?: boolean
+          created_at?: string
+          updated_at?: string
+        }
+        Relationships: []
+      }
       story_style_guides: {
         Row: {
           created_at: string
@@ -730,7 +811,8 @@ export type Database = {
       [_ in never]: never
     }
     Enums: {
-      [_ in never]: never
+      credit_pool: "monthly" | "bonus"
+      credit_tier: "basic" | "starter" | "creator" | "professional"
     }
     CompositeTypes: {
       [_ in never]: never
@@ -857,6 +939,9 @@ export type CompositeTypes<
 
 export const Constants = {
   public: {
-    Enums: {},
+    Enums: {
+      credit_pool: ["monthly", "bonus"],
+      credit_tier: ["basic", "starter", "creator", "professional"],
+    },
   },
 } as const

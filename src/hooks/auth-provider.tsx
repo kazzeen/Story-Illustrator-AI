@@ -9,7 +9,48 @@ export function AuthProvider({ children }: { children: ReactNode }) {
   const [loading, setLoading] = useState(true);
   const [profile, setProfile] = useState<UserProfile>(null);
 
-  const fetchProfile = async (userId: string) => {
+  const isMissingProfileError = (error: unknown) => {
+    if (!error || typeof error !== "object") return false;
+    const record = error as Record<string, unknown>;
+    const code = typeof record.code === "string" ? record.code : "";
+    if (code === "PGRST116") return true;
+    const message = typeof record.message === "string" ? record.message : "";
+    const details = typeof record.details === "string" ? record.details : "";
+    const combined = `${message} ${details}`.toLowerCase();
+    return combined.includes("0 rows") || combined.includes("no rows") || combined.includes("results contain 0 rows");
+  };
+
+  const refreshCreditsBalance = async (_userId: string, existingProfile: UserProfile) => {
+    try {
+      const { data, error } = await supabase.functions.invoke("credits", {
+        body: { action: "status", limit: 1 },
+      });
+      if (error) {
+        // Fallback: If edge function fails, trust profiles table which is synced via trigger
+        return;
+      }
+      if (!data || typeof data !== "object") return;
+      const creditsRaw = "credits" in data ? (data as { credits?: unknown }).credits : null;
+      if (!creditsRaw || typeof creditsRaw !== "object") return;
+      const remainingMonthly =
+        "remaining_monthly" in creditsRaw ? Number((creditsRaw as { remaining_monthly?: unknown }).remaining_monthly) : NaN;
+      const remainingBonus =
+        "remaining_bonus" in creditsRaw ? Number((creditsRaw as { remaining_bonus?: unknown }).remaining_bonus) : NaN;
+      if (!Number.isFinite(remainingMonthly) || !Number.isFinite(remainingBonus)) return;
+      const nextBalance = Math.max(remainingMonthly + remainingBonus, 0);
+      setProfile((prev) => {
+        const base = prev ?? existingProfile;
+        if (!base) return prev;
+        if (base.credits_balance === nextBalance) return base;
+        return { ...base, credits_balance: nextBalance };
+      });
+    } catch {
+      return;
+    }
+  };
+
+  const fetchProfile = async (authUser: User) => {
+    const userId = authUser.id;
     try {
       const attemptWithCredits = async () => {
         return await supabase
@@ -30,10 +71,29 @@ export function AuthProvider({ children }: { children: ReactNode }) {
       const first = await attemptWithCredits();
       if (!first.error) {
         setProfile(first.data);
+        await refreshCreditsBalance(userId, first.data);
         return;
       }
 
       const code = typeof first.error.code === "string" ? first.error.code : "";
+      if (isMissingProfileError(first.error)) {
+        const displayName =
+          typeof authUser.user_metadata === "object" &&
+          authUser.user_metadata !== null &&
+          "display_name" in (authUser.user_metadata as Record<string, unknown>) &&
+          typeof (authUser.user_metadata as Record<string, unknown>).display_name === "string"
+            ? String((authUser.user_metadata as Record<string, unknown>).display_name)
+            : null;
+
+        await supabase.from("profiles").upsert({ user_id: userId, display_name: displayName }, { onConflict: "user_id" });
+
+        const retried = await attemptWithCredits();
+        if (!retried.error) {
+          setProfile(retried.data);
+          await refreshCreditsBalance(userId, retried.data);
+          return;
+        }
+      }
       if (code === "42703") {
         const fallback = await attemptBasic();
         if (fallback.error) {
@@ -41,6 +101,7 @@ export function AuthProvider({ children }: { children: ReactNode }) {
           return;
         }
         setProfile(fallback.data);
+        await refreshCreditsBalance(userId, fallback.data);
         return;
       }
 
@@ -57,7 +118,7 @@ export function AuthProvider({ children }: { children: ReactNode }) {
         setSession(session);
         setUser(session?.user ?? null);
         if (session?.user) {
-          fetchProfile(session.user.id);
+          fetchProfile(session.user);
         } else {
           setProfile(null);
         }
@@ -70,7 +131,7 @@ export function AuthProvider({ children }: { children: ReactNode }) {
       setSession(session);
       setUser(session?.user ?? null);
       if (session?.user) {
-        fetchProfile(session.user.id);
+        fetchProfile(session.user);
       }
       setLoading(false);
     });
@@ -78,9 +139,28 @@ export function AuthProvider({ children }: { children: ReactNode }) {
     return () => subscription.unsubscribe();
   }, []);
 
+  useEffect(() => {
+    if (!user) return;
+
+    const channel = supabase
+      .channel(`credits:${user.id}`)
+      .on(
+        "postgres_changes",
+        { event: "*", schema: "public", table: "user_credits", filter: `user_id=eq.${user.id}` },
+        () => {
+          void refreshCreditsBalance(user.id, null);
+        },
+      )
+      .subscribe();
+
+    return () => {
+      void supabase.removeChannel(channel);
+    };
+  }, [user?.id]);
+
   const refreshProfile = async () => {
     if (user) {
-      await fetchProfile(user.id);
+      await fetchProfile(user);
     }
   };
 

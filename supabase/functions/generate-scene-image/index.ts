@@ -4,7 +4,6 @@ import { encode as encodeBase64 } from "https://deno.land/std@0.168.0/encoding/b
 import { Image } from "https://deno.land/x/imagescript@1.3.0/mod.ts";
 import { ensureClothingColors, validateClothingColorCoverage } from "../_shared/clothing-colors.ts";
 import {
-  buildCharacterAppearanceAppendix,
   buildStoryStyleGuideGuidance,
   buildStyleGuidance,
   clampNumber,
@@ -19,6 +18,7 @@ import {
   validateStyleApplication,
 } from "../_shared/style-prompts.ts";
 import { assemblePrompt, sanitizePrompt } from "../_shared/prompt-assembly.ts";
+import { parseConsumeCreditsResult } from "../_shared/credits.ts";
 
 const GOOGLE_MODELS: Record<string, string> = {
   "gemini-2.5-flash": "imagen-4.0-generate-001",
@@ -433,7 +433,7 @@ async function fetchCharacterReferenceInputs(args: {
     return { byName: {}, warnings };
   }
 
-  const matched = (chars || [])
+  const matched = ((chars || []) as unknown[])
     .map((c) => {
       const id = typeof (c as { id?: unknown }).id === "string" ? String((c as { id: string }).id) : "";
       const name = typeof (c as { name?: unknown }).name === "string" ? String((c as { name: string }).name) : "";
@@ -467,7 +467,7 @@ async function fetchCharacterReferenceInputs(args: {
       .select("id, character_id, version, status, prompt_snippet, reference_image_url")
       .in("id", activeRefIds);
     if (activeErr) warnings.push("character_image_reference_failed:active_reference_fetch");
-    (activeSheets || []).forEach((row) => {
+    (activeSheets || []).forEach((row: unknown) => {
       const id = typeof (row as { id?: unknown }).id === "string" ? String((row as { id: string }).id) : "";
       if (!id) return;
       sheetsById[id] = row as unknown as CharacterReferenceSheetRow;
@@ -485,7 +485,7 @@ async function fetchCharacterReferenceInputs(args: {
   if (approvedErr) warnings.push("character_image_reference_failed:approved_reference_fetch");
 
   const latestApprovedByCharacterId: Record<string, CharacterReferenceSheetRow> = {};
-  (approvedSheets || []).forEach((row) => {
+  (approvedSheets || []).forEach((row: unknown) => {
     const cid = typeof (row as { character_id?: unknown }).character_id === "string" ? String((row as { character_id: string }).character_id) : "";
     if (!cid) return;
     if (!latestApprovedByCharacterId[cid]) latestApprovedByCharacterId[cid] = row as unknown as CharacterReferenceSheetRow;
@@ -1034,6 +1034,9 @@ serve(async (req: Request) => {
   let admin: ReturnType<typeof createClient> | null = null;
   let currentSceneRow: SceneRow | null = null;
   let requestedSceneId: string | null = null;
+  let creditsConsumed = false;
+  let creditsProvider: "venice" | "google" | "unknown" = "unknown";
+  let userId: string | null = null;
   let lastPromptDebug:
     | {
         model: string;
@@ -1079,7 +1082,7 @@ serve(async (req: Request) => {
       characterImageReferenceEnabled,
       character_image_reference_enabled: characterImageReferenceEnabledSnake,
     } = requestBody as Record<string, unknown>;
-    requestedSceneId = sceneId;
+    requestedSceneId = asString(sceneId);
 
     const warnings: string[] = [];
     const rawModel = asString(model);
@@ -1121,10 +1124,65 @@ serve(async (req: Request) => {
       return json(401, { error: "Invalid token", requestId });
     }
 
+    userId = user.id;
+
+    const syncProfileCreditsBalance = async () => {
+      try {
+        const { data: creditsRow, error: creditsErr } = await admin!
+          .from("user_credits")
+          .select("monthly_credits_per_cycle,monthly_credits_used,bonus_credits_total,bonus_credits_used")
+          .eq("user_id", user.id)
+          .maybeSingle();
+        if (creditsErr || !creditsRow) return;
+
+        const row = creditsRow as unknown as {
+          monthly_credits_per_cycle?: unknown;
+          monthly_credits_used?: unknown;
+          bonus_credits_total?: unknown;
+          bonus_credits_used?: unknown;
+        };
+
+        const monthlyPerCycle =
+          typeof row.monthly_credits_per_cycle === "number" ? row.monthly_credits_per_cycle : Number(row.monthly_credits_per_cycle);
+        const monthlyUsed = typeof row.monthly_credits_used === "number" ? row.monthly_credits_used : Number(row.monthly_credits_used);
+        const bonusTotal = typeof row.bonus_credits_total === "number" ? row.bonus_credits_total : Number(row.bonus_credits_total);
+        const bonusUsed = typeof row.bonus_credits_used === "number" ? row.bonus_credits_used : Number(row.bonus_credits_used);
+
+        if (![monthlyPerCycle, monthlyUsed, bonusTotal, bonusUsed].every((n) => Number.isFinite(n))) return;
+
+        const nextBalance = Math.max(monthlyPerCycle - monthlyUsed + (bonusTotal - bonusUsed), 0);
+        await admin!.from("profiles").update({ credits_balance: nextBalance }).eq("user_id", user.id);
+      } catch {
+        return;
+      }
+    };
+
+    const refundIfNeeded = async (reason: string, extraMetadata?: Record<string, unknown>) => {
+      if (!admin || !creditsConsumed) return;
+      const adminRpc = admin as unknown as {
+        rpc: (fn: string, params: Record<string, unknown>) => Promise<{ data: unknown; error: unknown }>;
+      };
+      try {
+        await adminRpc.rpc("refund_consumed_credits", {
+          p_user_id: userId ?? user.id,
+          p_request_id: requestId,
+          p_reason: reason,
+          p_metadata: {
+            feature: "generate-scene-image",
+            provider: creditsProvider,
+            ...(extraMetadata ?? {}),
+          },
+        });
+      } catch {
+        void 0;
+      }
+      await syncProfileCreditsBalance();
+    };
+
     // --- RESET LOGIC ---
     if (resetFlag) {
       // Validate storyId
-      if (!storyId || !UUID_REGEX.test(storyId)) {
+      if (!storyId || !UUID_REGEX.test(String(storyId))) {
         return json(400, { error: "Valid story ID is required for reset", requestId });
       }
       const storyIdString = String(storyId);
@@ -1165,7 +1223,7 @@ serve(async (req: Request) => {
     }
 
     // Validate sceneId is a valid UUID
-    if (!sceneId || !UUID_REGEX.test(sceneId)) {
+    if (!sceneId || !UUID_REGEX.test(String(sceneId))) {
       return json(400, { error: "Valid scene ID is required", requestId });
     }
 
@@ -1306,6 +1364,49 @@ serve(async (req: Request) => {
     }
 
     if (!isPromptOnly) {
+      const adminRpc = admin as unknown as {
+        rpc: (fn: string, params: Record<string, unknown>) => Promise<{ data: unknown; error: unknown }>;
+      };
+      creditsProvider = usedModel && GOOGLE_MODELS[usedModel] ? "google" : "venice";
+      const { data: creditData, error: creditError } = await adminRpc.rpc("consume_credits", {
+        p_user_id: user.id,
+        p_amount: 1,
+        p_description: "Scene image generation",
+        p_metadata: {
+          feature: "generate-scene-image",
+          provider: creditsProvider,
+          scene_id: sceneId,
+          story_id: scene.story_id,
+          model: usedModel,
+        },
+        p_request_id: requestId,
+      });
+
+      if (creditError) {
+        console.error("Credit consume error:", { requestId, creditError });
+        return json(500, { error: "Failed to consume credits", requestId, details: creditError });
+      }
+
+      const parsedCredits = parseConsumeCreditsResult(creditData);
+      if (!parsedCredits?.ok) {
+        const reason = parsedCredits?.reason ? String(parsedCredits.reason) : "insufficient_credits";
+        if (reason === "insufficient_credits") {
+          return json(402, {
+            error: "Insufficient credits",
+            requestId,
+            details: {
+              reason,
+              tier: parsedCredits?.tier,
+              remaining_monthly: parsedCredits?.remaining_monthly,
+              remaining_bonus: parsedCredits?.remaining_bonus,
+            },
+          });
+        }
+        return json(400, { error: "Credit check failed", requestId, details: { reason } });
+      }
+
+      creditsConsumed = true;
+      await syncProfileCreditsBalance();
       await admin.from("scenes").update({ generation_status: "generating" }).eq("id", sceneId);
       logTiming("status_update_generating");
     }
@@ -1946,7 +2047,7 @@ serve(async (req: Request) => {
        const body = typeof aiErrorText === "string" && aiErrorText.length > 0 ? truncateText(aiErrorText, 4000) : "No error details provided";
        
        await admin.from("scenes").update({ generation_status: "error" }).eq("id", sceneId);
-       
+       await refundIfNeeded("Scene image generation failed", { stage: "upstream_error", upstream_status: aiResponse.status });
        return json(502, { 
          error: `Upstream Generation Failed (${aiResponse.status})`, 
          requestId,
@@ -1961,6 +2062,7 @@ serve(async (req: Request) => {
     } catch (e) {
       console.error("Failed to parse AI response JSON:", e);
       await admin.from("scenes").update({ generation_status: "error" }).eq("id", sceneId);
+      await refundIfNeeded("Scene image generation failed", { stage: "upstream_invalid_json" });
       return json(502, { error: "Invalid JSON from upstream provider", requestId, details: String(e) });
     }
 
@@ -1969,6 +2071,7 @@ serve(async (req: Request) => {
     if (!imageDataUrl) {
       console.error("No valid image in response", aiData);
       await admin.from("scenes").update({ generation_status: "error" }).eq("id", sceneId);
+      await refundIfNeeded("Scene image generation failed", { stage: "missing_image_data" });
       return json(500, { error: "No image data returned", requestId, details: "Upstream response missing image data" });
     }
 
@@ -1979,6 +2082,7 @@ serve(async (req: Request) => {
     } catch (e) {
       console.error("Failed to decode base64 image data:", e);
       await admin.from("scenes").update({ generation_status: "error" }).eq("id", sceneId);
+      await refundIfNeeded("Scene image generation failed", { stage: "decode_image_base64" });
       return json(500, { error: "Failed to process image data", requestId, details: "Invalid base64 response" });
     }
 
@@ -1998,6 +2102,7 @@ serve(async (req: Request) => {
     if (uploadError) {
       console.error("Upload error:", uploadError);
       await admin.from("scenes").update({ generation_status: "error" }).eq("id", sceneId);
+      await refundIfNeeded("Scene image generation failed", { stage: "storage_upload" });
       return json(500, { error: "Failed to store image", requestId, details: serializeSupabaseError(uploadError) });
     }
 
@@ -2046,10 +2151,12 @@ serve(async (req: Request) => {
         .eq("id", sceneId);
       if (updateError) {
         console.error("Scene update error:", updateError);
+        await refundIfNeeded("Scene image generation failed", { stage: "scene_update" });
         return json(500, { error: "Failed to update scene with image", requestId, details: serializeSupabaseError(updateError) });
       }
     } catch (e) {
       console.error("Scene update exception:", e);
+      await refundIfNeeded("Scene image generation failed", { stage: "scene_update_exception" });
       return json(500, { error: "Failed to update scene with image", requestId, details: String(e) });
     }
 
@@ -2068,6 +2175,21 @@ serve(async (req: Request) => {
 
   } catch (e) {
     console.error("Unexpected error:", e);
+    try {
+      if (admin && creditsConsumed && userId) {
+        const adminRpc = admin as unknown as {
+          rpc: (fn: string, params: Record<string, unknown>) => Promise<{ data: unknown; error: unknown }>;
+        };
+        await adminRpc.rpc("refund_consumed_credits", {
+          p_user_id: userId,
+          p_request_id: requestId,
+          p_reason: "Scene image generation failed",
+          p_metadata: { feature: "generate-scene-image", provider: creditsProvider, stage: "unexpected_exception" },
+        });
+      }
+    } catch {
+      void 0;
+    }
     return json(500, { error: "Internal Server Error", requestId, details: String(e) });
   }
 });

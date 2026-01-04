@@ -69,15 +69,13 @@ export function Navbar() {
           <div className="flex items-center gap-3">
             {user ? (
               <>
-                {profile && (
-                  <Link to="/pricing">
-                    <Button variant="ghost" size="sm" className="hidden sm:flex items-center gap-2">
-                      <CreditCard className="w-4 h-4" />
-                      <span className="font-semibold">{profile.credits_balance ?? 0}</span>
-                      <span className="text-muted-foreground text-xs">credits</span>
-                    </Button>
-                  </Link>
-                )}
+                <Link to="/pricing">
+                  <Button variant="ghost" size="sm" className="flex items-center gap-2">
+                    <CreditCard className="w-4 h-4" />
+                    <span className="font-semibold">{profile?.credits_balance ?? 0}</span>
+                    <span className="text-muted-foreground text-xs">credits</span>
+                  </Button>
+                </Link>
                 <Link to="/import">
                   <Button variant="hero" size="sm">
                     New Story

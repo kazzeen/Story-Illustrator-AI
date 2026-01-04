@@ -11,6 +11,7 @@ import {
   validateStyleApplication,
 } from "../_shared/style-prompts.ts";
 import { assemblePrompt, sanitizePrompt } from "../_shared/prompt-assembly.ts";
+import { parseConsumeCreditsResult } from "../_shared/credits.ts";
 
 const corsHeaders = {
   "Access-Control-Allow-Origin": "*",
@@ -232,7 +233,14 @@ function isRetryableUpstreamStatus(status: number) {
 serve(async (req: Request) => {
   if (req.method === "OPTIONS") return new Response(null, { headers: corsHeaders });
 
-  const requestId = crypto.randomUUID();
+  const serverRequestId = crypto.randomUUID();
+  let requestId = serverRequestId;
+  let adminClient: ReturnType<typeof createClient> | null = null;
+  let creditConsumed = false;
+  let creditRefunded = false;
+  let refundUserId: string | null = null;
+  let refundCharacterId: string | null = null;
+  let refundStoryId: string | null = null;
   
   try {
     const supabaseUrl = Deno.env.get("SUPABASE_URL");
@@ -244,7 +252,22 @@ serve(async (req: Request) => {
       return json(500, { error: "Configuration error", requestId }, { "x-request-id": requestId });
     }
 
+    let requestBody: unknown = null;
+    try {
+      requestBody = await req.json();
+    } catch (e) {
+      return json(400, { error: "Invalid JSON body", requestId, details: errorToString(e) }, { "x-request-id": requestId });
+    }
+
+    const bodyObj = asJsonObject(requestBody) ?? {};
+    const clientRequestId =
+      asString(bodyObj.requestId) ?? asString(bodyObj.clientRequestId) ?? asString(bodyObj.request_id) ?? null;
+    if (clientRequestId && UUID_REGEX.test(clientRequestId)) {
+      requestId = clientRequestId;
+    }
+
     const admin = createClient(supabaseUrl, supabaseServiceKey);
+    adminClient = admin;
 
     // Auth check
     const authHeader = req.headers.get("Authorization");
@@ -262,6 +285,7 @@ serve(async (req: Request) => {
         { "x-request-id": requestId },
       );
     }
+    refundUserId = user.id;
 
     // Parse Input
     const {
@@ -274,7 +298,7 @@ serve(async (req: Request) => {
       model, // e.g., "venice-sd35", "lustify-sdxl"
       pose, // "front", "three-quarter", "portrait"
       forceRegenerate,
-    } = await req.json();
+    } = requestBody as Record<string, unknown>;
 
     if (!characterId || !UUID_REGEX.test(characterId)) {
       return json(400, { error: "Valid characterId is required", requestId }, { "x-request-id": requestId });
@@ -307,6 +331,8 @@ serve(async (req: Request) => {
     }
 
     const storyId = String(character.story_id);
+    refundStoryId = storyId;
+    refundCharacterId = characterId;
     const characterName = String(character.name || "Character");
     const desc = String(character.description || "");
     const physical = String(character.physical_attributes || "");
@@ -453,7 +479,7 @@ serve(async (req: Request) => {
         height,
       }),
     );
-    
+
     if (!shouldForce) {
       const { data: existing } = await admin
         .from("character_reference_sheets")
@@ -485,6 +511,119 @@ serve(async (req: Request) => {
         );
       }
     }
+
+    const adminRpc = admin as unknown as {
+      rpc: (fn: string, params: Record<string, unknown>) => Promise<{ data: unknown; error: unknown }>;
+    };
+
+    const { data: creditData, error: creditError } = await adminRpc.rpc("consume_credits", {
+      p_user_id: user.id,
+      p_amount: 1,
+      p_description: "Character image generation",
+      p_metadata: {
+        feature: "generate-character-reference",
+        provider: "venice",
+        character_id: characterId,
+        story_id: storyId,
+        model: selectedModel,
+        style: effectiveStyle,
+        intensity: effectiveIntensity,
+        strict: effectiveStrict,
+        disabled_elements: effectiveDisabledElements,
+      },
+      p_request_id: requestId,
+    });
+
+    if (creditError) {
+      console.error("Credit consume error:", { requestId, creditError, characterId, storyId });
+      return json(500, { error: "Failed to verify credits", requestId, details: creditError }, { "x-request-id": requestId });
+    }
+
+    const creditParsed = parseConsumeCreditsResult(creditData);
+    if (!creditParsed) {
+      console.error("Credit consume returned unexpected payload:", { requestId, creditData });
+      return json(500, { error: "Failed to verify credits", requestId }, { "x-request-id": requestId });
+    }
+
+    if (creditParsed.ok === false) {
+      if (creditParsed.reason === "insufficient_credits") {
+        return json(
+          402,
+          {
+            error: "Insufficient credits",
+            requestId,
+            details: {
+              reason: creditParsed.reason,
+              remaining_monthly: creditParsed.remaining_monthly ?? 0,
+              remaining_bonus: creditParsed.remaining_bonus ?? 0,
+              tier: creditParsed.tier ?? null,
+            },
+          },
+          { "x-request-id": requestId, "x-failure-reason": "insufficient_credits" },
+        );
+      }
+
+      return json(
+        400,
+        { error: "Credit verification failed", requestId, details: creditParsed },
+        { "x-request-id": requestId },
+      );
+    }
+
+    creditConsumed = true;
+
+    const syncProfileCreditsBalance = async () => {
+      try {
+        const { data: creditsRow, error: creditsErr } = await admin
+          .from("user_credits")
+          .select("monthly_credits_per_cycle,monthly_credits_used,bonus_credits_total,bonus_credits_used")
+          .eq("user_id", user.id)
+          .maybeSingle();
+        if (creditsErr || !creditsRow) return;
+
+        const row = creditsRow as unknown as {
+          monthly_credits_per_cycle?: unknown;
+          monthly_credits_used?: unknown;
+          bonus_credits_total?: unknown;
+          bonus_credits_used?: unknown;
+        };
+
+        const monthlyPerCycle = typeof row.monthly_credits_per_cycle === "number" ? row.monthly_credits_per_cycle : Number(row.monthly_credits_per_cycle);
+        const monthlyUsed = typeof row.monthly_credits_used === "number" ? row.monthly_credits_used : Number(row.monthly_credits_used);
+        const bonusTotal = typeof row.bonus_credits_total === "number" ? row.bonus_credits_total : Number(row.bonus_credits_total);
+        const bonusUsed = typeof row.bonus_credits_used === "number" ? row.bonus_credits_used : Number(row.bonus_credits_used);
+
+        if (![monthlyPerCycle, monthlyUsed, bonusTotal, bonusUsed].every((n) => Number.isFinite(n))) return;
+
+        const nextBalance = Math.max((monthlyPerCycle - monthlyUsed) + (bonusTotal - bonusUsed), 0);
+        await admin.from("profiles").update({ credits_balance: nextBalance }).eq("user_id", user.id);
+      } catch {
+        return;
+      }
+    };
+
+    await syncProfileCreditsBalance();
+    const refundIfNeeded = async (reason: string, details: unknown) => {
+      if (creditRefunded) return;
+      creditRefunded = true;
+      const { data: refundData, error: refundError } = await adminRpc.rpc("refund_consumed_credits", {
+        p_user_id: user.id,
+        p_request_id: requestId,
+        p_reason: reason,
+        p_metadata: {
+          feature: "generate-character-reference",
+          character_id: characterId,
+          story_id: storyId,
+          details,
+        },
+      });
+      if (refundError) {
+        console.error("Credit refund error:", { requestId, refundError });
+      } else {
+        console.log("Credits refunded:", { requestId, refundData });
+        await syncProfileCreditsBalance();
+      }
+    };
 
     // --- GENERATION ---
     console.log(`[Generate] Creating reference for ${characterName} (${characterId})`);
@@ -544,6 +683,7 @@ serve(async (req: Request) => {
             await sleep(delay);
             continue;
           }
+          await refundIfNeeded("Character image generation failed", { stage: "upstream_fetch", error: String(e) });
           return json(
             502,
             { error: "Failed to reach image generation provider", requestId, details: String(e) },
@@ -578,6 +718,13 @@ serve(async (req: Request) => {
             continue;
           }
 
+          await refundIfNeeded("Character image generation failed", {
+            stage: "upstream_response",
+            upstream_status: veniceRes.status,
+            upstream_status_text: veniceRes.statusText,
+            upstream_error: upstreamBodyText || "No error details provided",
+            headers: upstreamHeaders,
+          });
           return json(
             502,
             {
@@ -598,6 +745,11 @@ serve(async (req: Request) => {
           aiData = await veniceRes.json();
         } catch (e) {
           const raw = await veniceRes.text().catch(() => "");
+          await refundIfNeeded("Character image generation failed", {
+            stage: "upstream_invalid_json",
+            parse_error: String(e),
+            body: truncateText(raw, 2000),
+          });
           return json(
             502,
             {
@@ -615,6 +767,12 @@ serve(async (req: Request) => {
     }
 
     if (!aiData) {
+      await refundIfNeeded("Character image generation failed", {
+        stage: "upstream_retries_exhausted",
+        upstream_status: upstreamStatus,
+        upstream_error: upstreamBodyText || "No error details provided",
+        headers: upstreamHeaders,
+      });
       return json(
         502,
         {
@@ -631,13 +789,17 @@ serve(async (req: Request) => {
     }
 
     const b64 = extractFirstBase64Image(aiData);
-    if (!b64) return json(500, { error: "No image data returned", requestId }, { "x-request-id": requestId });
+    if (!b64) {
+      await refundIfNeeded("Character image generation failed", { stage: "upstream_missing_image_data" });
+      return json(500, { error: "No image data returned", requestId }, { "x-request-id": requestId });
+    }
 
     // --- STORAGE ---
     let bytes: Uint8Array;
     try {
       bytes = Uint8Array.from(atob(b64), (c) => c.charCodeAt(0));
     } catch (e) {
+      await refundIfNeeded("Character image generation failed", { stage: "decode_base64", error: String(e) });
       return json(500, { error: "Failed to decode image data", requestId, details: String(e) }, { "x-request-id": requestId });
     }
 
@@ -662,6 +824,11 @@ serve(async (req: Request) => {
       const fallback = await tryUpload(targetBucket);
       if (!fallback.ok) {
         console.error("Upload error:", { primary: primary.error, fallback: fallback.error });
+        await refundIfNeeded("Character image generation failed", {
+          stage: "upload",
+          primary: errorToString(primary.error),
+          fallback: errorToString(fallback.error),
+        });
         return json(
           500,
           {
@@ -730,8 +897,14 @@ serve(async (req: Request) => {
       .single();
 
     const activeSheetId = newSheet?.id ? String(newSheet.id) : null;
-    if (dbError) {
+    if (dbError || !activeSheetId) {
       console.error("DB Insert Error:", dbError);
+      await refundIfNeeded("Character image generation failed", { stage: "db_insert_reference_sheet", dbError });
+      return json(
+        500,
+        { error: "Failed to save reference sheet", requestId, details: dbError },
+        { "x-request-id": requestId },
+      );
     }
 
     const updatePayload: Record<string, unknown> = { image_url: publicUrl };
@@ -752,6 +925,7 @@ serve(async (req: Request) => {
 
     if (characterUpdateError) {
       console.error("Character update error:", characterUpdateError);
+      await refundIfNeeded("Character image generation failed", { stage: "db_update_character", characterUpdateError });
       return json(
         500,
         { error: "Failed to update character with generated image", requestId, details: characterUpdateError },
@@ -785,6 +959,27 @@ serve(async (req: Request) => {
 
   } catch (e) {
     console.error("Unexpected error:", e);
+    if (creditConsumed && !creditRefunded && adminClient && refundUserId) {
+      try {
+        const adminRpc = adminClient as unknown as {
+          rpc: (fn: string, params: Record<string, unknown>) => Promise<{ data: unknown; error: unknown }>;
+        };
+        const { error: refundError } = await adminRpc.rpc("refund_consumed_credits", {
+          p_user_id: refundUserId,
+          p_request_id: requestId,
+          p_reason: "Character image generation failed",
+          p_metadata: {
+            feature: "generate-character-reference",
+            character_id: refundCharacterId,
+            story_id: refundStoryId,
+            details: { stage: "unexpected_exception", error: String(e) },
+          },
+        });
+        if (refundError) console.error("Credit refund error:", { requestId, refundError });
+      } catch (refundErr) {
+        console.error("Credit refund error:", { requestId, refundErr });
+      }
+    }
     return json(500, { error: "Internal Server Error", details: String(e), requestId }, { "x-request-id": requestId });
   }
 });

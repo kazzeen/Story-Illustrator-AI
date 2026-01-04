@@ -66,3 +66,24 @@ All future scene prompt generations must ensure that clothing descriptions inclu
 ### Validation
 
 After color assignment, the system validates that each recognized clothing segment contains at least one color token. Missing colors are treated as quality-control issues and must be corrected before final prompt submission.
+
+## Credits Initialization Rules
+
+All new accounts and all active accounts must be initialized with 5 free monthly credits (basic tier).
+
+### Source of Truth
+
+- Credits are tracked in `public.user_credits` (monthly + bonus pools).
+- The client displays the current credits using the `credits` Edge Function, which computes `remaining_monthly + remaining_bonus`.
+
+### Required Behavior
+
+- New account creation must create a `public.user_credits` row with `tier = basic` and `monthly_credits_per_cycle = 5`.
+- Activating an account (`profiles.subscription_status = active`) must ensure credits exist for that user.
+- Initialization must be idempotent (do not overwrite users who have already used credits).
+
+### Enforcement
+
+- Database-level: `user_credits_monthly_per_cycle_matches_tier` constraint enforces the tier-to-default mapping.
+- Database-level: `ensure_profile_credits_initialized` trigger ensures `user_credits` exists on profile insert/activation.
+- Admin tooling: `admin_init_active_accounts_free_5` and `admin_verify_active_accounts_free_5` support backfill and verification.

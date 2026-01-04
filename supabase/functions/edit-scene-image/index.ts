@@ -1,5 +1,6 @@
 import { serve } from "https://deno.land/std@0.168.0/http/server.ts";
 import { createClient } from "https://esm.sh/@supabase/supabase-js@2.49.2";
+import { parseConsumeCreditsResult } from "../_shared/credits.ts";
 
 export const corsHeaders = {
   "Access-Control-Allow-Origin": "*",
@@ -79,21 +80,23 @@ type CommitRequest = {
 serve(async (req: Request) => {
   if (req.method === "OPTIONS") return new Response(null, { headers: corsHeaders });
 
+  const requestId = crypto.randomUUID();
+
   const authHeader = req.headers.get("authorization") ?? req.headers.get("Authorization");
   if (!authHeader?.startsWith("Bearer ")) {
-    return json(401, { error: "Missing Authorization header" });
+    return json(401, { error: "Missing Authorization header", requestId });
   }
 
   let requestBody: PreviewRequest | CommitRequest;
   try {
     requestBody = (await req.json()) as PreviewRequest | CommitRequest;
   } catch {
-    return json(400, { error: "Invalid request body" });
+    return json(400, { error: "Invalid request body", requestId });
   }
 
   const mode = isRecord(requestBody) ? asString(requestBody.mode) : null;
   if (mode !== "preview" && mode !== "commit") {
-    return json(400, { error: "mode must be 'preview' or 'commit'" });
+    return json(400, { error: "mode must be 'preview' or 'commit'", requestId });
   }
 
   const supabaseUrl = Deno.env.get("SUPABASE_URL")!;
@@ -108,24 +111,94 @@ serve(async (req: Request) => {
   const { data: userData, error: userErr } = await authClient.auth.getUser();
   const user = userData?.user;
   if (userErr || !user) {
-    return json(401, { error: "Invalid or expired session" });
+    return json(401, { error: "Invalid or expired session", requestId });
   }
 
   const admin = createClient(supabaseUrl, supabaseServiceKey);
 
+  const syncProfileCreditsBalance = async () => {
+    try {
+      const { data: creditsRow, error: creditsErr } = await admin
+        .from("user_credits")
+        .select("monthly_credits_per_cycle,monthly_credits_used,bonus_credits_total,bonus_credits_used")
+        .eq("user_id", user.id)
+        .maybeSingle();
+      if (creditsErr || !creditsRow) return;
+
+      const row = creditsRow as unknown as {
+        monthly_credits_per_cycle?: unknown;
+        monthly_credits_used?: unknown;
+        bonus_credits_total?: unknown;
+        bonus_credits_used?: unknown;
+      };
+
+      const monthlyPerCycle =
+        typeof row.monthly_credits_per_cycle === "number" ? row.monthly_credits_per_cycle : Number(row.monthly_credits_per_cycle);
+      const monthlyUsed = typeof row.monthly_credits_used === "number" ? row.monthly_credits_used : Number(row.monthly_credits_used);
+      const bonusTotal = typeof row.bonus_credits_total === "number" ? row.bonus_credits_total : Number(row.bonus_credits_total);
+      const bonusUsed = typeof row.bonus_credits_used === "number" ? row.bonus_credits_used : Number(row.bonus_credits_used);
+
+      if (![monthlyPerCycle, monthlyUsed, bonusTotal, bonusUsed].every((n) => Number.isFinite(n))) return;
+
+      const nextBalance = Math.max(monthlyPerCycle - monthlyUsed + (bonusTotal - bonusUsed), 0);
+      await admin.from("profiles").update({ credits_balance: nextBalance }).eq("user_id", user.id);
+    } catch {
+      return;
+    }
+  };
+
   if (mode === "preview") {
     const prompt = asString((requestBody as PreviewRequest).prompt) ?? "";
-    if (!prompt.trim()) return json(400, { error: "prompt is required" });
-    if (prompt.length > 1500) return json(400, { error: "prompt exceeds maximum length (1500)" });
+    if (!prompt.trim()) return json(400, { error: "prompt is required", requestId });
+    if (prompt.length > 1500) return json(400, { error: "prompt exceeds maximum length (1500)", requestId });
 
     const imageBase64Raw = asString((requestBody as PreviewRequest).image_base64);
     const imageUrl = asString((requestBody as PreviewRequest).image_url);
-    if (!imageBase64Raw && !imageUrl) return json(400, { error: "image_base64 or image_url is required" });
+    if (!imageBase64Raw && !imageUrl) return json(400, { error: "image_base64 or image_url is required", requestId });
 
     const payload: { prompt: string; image: string } = {
       prompt: prompt.trim(),
       image: imageBase64Raw ? decodeDataUrlOrBase64(imageBase64Raw).base64 : String(imageUrl),
     };
+
+    const adminRpc = admin as unknown as {
+      rpc: (fn: string, params: Record<string, unknown>) => Promise<{ data: unknown; error: unknown }>;
+    };
+
+    const { data: creditData, error: creditError } = await adminRpc.rpc("consume_credits", {
+      p_user_id: user.id,
+      p_amount: 1,
+      p_description: "Scene image edit",
+      p_metadata: {
+        feature: "edit-scene-image",
+        provider: "venice",
+        mode: "preview",
+        prompt_len: prompt.trim().length,
+        image_source: imageBase64Raw ? "base64" : "url",
+      },
+      p_request_id: requestId,
+    });
+
+    if (creditError) return json(500, { error: "Failed to consume credits", requestId, details: creditError });
+    const parsedCredits = parseConsumeCreditsResult(creditData);
+    if (!parsedCredits?.ok) {
+      const reason = parsedCredits?.reason ? String(parsedCredits.reason) : "insufficient_credits";
+      if (reason === "insufficient_credits") {
+        return json(402, {
+          error: "Insufficient credits",
+          requestId,
+          details: {
+            reason,
+            tier: parsedCredits?.tier,
+            remaining_monthly: parsedCredits?.remaining_monthly,
+            remaining_bonus: parsedCredits?.remaining_bonus,
+          },
+        });
+      }
+      return json(400, { error: "Credit check failed", requestId, details: { reason } });
+    }
+
+    await syncProfileCreditsBalance();
 
     let veniceRes: Response;
     try {
@@ -138,13 +211,36 @@ serve(async (req: Request) => {
         body: JSON.stringify(payload),
       });
     } catch (e) {
-      return json(502, { error: "Failed to reach Venice API", details: e instanceof Error ? e.message : String(e) });
+      try {
+        await adminRpc.rpc("refund_consumed_credits", {
+          p_user_id: user.id,
+          p_request_id: requestId,
+          p_reason: "Scene image edit failed",
+          p_metadata: { feature: "edit-scene-image", provider: "venice", mode: "preview" },
+        });
+      } catch {
+        void 0;
+      }
+      await syncProfileCreditsBalance();
+      return json(502, { error: "Failed to reach Venice API", requestId, details: e instanceof Error ? e.message : String(e) });
     }
 
     if (!veniceRes.ok) {
       const errorText = await veniceRes.text().catch(() => "");
+      try {
+        await adminRpc.rpc("refund_consumed_credits", {
+          p_user_id: user.id,
+          p_request_id: requestId,
+          p_reason: "Scene image edit failed",
+          p_metadata: { feature: "edit-scene-image", provider: "venice", mode: "preview", upstream_status: veniceRes.status },
+        });
+      } catch {
+        void 0;
+      }
+      await syncProfileCreditsBalance();
       return json(veniceRes.status, {
         error: "Venice image edit failed",
+        requestId,
         upstreamError: errorText,
       });
     }
@@ -152,15 +248,15 @@ serve(async (req: Request) => {
     const mime = veniceRes.headers.get("content-type") ?? "image/png";
     const bytes = new Uint8Array(await veniceRes.arrayBuffer());
     const editedBase64 = bytesToBase64(bytes);
-    return json(200, { success: true, mime, edited_image_base64: editedBase64 });
+    return json(200, { success: true, requestId, mime, edited_image_base64: editedBase64 });
   }
 
   const sceneId = asString((requestBody as CommitRequest).sceneId);
   const editedImageRaw = asString((requestBody as CommitRequest).edited_image_base64);
   const editedMime = asString((requestBody as CommitRequest).edited_mime) ?? undefined;
 
-  if (!sceneId || !UUID_REGEX.test(sceneId)) return json(400, { error: "Valid sceneId is required" });
-  if (!editedImageRaw) return json(400, { error: "edited_image_base64 is required" });
+  if (!sceneId || !UUID_REGEX.test(sceneId)) return json(400, { error: "Valid sceneId is required", requestId });
+  if (!editedImageRaw) return json(400, { error: "edited_image_base64 is required", requestId });
 
   const decoded = decodeDataUrlOrBase64(editedImageRaw);
   const mime = editedMime ?? decoded.mime ?? "image/png";
@@ -172,18 +268,18 @@ serve(async (req: Request) => {
     .eq("id", sceneId)
     .maybeSingle();
 
-  if (sceneErr) return json(500, { error: "Failed to fetch scene" });
-  if (!sceneRow) return json(404, { error: "Scene not found" });
+  if (sceneErr) return json(500, { error: "Failed to fetch scene", requestId });
+  if (!sceneRow) return json(404, { error: "Scene not found", requestId });
 
   const ownerId = isRecord((sceneRow as unknown as JsonObject).stories)
     ? asString(((sceneRow as unknown as JsonObject).stories as JsonObject).user_id)
     : null;
-  if (!ownerId || ownerId !== user.id) return json(403, { error: "Not allowed" });
+  if (!ownerId || ownerId !== user.id) return json(403, { error: "Not allowed", requestId });
 
   const normalizedMime = normalizeMime(mime);
-  if (!normalizedMime || !ALLOWED_MIME.has(normalizedMime)) return json(400, { error: "Unsupported image type" });
-  if (imageBytes.length <= 0) return json(400, { error: "Empty image payload" });
-  if (imageBytes.length > 10 * 1024 * 1024) return json(400, { error: "Image is too large (max 10MB)" });
+  if (!normalizedMime || !ALLOWED_MIME.has(normalizedMime)) return json(400, { error: "Unsupported image type", requestId });
+  if (imageBytes.length <= 0) return json(400, { error: "Empty image payload", requestId });
+  if (imageBytes.length > 10 * 1024 * 1024) return json(400, { error: "Image is too large (max 10MB)", requestId });
 
   const extension = normalizedMime === "image/webp" ? "webp" : normalizedMime === "image/jpeg" ? "jpg" : "png";
   const fileName = `${sceneId}/edit-${Date.now()}.${extension}`;
@@ -196,7 +292,7 @@ serve(async (req: Request) => {
 
   if (uploadError) {
     console.error("[edit-scene-image] upload failed", { sceneId, error: uploadError.message });
-    return json(500, { error: "Failed to store edited image" });
+    return json(500, { error: "Failed to store edited image", requestId });
   }
 
   const { data: urlData } = admin.storage.from("scene-images").getPublicUrl(fileName);
@@ -213,8 +309,8 @@ serve(async (req: Request) => {
     } catch (e) {
       console.error("[edit-scene-image] cleanup failed", { sceneId, fileName, error: e instanceof Error ? e.message : String(e) });
     }
-    return json(500, { error: "Failed to update scene image" });
+    return json(500, { error: "Failed to update scene image", requestId });
   }
 
-  return json(200, { success: true, imageUrl });
+  return json(200, { success: true, requestId, imageUrl });
 });

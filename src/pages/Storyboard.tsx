@@ -46,7 +46,7 @@ import {
 import { useScenes, useStories, Scene, Story } from "@/hooks/useStories";
 import { useAuth } from "@/hooks/useAuth";
 import { useToast } from "@/hooks/use-toast";
-import { supabase } from "@/integrations/supabase/client";
+import { SUPABASE_KEY, SUPABASE_URL, supabase } from "@/integrations/supabase/client";
 import { Skeleton } from "@/components/ui/skeleton";
 import type { Json } from "@/integrations/supabase/types";
 import { buildAnchoredStoryHtmlDocument, buildStoryHtmlDocument, validateStoryHtmlDocument, validateStoryHtmlSceneCoverage } from "@/lib/story-html";
@@ -60,7 +60,7 @@ import { Select, SelectContent, SelectItem, SelectTrigger, SelectValue } from "@
 export default function Storyboard() {
   const { storyId } = useParams();
   const navigate = useNavigate();
-  const { user } = useAuth();
+  const { user, refreshProfile } = useAuth();
   const { stories, deleteStory, updateStory, fetchStories } = useStories();
   const { scenes, loading: scenesLoading, fetchScenes, setScenes, updateScene, stopAllGeneration } = useScenes(storyId || null);
   const { toast } = useToast();
@@ -847,14 +847,13 @@ export default function Storyboard() {
       const { data: { session: currentSession } } = await supabase.auth.getSession();
       const token = currentSession?.access_token ?? session.access_token;
       
-      // Get the function URL
-      const functionUrl = `${import.meta.env.VITE_SUPABASE_URL ?? "https://placeholder.supabase.co"}/functions/v1/generate-scene-image`;
+      const functionUrl = `${SUPABASE_URL.replace(/\/$/, "")}/functions/v1/generate-scene-image`;
       
       let rawResponse: Response;
       try {
-        const apikey = (import.meta.env.VITE_SUPABASE_PUBLISHABLE_KEY ?? "").trim();
+        const apikey = (import.meta.env.VITE_SUPABASE_ANON_KEY ?? import.meta.env.VITE_SUPABASE_PUBLISHABLE_KEY ?? SUPABASE_KEY).trim();
         if (!apikey) {
-          throw new Error("Missing VITE_SUPABASE_PUBLISHABLE_KEY; cannot call Supabase Functions endpoint");
+          throw new Error("Missing VITE_SUPABASE_ANON_KEY or VITE_SUPABASE_PUBLISHABLE_KEY; cannot call Supabase Functions endpoint");
         }
         rawResponse = await fetch(functionUrl, {
           method: "POST",
@@ -1289,6 +1288,7 @@ export default function Storyboard() {
       );
 
       if (!response?.imageUrl) await fetchScenes();
+      void refreshProfile();
 
       toast({
         title: "Image generated!",
@@ -1400,7 +1400,7 @@ export default function Storyboard() {
         let requestParams: Record<string, unknown> | undefined;
         try {
           // Use direct fetch to bypass supabase-js error wrapping that might obscure headers
-          const functionUrl = `${import.meta.env.VITE_SUPABASE_URL ?? "https://placeholder.supabase.co"}/functions/v1/generate-scene-image`;
+          const functionUrl = `${SUPABASE_URL.replace(/\/$/, "")}/functions/v1/generate-scene-image`;
           
           const artStyle = selectedStyleRef.current;
           const intensity = styleIntensityRef.current;
@@ -1422,10 +1422,15 @@ export default function Storyboard() {
 
           let rawResponse: Response;
           try {
+            const apikey = (import.meta.env.VITE_SUPABASE_ANON_KEY ?? import.meta.env.VITE_SUPABASE_PUBLISHABLE_KEY ?? SUPABASE_KEY).trim();
+            if (!apikey) {
+              throw new Error("Missing VITE_SUPABASE_ANON_KEY or VITE_SUPABASE_PUBLISHABLE_KEY; cannot call Supabase Functions endpoint");
+            }
             rawResponse = await fetch(functionUrl, {
               method: "POST",
               headers: {
                 "Authorization": `Bearer ${session.access_token}`,
+                "apikey": apikey,
                 "Content-Type": "application/json"
               },
               body: JSON.stringify({ 
@@ -1814,6 +1819,7 @@ export default function Storyboard() {
       });
 
       await fetchScenes();
+      void refreshProfile();
     } catch (error) {
       console.error("Error in batch generation:", error);
       toast({
@@ -2082,10 +2088,10 @@ export default function Storyboard() {
     const width = selectedResolution?.width;
     const height = selectedResolution?.height;
 
-    const functionUrl = `${import.meta.env.VITE_SUPABASE_URL ?? "https://placeholder.supabase.co"}/functions/v1/generate-scene-image`;
-    const apikey = (import.meta.env.VITE_SUPABASE_PUBLISHABLE_KEY ?? "").trim();
+    const functionUrl = `${SUPABASE_URL.replace(/\/$/, "")}/functions/v1/generate-scene-image`;
+    const apikey = (import.meta.env.VITE_SUPABASE_ANON_KEY ?? import.meta.env.VITE_SUPABASE_PUBLISHABLE_KEY ?? SUPABASE_KEY).trim();
     if (!apikey) {
-      throw new Error("Missing VITE_SUPABASE_PUBLISHABLE_KEY; cannot call Supabase Functions endpoint");
+      throw new Error("Missing VITE_SUPABASE_ANON_KEY or VITE_SUPABASE_PUBLISHABLE_KEY; cannot call Supabase Functions endpoint");
     }
 
     const rawResponse = await fetch(functionUrl, {

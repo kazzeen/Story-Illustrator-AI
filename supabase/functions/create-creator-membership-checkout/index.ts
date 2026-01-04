@@ -91,7 +91,7 @@ export function buildStripeCheckoutForm(params: {
   successUrl: string;
   cancelUrl: string;
   userId: string;
-  tier: "creator";
+  tier: "creator" | "professional";
   customerId?: string | null;
   customerEmail?: string | null;
   clientReferenceId?: string | null;
@@ -170,12 +170,14 @@ serve(async (req: Request) => {
   if (req.method === "OPTIONS") return new Response(null, { headers: corsHeaders });
   if (req.method !== "POST") return json(405, { error: "Method not allowed" });
 
+  let tier: "creator" | "professional" = "creator";
   let interval: "month" | "year" = "month";
   let returnBase: string | null = null;
   try {
     const body = (await req.json().catch(() => null)) as unknown;
     if (body && typeof body === "object" && !Array.isArray(body)) {
       const record = body as Record<string, unknown>;
+      tier = record.tier === "professional" ? "professional" : "creator";
       const raw = record.interval;
       if (raw === "month" || raw === "year") interval = raw;
       returnBase = typeof record.returnBase === "string" ? record.returnBase : null;
@@ -187,15 +189,21 @@ serve(async (req: Request) => {
   const supabaseUrl = Deno.env.get("SUPABASE_URL");
   const supabaseServiceKey = Deno.env.get("SUPABASE_SERVICE_ROLE_KEY");
   const stripeSecretKeyRaw = Deno.env.get("STRIPE_SECRET_KEY");
-  const monthlyPriceId = Deno.env.get("STRIPE_PRICE_CREATOR_ID");
-  const annualPriceId = Deno.env.get("STRIPE_PRICE_CREATOR_ANNUAL_ID");
+  const monthlyPriceId =
+    tier === "professional" ? Deno.env.get("STRIPE_PRICE_PROFESSIONAL_ID") : Deno.env.get("STRIPE_PRICE_CREATOR_ID");
+  const annualPriceId =
+    tier === "professional"
+      ? Deno.env.get("STRIPE_PRICE_PROFESSIONAL_ANNUAL_ID")
+      : Deno.env.get("STRIPE_PRICE_CREATOR_ANNUAL_ID");
   const priceId = interval === "year" && annualPriceId ? annualPriceId : monthlyPriceId;
   const missing: string[] = [];
   if (!supabaseUrl) missing.push("SUPABASE_URL");
   if (!supabaseServiceKey) missing.push("SUPABASE_SERVICE_ROLE_KEY");
   if (!stripeSecretKeyRaw) missing.push("STRIPE_SECRET_KEY");
-  if (!monthlyPriceId) missing.push("STRIPE_PRICE_CREATOR_ID");
-  if (interval === "year" && !annualPriceId) missing.push("STRIPE_PRICE_CREATOR_ANNUAL_ID");
+  if (!monthlyPriceId) missing.push(tier === "professional" ? "STRIPE_PRICE_PROFESSIONAL_ID" : "STRIPE_PRICE_CREATOR_ID");
+  if (interval === "year" && !annualPriceId) {
+    missing.push(tier === "professional" ? "STRIPE_PRICE_PROFESSIONAL_ANNUAL_ID" : "STRIPE_PRICE_CREATOR_ANNUAL_ID");
+  }
   if (missing.length) return json(500, { error: "Configuration error", missing });
   const stripeSecretKey = normalizeStripeSecretKey(stripeSecretKeyRaw);
   if (!stripeSecretKey.startsWith("sk_")) return json(500, { error: "Configuration error", details: "STRIPE_SECRET_KEY must start with sk_", got: classifyStripeKeyPrefix(stripeSecretKey) });
@@ -225,7 +233,7 @@ serve(async (req: Request) => {
     successUrl: urls.successUrl,
     cancelUrl: urls.cancelUrl,
     userId: user.id,
-    tier: "creator",
+    tier,
     customerId: creditsRow?.stripe_customer_id ?? null,
     customerEmail: user.email ?? null,
   });

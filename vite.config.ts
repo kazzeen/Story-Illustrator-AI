@@ -16,6 +16,7 @@ export default defineConfig(({ mode }) => ({
   plugins: [react(), mode === "development" && componentTagger()].filter(Boolean),
   test: {
     environment: "node",
+    environmentMatchGlobs: [["**/*.test.tsx", "jsdom"]],
   },
   resolve: {
     alias: {
