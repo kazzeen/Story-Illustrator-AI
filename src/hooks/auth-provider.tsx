@@ -22,8 +22,12 @@ export function AuthProvider({ children }: { children: ReactNode }) {
 
   const refreshCreditsBalance = async (_userId: string, existingProfile: UserProfile) => {
     try {
+      const { data: sessionData } = await supabase.auth.getSession();
+      const token = sessionData.session?.access_token;
+      if (!token) return;
       const { data, error } = await supabase.functions.invoke("credits", {
         body: { action: "status", limit: 1 },
+        headers: { Authorization: `Bearer ${token}` },
       });
       if (error) {
         // Fallback: If edge function fails, trust profiles table which is synced via trigger

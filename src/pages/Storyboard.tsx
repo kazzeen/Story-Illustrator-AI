@@ -1288,7 +1288,7 @@ export default function Storyboard() {
       );
 
       if (!response?.imageUrl) await fetchScenes();
-      void refreshProfile();
+      await refreshProfile();
 
       toast({
         title: "Image generated!",
@@ -1819,7 +1819,7 @@ export default function Storyboard() {
       });
 
       await fetchScenes();
-      void refreshProfile();
+      await refreshProfile();
     } catch (error) {
       console.error("Error in batch generation:", error);
       toast({

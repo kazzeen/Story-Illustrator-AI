@@ -92,6 +92,7 @@ export function buildStripeCheckoutForm(params: {
   cancelUrl: string;
   userId: string;
   tier: "creator" | "professional";
+  interval: "month" | "year";
   customerId?: string | null;
   customerEmail?: string | null;
   clientReferenceId?: string | null;
@@ -115,8 +116,12 @@ export function buildStripeCheckoutForm(params: {
 
   form.set("metadata[user_id]", params.userId);
   form.set("metadata[tier]", params.tier);
+  form.set("metadata[interval]", params.interval);
+  form.set("metadata[price_id]", params.priceId);
   form.set("subscription_data[metadata][user_id]", params.userId);
   form.set("subscription_data[metadata][tier]", params.tier);
+  form.set("subscription_data[metadata][interval]", params.interval);
+  form.set("subscription_data[metadata][price_id]", params.priceId);
 
   return form;
 }
@@ -234,6 +239,7 @@ serve(async (req: Request) => {
     cancelUrl: urls.cancelUrl,
     userId: user.id,
     tier,
+    interval,
     customerId: creditsRow?.stripe_customer_id ?? null,
     customerEmail: user.email ?? null,
   });

@@ -298,9 +298,14 @@ serve(async (req: Request) => {
     if (!objRec) return json(400, { error: "Missing event object" });
     const mode = asString(objRec.mode);
     const paymentStatus = asString(objRec.payment_status);
-    if (paymentStatus !== "paid") {
+    const subscriptionPaymentOk = paymentStatus === "paid" || paymentStatus === "no_payment_required";
+    if (mode === "payment" && paymentStatus !== "paid") {
       await logWebhookOutcome({ status: "ignored", reason: "not_paid" });
       return json(200, { received: true, ignored: true, reason: "not_paid" });
+    }
+    if (mode === "subscription" && paymentStatus && !subscriptionPaymentOk) {
+      await logWebhookOutcome({ status: "ignored", reason: "subscription_not_paid", details: { paymentStatus } });
+      return json(200, { received: true, ignored: true, reason: "subscription_not_paid" });
     }
 
     const sessionId = asString(objRec.id);
@@ -344,10 +349,46 @@ serve(async (req: Request) => {
     if (mode === "subscription") {
       const metadataTier = meta ? asString(meta.tier) : null;
       const metadataUserId = meta ? asString(meta.supabase_user_id ?? meta.user_id) : null;
+      const metadataPriceId = meta ? asString(meta.price_id) : null;
+      const metadataInterval = meta ? asString(meta.interval) : null;
       const resolvedUserId = await findUserId({ customerId, subscriptionId, metadataUserId });
       if (!subscriptionId) {
         await logWebhookOutcome({ status: "ignored", userId: resolvedUserId, reason: "missing_subscription_id" });
         return json(200, { received: true, ignored: true, reason: "missing_subscription_id" });
+      }
+
+      const tierFromMetadata =
+        metadataTier === "starter" || metadataTier === "creator" || metadataTier === "professional" ? metadataTier : null;
+      const intervalFromMetadata = metadataInterval === "month" || metadataInterval === "year" ? metadataInterval : null;
+      if (tierFromMetadata && resolvedUserId) {
+        const nowSec = Math.floor(Date.now() / 1000);
+        const cycleStart = nowSec;
+        const cycleEnd = nowSec + (intervalFromMetadata === "year" ? 365 * 24 * 60 * 60 : 30 * 24 * 60 * 60);
+
+        const { error } = await handleSubscriptionState({
+          userId: resolvedUserId,
+          tier: tierFromMetadata,
+          customerId,
+          subscriptionId,
+          priceId: metadataPriceId,
+          cycleStart,
+          cycleEnd,
+          invoiceId,
+          resetUsage: true,
+        });
+        if (error) {
+          await logWebhookOutcome({ status: "error", userId: resolvedUserId, reason: "subscription_apply_failed_metadata", details: { error } });
+          await alertIfNeeded({ status: "error", userId: resolvedUserId, reason: "subscription_apply_failed_metadata", details: { error } });
+          return json(500, { error: "Failed to apply subscription grant", details: error });
+        }
+
+        await logWebhookOutcome({
+          status: "ok",
+          userId: resolvedUserId,
+          reason: "subscription_grant_applied_metadata",
+          details: { tier: tierFromMetadata, interval: intervalFromMetadata, priceId: metadataPriceId },
+        });
+        return json(200, { received: true });
       }
 
       const fetched = await fetchStripeSubscription(subscriptionId);
@@ -356,7 +397,7 @@ serve(async (req: Request) => {
           status: "ignored",
           userId: resolvedUserId,
           reason: fetched.reason,
-          details: { subscriptionId, mode, metadataTier },
+          details: { subscriptionId, mode, metadataTier, metadataPriceId },
         });
         return json(200, { received: true, ignored: true, reason: fetched.reason });
       }

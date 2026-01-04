@@ -15,14 +15,17 @@ verify_jwt = true
 [functions.generate-character-reference]
 verify_jwt = false
 
+[functions.stripe-webhook]
+verify_jwt = false
+
 [functions.create-starter-membership-checkout]
 verify_jwt = false
 
 [functions.create-creator-membership-checkout]
 verify_jwt = false
 
-[functions.stripe-webhook]
+[functions.create-credit-pack-checkout]
 verify_jwt = false
 
-[functions.create-credit-pack-checkout]
+[functions.credits]
 verify_jwt = false
