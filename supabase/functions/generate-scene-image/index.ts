@@ -1363,6 +1363,8 @@ serve(async (req: Request) => {
       }
     }
 
+    let creditsResult: { remaining_monthly?: number; remaining_bonus?: number; tier?: string } | null = null;
+
     if (!isPromptOnly) {
       const adminRpc = admin as unknown as {
         rpc: (fn: string, params: Record<string, unknown>) => Promise<{ data: unknown; error: unknown }>;
@@ -1404,6 +1406,12 @@ serve(async (req: Request) => {
         }
         return json(400, { error: "Credit check failed", requestId, details: { reason } });
       }
+
+      creditsResult = {
+        remaining_monthly: parsedCredits.remaining_monthly,
+        remaining_bonus: parsedCredits.remaining_bonus,
+        tier: parsedCredits.tier,
+      };
 
       creditsConsumed = true;
       await syncProfileCreditsBalance();
@@ -2164,6 +2172,14 @@ serve(async (req: Request) => {
       success: true,
       imageUrl: urlData.publicUrl,
       requestId,
+      credits: creditsResult
+        ? {
+            consumed: 1,
+            remaining_monthly: creditsResult.remaining_monthly,
+            remaining_bonus: creditsResult.remaining_bonus,
+            tier: creditsResult.tier,
+          }
+        : undefined,
       model: actualModel,
       prompt: fullPrompt,
       promptFull: fullPrompt,
