@@ -21,6 +21,15 @@ export function Navbar() {
   const location = useLocation();
   const navigate = useNavigate();
   const { user, signOut, profile } = useAuth();
+  const subscriptionTier = typeof profile?.subscription_tier === "string" ? profile.subscription_tier : null;
+  const planLabel =
+    subscriptionTier === "starter"
+      ? "Starter"
+      : subscriptionTier === "creator"
+        ? "Creator"
+        : subscriptionTier === "professional"
+          ? "Pro"
+          : "Free";
 
   const handleSignOut = async () => {
     await signOut();
@@ -74,6 +83,10 @@ export function Navbar() {
                     <CreditCard className="w-4 h-4" />
                     <span className="font-semibold">{profile?.credits_balance ?? 0}</span>
                     <span className="text-muted-foreground text-xs">credits</span>
+                    <span className="hidden sm:inline-flex items-center text-muted-foreground text-xs">·</span>
+                    <span className="hidden sm:inline-flex items-center rounded-full bg-secondary px-2 py-0.5 text-xs font-medium text-foreground">
+                      {planLabel}
+                    </span>
                   </Button>
                 </Link>
                 <Link to="/import">

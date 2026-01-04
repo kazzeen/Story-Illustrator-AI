@@ -36,13 +36,16 @@ export function AuthProvider({ children }: { children: ReactNode }) {
         "remaining_monthly" in creditsRaw ? Number((creditsRaw as { remaining_monthly?: unknown }).remaining_monthly) : NaN;
       const remainingBonus =
         "remaining_bonus" in creditsRaw ? Number((creditsRaw as { remaining_bonus?: unknown }).remaining_bonus) : NaN;
+      const tierRaw = "tier" in creditsRaw ? (creditsRaw as { tier?: unknown }).tier : null;
+      const tier = typeof tierRaw === "string" && tierRaw.trim() ? tierRaw.trim() : null;
+      const nextSubscriptionTier = tier === "basic" ? "free" : tier;
       if (!Number.isFinite(remainingMonthly) || !Number.isFinite(remainingBonus)) return;
       const nextBalance = Math.max(remainingMonthly + remainingBonus, 0);
       setProfile((prev) => {
         const base = prev ?? existingProfile;
         if (!base) return prev;
-        if (base.credits_balance === nextBalance) return base;
-        return { ...base, credits_balance: nextBalance };
+        if (base.credits_balance === nextBalance && (nextSubscriptionTier ? base.subscription_tier === nextSubscriptionTier : true)) return base;
+        return { ...base, credits_balance: nextBalance, subscription_tier: nextSubscriptionTier ?? base.subscription_tier };
       });
     } catch {
       return;
