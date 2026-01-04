@@ -60,7 +60,7 @@ import { Select, SelectContent, SelectItem, SelectTrigger, SelectValue } from "@
 export default function Storyboard() {
   const { storyId } = useParams();
   const navigate = useNavigate();
-  const { user, refreshProfile } = useAuth();
+  const { user, refreshProfile, applyProfilePatch } = useAuth();
   const { stories, deleteStory, updateStory, fetchStories } = useStories();
   const { scenes, loading: scenesLoading, fetchScenes, setScenes, updateScene, stopAllGeneration } = useScenes(storyId || null);
   const { toast } = useToast();
@@ -310,6 +310,28 @@ export default function Storyboard() {
     ].filter(Boolean);
 
     return parts.join(" • ") || "Request failed";
+  };
+
+  const applyCreditsFromResponse = (credits: unknown) => {
+    if (!credits || typeof credits !== "object" || Array.isArray(credits)) return;
+    const c = credits as Record<string, unknown>;
+    const unlimited = typeof c.unlimited === "boolean" ? c.unlimited : false;
+
+    const tierRaw = typeof c.tier === "string" ? c.tier.trim() : "";
+    const tier = tierRaw ? (tierRaw === "basic" ? "free" : tierRaw) : null;
+
+    const remainingMonthly = typeof c.remaining_monthly === "number" ? c.remaining_monthly : Number(c.remaining_monthly);
+    const remainingBonus = typeof c.remaining_bonus === "number" ? c.remaining_bonus : Number(c.remaining_bonus);
+
+    if (Number.isFinite(remainingMonthly) && Number.isFinite(remainingBonus)) {
+      const nextBalance = Math.max(remainingMonthly + remainingBonus, 0);
+      applyProfilePatch({ credits_balance: nextBalance, ...(tier ? { subscription_tier: tier } : {}) });
+      return;
+    }
+
+    if (unlimited && tier) {
+      applyProfilePatch({ subscription_tier: tier });
+    }
   };
 
   const extractInvokeDebugInfo = async (error: unknown, preParsedBody?: unknown) => {
@@ -795,6 +817,13 @@ export default function Storyboard() {
       type GenerateSceneImageResponse = {
         success?: boolean;
         imageUrl?: string;
+        credits?: {
+          consumed?: number;
+          remaining_monthly?: number;
+          remaining_bonus?: number;
+          tier?: string;
+          unlimited?: boolean;
+        };
         generationStatus?: string;
         consistency?: unknown;
         warnings?: string[];
@@ -1288,6 +1317,7 @@ export default function Storyboard() {
       );
 
       if (!response?.imageUrl) await fetchScenes();
+      applyCreditsFromResponse(response?.credits);
       await refreshProfile();
 
       toast({
@@ -1355,24 +1385,31 @@ export default function Storyboard() {
     setBatchSceneIds(scenesToGenerate.map((s) => s.id));
 
     try {
-        type GenerateSceneImageResponse = {
-          success?: boolean;
-          imageUrl?: string;
-          headers?: Record<string, string>;
-          redactedHeaders?: string[];
-          requestId?: string;
-          stage?: string;
-          model?: string;
-          prompt?: string;
-          promptFull?: string;
-          preprocessingSteps?: string[];
-          promptHash?: string;
-          modelConfig?: unknown;
-          error?: string;
-          message?: string;
-          details?: string;
+      type GenerateSceneImageResponse = {
+        success?: boolean;
+        imageUrl?: string;
+        credits?: {
+          consumed?: number;
+          remaining_monthly?: number;
+          remaining_bonus?: number;
+          tier?: string;
+          unlimited?: boolean;
         };
-        const { data: { session } } = await supabase.auth.getSession();
+        headers?: Record<string, string>;
+        redactedHeaders?: string[];
+        requestId?: string;
+        stage?: string;
+        model?: string;
+        prompt?: string;
+        promptFull?: string;
+        preprocessingSteps?: string[];
+        promptHash?: string;
+        modelConfig?: unknown;
+        error?: string;
+        message?: string;
+        details?: string;
+      };
+      const { data: { session } } = await supabase.auth.getSession();
 
       if (!session) {
         toast({
@@ -1745,6 +1782,7 @@ export default function Storyboard() {
             promptHash: response?.promptHash,
             requestParams
           });
+          applyCreditsFromResponse(response?.credits);
           setScenes((prev) =>
             prev.map((s) =>
               s.id === scene.id

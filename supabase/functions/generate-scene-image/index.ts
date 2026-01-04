@@ -1363,7 +1363,7 @@ serve(async (req: Request) => {
       }
     }
 
-    let creditsResult: { remaining_monthly?: number; remaining_bonus?: number; tier?: string } | null = null;
+    let creditsResult: { remaining_monthly?: number; remaining_bonus?: number; tier?: string; unlimited?: boolean } | null = null;
 
     if (!isPromptOnly) {
       const adminRpc = admin as unknown as {
@@ -1411,6 +1411,7 @@ serve(async (req: Request) => {
         remaining_monthly: parsedCredits.remaining_monthly,
         remaining_bonus: parsedCredits.remaining_bonus,
         tier: parsedCredits.tier,
+        unlimited: parsedCredits.unlimited,
       };
 
       creditsConsumed = true;
@@ -2178,6 +2179,7 @@ serve(async (req: Request) => {
             remaining_monthly: creditsResult.remaining_monthly,
             remaining_bonus: creditsResult.remaining_bonus,
             tier: creditsResult.tier,
+            unlimited: creditsResult.unlimited,
           }
         : undefined,
       model: actualModel,

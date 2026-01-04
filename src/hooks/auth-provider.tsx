@@ -171,6 +171,13 @@ export function AuthProvider({ children }: { children: ReactNode }) {
     }
   };
 
+  const applyProfilePatch = (patch: Partial<NonNullable<UserProfile>>) => {
+    setProfile((prev) => {
+      if (!prev) return prev;
+      return { ...prev, ...patch };
+    });
+  };
+
   const signUp = async (email: string, password: string, displayName?: string) => {
     const { data, error } = await supabase.auth.signUp({
       email,
@@ -196,7 +203,7 @@ export function AuthProvider({ children }: { children: ReactNode }) {
     await supabase.auth.signOut();
   };
 
-  const value: AuthContextType = { user, session, loading, profile, refreshProfile, signUp, signIn, signOut };
+  const value: AuthContextType = { user, session, loading, profile, refreshProfile, applyProfilePatch, signUp, signIn, signOut };
 
   return (
     <AuthContext.Provider value={value}>
