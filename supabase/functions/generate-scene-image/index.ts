@@ -18,7 +18,11 @@ import {
   validateStyleApplication,
 } from "../_shared/style-prompts.ts";
 import { assemblePrompt, sanitizePrompt } from "../_shared/prompt-assembly.ts";
-import { parseConsumeCreditsResult } from "../_shared/credits.ts";
+import {
+  parseCommitReservedCreditsResult,
+  parseReleaseReservedCreditsResult,
+  parseReserveCreditsResult,
+} from "../_shared/credits.ts";
 
 const GOOGLE_MODELS: Record<string, string> = {
   "gemini-2.5-flash": "imagen-4.0-generate-001",
@@ -1108,10 +1112,12 @@ async function fetchWithTimeout(url: string, init: RequestInit, timeoutMs: numbe
 serve(async (req: Request) => {
   if (req.method === "OPTIONS") return new Response(null, { headers: corsHeaders });
 
-  const requestId = crypto.randomUUID();
+  const serverRequestId = crypto.randomUUID();
+  let requestId: string = String(serverRequestId);
   let admin: SupabaseClientLike | null = null;
   let currentSceneRow: SceneRow | null = null;
   let requestedSceneId: string | null = null;
+  let creditsReserved = false;
   let creditsConsumed = false;
   let creditsProvider: "venice" | "google" | "unknown" = "unknown";
   let userId: string | null = null;
@@ -1133,6 +1139,75 @@ serve(async (req: Request) => {
     timings[label] = Math.round(performance.now() - startTotal);
   };
 
+  const updateAttempt = async (patch: Record<string, unknown>) => {
+    if (!admin || !userId) return;
+    try {
+      await admin
+        .from("image_generation_attempts")
+        .upsert(
+          {
+            request_id: requestId,
+            user_id: userId,
+            feature: "generate-scene-image",
+            ...(patch ?? {}),
+          },
+          { onConflict: "request_id" },
+        );
+    } catch {
+      void 0;
+    }
+  };
+
+  const releaseReservationIfNeeded = async (reason: string, extraMetadata?: Record<string, unknown>) => {
+    if (!admin || !creditsReserved || !userId) return null;
+    const adminRpc = admin as unknown as {
+      rpc: (fn: string, params: Record<string, unknown>) => Promise<{ data: unknown; error: unknown }>;
+    };
+    try {
+      const { data, error } = await adminRpc.rpc("release_reserved_credits", {
+        p_user_id: userId,
+        p_request_id: requestId,
+        p_reason: reason,
+        p_metadata: {
+          feature: "generate-scene-image",
+          provider: creditsProvider,
+          ...(extraMetadata ?? {}),
+        },
+      });
+      if (error) return null;
+      return parseReleaseReservedCreditsResult(data);
+    } catch {
+      return null;
+    }
+  };
+
+  const commitReservationIfNeeded = async (extraMetadata?: Record<string, unknown>) => {
+    if (!admin || !creditsReserved || !userId) return null;
+    const adminRpc = admin as unknown as {
+      rpc: (fn: string, params: Record<string, unknown>) => Promise<{ data: unknown; error: unknown }>;
+    };
+    try {
+      const { data, error } = await adminRpc.rpc("commit_reserved_credits", {
+        p_user_id: userId,
+        p_request_id: requestId,
+        p_metadata: {
+          feature: "generate-scene-image",
+          provider: creditsProvider,
+          ...(extraMetadata ?? {}),
+        },
+      });
+      if (error) return null;
+      const parsed = parseCommitReservedCreditsResult(data);
+      if (parsed?.ok) {
+        creditsReserved = false;
+        creditsConsumed = true;
+      }
+      return parsed;
+    } catch {
+      return null;
+    }
+  };
+
   try {
     const supabaseUrl = Deno.env.get("SUPABASE_URL");
     const supabaseServiceKey = Deno.env.get("SUPABASE_SERVICE_ROLE_KEY");
@@ -1143,6 +1218,16 @@ serve(async (req: Request) => {
     }
 
     const requestBody = await req.json();
+    const requestBodyObj =
+      requestBody && typeof requestBody === "object" && !Array.isArray(requestBody) ? (requestBody as Record<string, unknown>) : null;
+    const clientRequestId =
+      (requestBodyObj ? asString(requestBodyObj.requestId) : null) ??
+      (requestBodyObj ? asString(requestBodyObj.clientRequestId) : null) ??
+      (requestBodyObj ? asString(requestBodyObj.request_id) : null) ??
+      null;
+    if (clientRequestId && UUID_REGEX.test(clientRequestId)) {
+      requestId = clientRequestId;
+    }
     const {
       sceneId,
       storyId,
@@ -1206,27 +1291,6 @@ serve(async (req: Request) => {
 
     userId = user.id;
 
-    const refundIfNeeded = async (reason: string, extraMetadata?: Record<string, unknown>) => {
-      if (!admin || !creditsConsumed) return;
-      const adminRpc = admin as unknown as {
-        rpc: (fn: string, params: Record<string, unknown>) => Promise<{ data: unknown; error: unknown }>;
-      };
-      try {
-        await adminRpc.rpc("refund_consumed_credits", {
-          p_user_id: userId ?? user.id,
-          p_request_id: requestId,
-          p_reason: reason,
-          p_metadata: {
-            feature: "generate-scene-image",
-            provider: creditsProvider,
-            ...(extraMetadata ?? {}),
-          },
-        });
-      } catch {
-        void 0;
-      }
-    };
-
     // --- RESET LOGIC ---
     if (resetFlag) {
       // Validate storyId
@@ -1272,7 +1336,13 @@ serve(async (req: Request) => {
 
     // Validate sceneId is a valid UUID
     if (!sceneId || !UUID_REGEX.test(String(sceneId))) {
-      return json(400, { error: "Valid scene ID is required", requestId });
+      await updateAttempt({
+        status: "failed",
+        error_stage: "invalid_parameters",
+        error_message: "Valid scene ID is required",
+        metadata: { sceneId },
+      });
+      return json(400, { error: "Valid scene ID is required", requestId, stage: "invalid_parameters" });
     }
 
     // Validate artStyle if provided
@@ -1307,7 +1377,13 @@ serve(async (req: Request) => {
       console.log(`[Debug] Received request for model: '${usedModel}'`);
       if (!ALLOWED_MODELS.includes(usedModel)) {
         console.error(`[Error] Invalid model requested: '${usedModel}'. Allowed: ${ALLOWED_MODELS.join(", ")}`);
-        return json(400, { error: "Invalid model", requestId, details: `Model '${usedModel}' not supported` });
+        await updateAttempt({
+          status: "failed",
+          error_stage: "invalid_parameters",
+          error_message: "Invalid model",
+          metadata: { model: usedModel, allowed_models: ALLOWED_MODELS },
+        });
+        return json(400, { error: "Invalid model", requestId, stage: "invalid_parameters", details: `Model '${usedModel}' not supported` });
       }
     }
 
@@ -1341,6 +1417,12 @@ serve(async (req: Request) => {
       } catch {
         void 0;
       }
+      await updateAttempt({
+        status: "failed",
+        error_stage: "scene_fetch",
+        error_message: "Failed to fetch scene",
+        metadata: { sceneId, details: serializeSupabaseError(sceneError), retryDetails: serializeSupabaseError(retrySceneError) },
+      });
       const { error: probeError } = await admin.from("scenes").select("id").eq("id", sceneId).maybeSingle();
       const serialized = serializeSupabaseError(sceneError);
       const retrySerialized = serializeSupabaseError(retrySceneError);
@@ -1358,7 +1440,15 @@ serve(async (req: Request) => {
       });
     }
 
-    if (!scene) return json(404, { error: "Scene not found", requestId });
+    if (!scene) {
+      await updateAttempt({
+        status: "failed",
+        error_stage: "scene_not_found",
+        error_message: "Scene not found",
+        metadata: { sceneId },
+      });
+      return json(404, { error: "Scene not found", requestId, stage: "scene_not_found" });
+    }
     currentSceneRow = scene;
 
     const { data: storyRow, error: storyError } = await admin
@@ -1368,6 +1458,12 @@ serve(async (req: Request) => {
       .single();
 
     if (storyError || !storyRow) {
+      await updateAttempt({
+        status: "failed",
+        error_stage: "story_fetch",
+        error_message: "Failed to fetch story",
+        metadata: { storyId: scene.story_id, details: serializeSupabaseError(storyError) },
+      });
       return json(500, { error: "Failed to fetch story", requestId });
     }
 
@@ -1418,7 +1514,15 @@ serve(async (req: Request) => {
         rpc: (fn: string, params: Record<string, unknown>) => Promise<{ data: unknown; error: unknown }>;
       };
       creditsProvider = usedModel && GOOGLE_MODELS[usedModel] ? "google" : "venice";
-      const { data: creditData, error: creditError } = await adminRpc.rpc("consume_credits", {
+      await updateAttempt({
+        status: "started",
+        story_id: scene.story_id,
+        scene_id: sceneId,
+        model: usedModel,
+        provider: creditsProvider,
+        credits_amount: 1,
+      });
+      const { data: reserveData, error: reserveError } = await adminRpc.rpc("reserve_credits", {
         p_user_id: user.id,
         p_amount: 1,
         p_description: "Scene image generation",
@@ -1432,55 +1536,48 @@ serve(async (req: Request) => {
         p_request_id: requestId,
       });
 
-      if (creditError) {
-        console.error("Credit consume error:", { requestId, creditError });
-        return json(500, { error: "Failed to consume credits", requestId, details: creditError });
+      if (reserveError) {
+        console.error("Credit reserve error:", { requestId, reserveError });
+        await updateAttempt({ status: "failed", error_stage: "credits_reserve", error_message: "Failed to reserve credits", metadata: { reserveError } });
+        return json(500, { error: "Failed to reserve credits", requestId, stage: "credits_reserve", details: reserveError });
       }
 
-      const parsedCredits = parseConsumeCreditsResult(creditData);
-      if (!parsedCredits?.ok) {
-        const reason = parsedCredits?.reason ? String(parsedCredits.reason) : "insufficient_credits";
+      const parsedReserve = parseReserveCreditsResult(reserveData);
+      if (!parsedReserve?.ok) {
+        const reason = parsedReserve?.reason ? String(parsedReserve.reason) : "insufficient_credits";
         if (reason === "insufficient_credits") {
+          await updateAttempt({
+            status: "failed",
+            error_stage: "insufficient_credits",
+            error_message: "Insufficient credits",
+            metadata: {
+              tier: parsedReserve?.tier,
+              remaining_monthly: parsedReserve?.remaining_monthly,
+              remaining_bonus: parsedReserve?.remaining_bonus,
+            },
+          });
           return json(402, {
             error: "Insufficient credits",
             requestId,
+            stage: "credits_reserve",
             details: {
               reason,
-              tier: parsedCredits?.tier,
-              remaining_monthly: parsedCredits?.remaining_monthly,
-              remaining_bonus: parsedCredits?.remaining_bonus,
+              tier: parsedReserve?.tier,
+              remaining_monthly: parsedReserve?.remaining_monthly,
+              remaining_bonus: parsedReserve?.remaining_bonus,
+            },
+            credits: {
+              remaining_monthly: parsedReserve?.remaining_monthly,
+              remaining_bonus: parsedReserve?.remaining_bonus,
+              tier: parsedReserve?.tier,
             },
           });
         }
-        return json(400, { error: "Credit check failed", requestId, details: { reason } });
+        await updateAttempt({ status: "failed", error_stage: "credits_reserve", error_message: `Credit reservation failed: ${reason}` });
+        return json(400, { error: "Credit check failed", requestId, stage: "credits_reserve", details: { reason } });
       }
 
-      const parsedOk = parsedCredits as unknown as Record<string, unknown>;
-      const parsedTier = typeof parsedOk.tier === "string" ? parsedOk.tier : null;
-      const parsedUnlimited = typeof parsedOk.unlimited === "boolean" ? parsedOk.unlimited : false;
-      const parsedIdempotent = parsedOk.idempotent === true;
-
-      if (
-        parsedTier === "professional" &&
-        parsedUnlimited === true &&
-        !parsedIdempotent &&
-        !hasFiniteNumberField(parsedOk, "remaining_monthly") &&
-        !hasFiniteNumberField(parsedOk, "remaining_bonus")
-      ) {
-        const backfilled = await backfillProfessionalMonthlyUsage({ admin, userId: user.id, amount: 1 });
-        creditsResult = backfilled
-          ? { remaining_monthly: backfilled.remaining_monthly, remaining_bonus: backfilled.remaining_bonus, tier: backfilled.tier, unlimited: false }
-          : { remaining_monthly: parsedCredits.remaining_monthly, remaining_bonus: parsedCredits.remaining_bonus, tier: parsedCredits.tier, unlimited: false };
-      } else {
-        creditsResult = {
-          remaining_monthly: parsedCredits.remaining_monthly,
-          remaining_bonus: parsedCredits.remaining_bonus,
-          tier: parsedCredits.tier,
-          unlimited: parsedCredits.unlimited,
-        };
-      }
-
-      creditsConsumed = true;
+      creditsReserved = true;
       await admin.from("scenes").update({ generation_status: "generating" }).eq("id", sceneId);
       logTiming("status_update_generating");
     }
@@ -1649,7 +1746,23 @@ serve(async (req: Request) => {
       if (isPromptOnly) {
         return json(200, { success: false, error: "Prompt is empty", requestId, stage: "prompt_only" });
       }
-      return json(400, { error: "Prompt is empty", requestId });
+      const creditsAfterRelease = await releaseReservationIfNeeded("Scene image generation failed", { stage: "prompt_empty" });
+      await updateAttempt({
+        status: "failed",
+        error_stage: "prompt_empty",
+        error_message: "Prompt is empty",
+      });
+      return json(400, {
+        error: "Prompt is empty",
+        requestId,
+        stage: "prompt_empty",
+        credits: creditsAfterRelease && creditsAfterRelease.ok
+          ? {
+              remaining_monthly: creditsAfterRelease.remaining_monthly,
+              remaining_bonus: creditsAfterRelease.remaining_bonus,
+            }
+          : undefined,
+      });
     }
 
     const storyStyleNormalized = normalizeArtStyleId((storyRow as { art_style?: unknown }).art_style);
@@ -1894,14 +2007,27 @@ serve(async (req: Request) => {
       if (!hasMarker) {
         warnings.push("style_validation_issue:style_marker_missing_in_prompt");
         preprocessingSteps.push("style_marker_missing_in_prompt");
-        if (usedStrictStyle) {
+          if (usedStrictStyle) {
           if (!isPromptOnly) {
             await admin.from("scenes").update({ generation_status: "error" }).eq("id", sceneId);
+            const creditsAfterRelease = await releaseReservationIfNeeded("Scene image generation failed", { stage: "style_application" });
+            await updateAttempt({
+              status: "failed",
+              error_stage: "style_application",
+              error_message: "Style application failed",
+              metadata: { styleId: selectedStyle, model: selectedModel },
+            });
             return json(500, {
               error: "Style application failed",
               requestId,
               stage: "style_application",
               details: { styleId: selectedStyle, model: selectedModel },
+              credits: creditsAfterRelease && creditsAfterRelease.ok
+                ? {
+                    remaining_monthly: creditsAfterRelease.remaining_monthly,
+                    remaining_bonus: creditsAfterRelease.remaining_bonus,
+                  }
+                : undefined,
             });
           }
           return json(200, {
@@ -2122,19 +2248,32 @@ serve(async (req: Request) => {
        const isAuthFailure = aiResponse.status === 401 || aiResponse.status === 403;
        
        await admin.from("scenes").update({ generation_status: "error" }).eq("id", sceneId);
-       await refundIfNeeded("Scene image generation failed", {
+       const creditsAfterRelease = await releaseReservationIfNeeded("Scene image generation failed", {
          stage: isAuthFailure ? "upstream_auth" : "upstream_error",
          upstream_status: aiResponse.status,
+       });
+       await updateAttempt({
+         status: "failed",
+         error_stage: isAuthFailure ? "upstream_auth" : "upstream_error",
+         error_message: `Upstream generation failed (${aiResponse.status})`,
+         metadata: { upstream_status: aiResponse.status, headers: responseHeaders },
        });
        return json(502, { 
          error: isAuthFailure ? "Upstream Authentication Failed" : `Upstream Generation Failed (${aiResponse.status})`, 
          requestId,
+         stage: isAuthFailure ? "upstream_auth" : "upstream_error",
          details: {
            statusText,
            upstream_error: body,
            headers: responseHeaders,
            hint: isAuthFailure ? "Verify VENICE_API_KEY is valid in Supabase secrets and redeploy the function." : undefined,
          },
+         credits: creditsAfterRelease && creditsAfterRelease.ok
+           ? {
+               remaining_monthly: creditsAfterRelease.remaining_monthly,
+               remaining_bonus: creditsAfterRelease.remaining_bonus,
+             }
+           : undefined,
          model: actualModel
        });
     }
@@ -2145,8 +2284,24 @@ serve(async (req: Request) => {
     } catch (e) {
       console.error("Failed to parse AI response JSON:", e);
       await admin.from("scenes").update({ generation_status: "error" }).eq("id", sceneId);
-      await refundIfNeeded("Scene image generation failed", { stage: "upstream_invalid_json" });
-      return json(502, { error: "Invalid JSON from upstream provider", requestId, details: String(e) });
+      const creditsAfterRelease = await releaseReservationIfNeeded("Scene image generation failed", { stage: "upstream_invalid_json" });
+      await updateAttempt({
+        status: "failed",
+        error_stage: "upstream_invalid_json",
+        error_message: "Invalid JSON from upstream provider",
+      });
+      return json(502, {
+        error: "Invalid JSON from upstream provider",
+        requestId,
+        stage: "upstream_invalid_json",
+        details: String(e),
+        credits: creditsAfterRelease && creditsAfterRelease.ok
+          ? {
+              remaining_monthly: creditsAfterRelease.remaining_monthly,
+              remaining_bonus: creditsAfterRelease.remaining_bonus,
+            }
+          : undefined,
+      });
     }
 
     const imageDataUrl = extractFirstBase64Image(aiData);
@@ -2154,8 +2309,24 @@ serve(async (req: Request) => {
     if (!imageDataUrl) {
       console.error("No valid image in response", aiData);
       await admin.from("scenes").update({ generation_status: "error" }).eq("id", sceneId);
-      await refundIfNeeded("Scene image generation failed", { stage: "missing_image_data" });
-      return json(500, { error: "No image data returned", requestId, details: "Upstream response missing image data" });
+      const creditsAfterRelease = await releaseReservationIfNeeded("Scene image generation failed", { stage: "missing_image_data" });
+      await updateAttempt({
+        status: "failed",
+        error_stage: "missing_image_data",
+        error_message: "Upstream response missing image data",
+      });
+      return json(500, {
+        error: "No image data returned",
+        requestId,
+        stage: "missing_image_data",
+        details: "Upstream response missing image data",
+        credits: creditsAfterRelease && creditsAfterRelease.ok
+          ? {
+              remaining_monthly: creditsAfterRelease.remaining_monthly,
+              remaining_bonus: creditsAfterRelease.remaining_bonus,
+            }
+          : undefined,
+      });
     }
 
     let bytes;
@@ -2165,8 +2336,81 @@ serve(async (req: Request) => {
     } catch (e) {
       console.error("Failed to decode base64 image data:", e);
       await admin.from("scenes").update({ generation_status: "error" }).eq("id", sceneId);
-      await refundIfNeeded("Scene image generation failed", { stage: "decode_image_base64" });
-      return json(500, { error: "Failed to process image data", requestId, details: "Invalid base64 response" });
+      const creditsAfterRelease = await releaseReservationIfNeeded("Scene image generation failed", { stage: "decode_image_base64" });
+      await updateAttempt({
+        status: "failed",
+        error_stage: "decode_image_base64",
+        error_message: "Invalid base64 response",
+      });
+      return json(500, {
+        error: "Failed to process image data",
+        requestId,
+        stage: "decode_image_base64",
+        details: "Invalid base64 response",
+        credits: creditsAfterRelease && creditsAfterRelease.ok
+          ? {
+              remaining_monthly: creditsAfterRelease.remaining_monthly,
+              remaining_bonus: creditsAfterRelease.remaining_bonus,
+            }
+          : undefined,
+      });
+    }
+
+    if (!bytes || bytes.length < 512) {
+      await admin.from("scenes").update({ generation_status: "error" }).eq("id", sceneId);
+      const creditsAfterRelease = await releaseReservationIfNeeded("Scene image generation failed", {
+        stage: "image_integrity_min_bytes",
+        bytes: bytes?.length ?? 0,
+      });
+      await updateAttempt({
+        status: "failed",
+        error_stage: "image_integrity_min_bytes",
+        error_message: "Generated image too small to be valid",
+        metadata: { bytes: bytes?.length ?? 0 },
+      });
+      return json(500, {
+        error: "Generated image failed integrity checks",
+        requestId,
+        stage: "image_integrity_min_bytes",
+        details: { bytes: bytes?.length ?? 0 },
+        credits: creditsAfterRelease && creditsAfterRelease.ok
+          ? {
+              remaining_monthly: creditsAfterRelease.remaining_monthly,
+              remaining_bonus: creditsAfterRelease.remaining_bonus,
+            }
+          : undefined,
+      });
+    }
+
+    try {
+      const decoded = await (Image as unknown as { decode: (b: Uint8Array) => Promise<{ width: number; height: number }> }).decode(bytes);
+      if (!decoded || decoded.width <= 0 || decoded.height <= 0) {
+        throw new Error("Decoded image has invalid dimensions");
+      }
+    } catch (e) {
+      await admin.from("scenes").update({ generation_status: "error" }).eq("id", sceneId);
+      const creditsAfterRelease = await releaseReservationIfNeeded("Scene image generation failed", {
+        stage: "image_integrity_decode",
+        error: String(e),
+      });
+      await updateAttempt({
+        status: "failed",
+        error_stage: "image_integrity_decode",
+        error_message: "Generated image could not be decoded",
+        metadata: { error: String(e) },
+      });
+      return json(500, {
+        error: "Generated image failed integrity checks",
+        requestId,
+        stage: "image_integrity_decode",
+        details: String(e),
+        credits: creditsAfterRelease && creditsAfterRelease.ok
+          ? {
+              remaining_monthly: creditsAfterRelease.remaining_monthly,
+              remaining_bonus: creditsAfterRelease.remaining_bonus,
+            }
+          : undefined,
+      });
     }
 
     const mime = detectImageMime(bytes);
@@ -2185,11 +2429,61 @@ serve(async (req: Request) => {
     if (uploadError) {
       console.error("Upload error:", uploadError);
       await admin.from("scenes").update({ generation_status: "error" }).eq("id", sceneId);
-      await refundIfNeeded("Scene image generation failed", { stage: "storage_upload" });
-      return json(500, { error: "Failed to store image", requestId, details: serializeSupabaseError(uploadError) });
+      const creditsAfterRelease = await releaseReservationIfNeeded("Scene image generation failed", { stage: "storage_upload" });
+      await updateAttempt({
+        status: "failed",
+        error_stage: "storage_upload",
+        error_message: "Failed to store image",
+      });
+      return json(500, {
+        error: "Failed to store image",
+        requestId,
+        stage: "storage_upload",
+        details: serializeSupabaseError(uploadError),
+        credits: creditsAfterRelease && creditsAfterRelease.ok
+          ? {
+              remaining_monthly: creditsAfterRelease.remaining_monthly,
+              remaining_bonus: creditsAfterRelease.remaining_bonus,
+            }
+          : undefined,
+      });
     }
 
     const { data: urlData } = admin.storage.from("scene-images").getPublicUrl(fileName);
+
+    const commitResult = await commitReservationIfNeeded({ stage: "commit_reserved_credits", model: actualModel });
+    if (!commitResult?.ok) {
+      const creditsAfterRelease = await releaseReservationIfNeeded("Scene image generation failed", { stage: "commit_reserved_credits" });
+      await updateAttempt({
+        status: "failed",
+        error_stage: "commit_reserved_credits",
+        error_message: "Failed to commit reserved credits",
+        metadata: { reason: commitResult?.reason },
+      });
+      try {
+        await admin.storage.from("scene-images").remove([fileName]);
+      } catch {
+        void 0;
+      }
+      return json(500, {
+        error: "Failed to finalize credits",
+        requestId,
+        stage: "commit_reserved_credits",
+        details: { reason: commitResult?.reason ?? "unknown" },
+        credits: creditsAfterRelease && creditsAfterRelease.ok
+          ? {
+              remaining_monthly: creditsAfterRelease.remaining_monthly,
+              remaining_bonus: creditsAfterRelease.remaining_bonus,
+            }
+          : undefined,
+      });
+    }
+
+    creditsResult = {
+      remaining_monthly: commitResult.remaining_monthly,
+      remaining_bonus: commitResult.remaining_bonus,
+      tier: commitResult.tier,
+    };
 
     try {
       const existingDetails =
@@ -2234,15 +2528,90 @@ serve(async (req: Request) => {
         .eq("id", sceneId);
       if (updateError) {
         console.error("Scene update error:", updateError);
-        await refundIfNeeded("Scene image generation failed", { stage: "scene_update" });
-        return json(500, { error: "Failed to update scene with image", requestId, details: serializeSupabaseError(updateError) });
+        try {
+          if (creditsConsumed && userId) {
+            const adminRpc = admin as unknown as {
+              rpc: (fn: string, params: Record<string, unknown>) => Promise<{ data: unknown; error: unknown }>;
+            };
+            await adminRpc.rpc("refund_consumed_credits", {
+              p_user_id: userId,
+              p_request_id: requestId,
+              p_reason: "Scene image generation failed",
+              p_metadata: { feature: "generate-scene-image", provider: creditsProvider, stage: "scene_update" },
+            });
+          }
+        } catch {
+          void 0;
+        }
+        try {
+          await admin.storage.from("scene-images").remove([fileName]);
+        } catch {
+          void 0;
+        }
+        await updateAttempt({
+          status: "failed",
+          error_stage: "scene_update",
+          error_message: "Failed to update scene with image",
+        });
+        return json(500, {
+          error: "Failed to update scene with image",
+          requestId,
+          stage: "scene_update",
+          details: serializeSupabaseError(updateError),
+          credits: creditsResult
+            ? {
+                remaining_monthly: creditsResult.remaining_monthly,
+                remaining_bonus: creditsResult.remaining_bonus,
+              }
+            : undefined,
+        });
       }
     } catch (e) {
       console.error("Scene update exception:", e);
-      await refundIfNeeded("Scene image generation failed", { stage: "scene_update_exception" });
-      return json(500, { error: "Failed to update scene with image", requestId, details: String(e) });
+      try {
+        if (admin && creditsConsumed && userId) {
+          const adminRpc = admin as unknown as {
+            rpc: (fn: string, params: Record<string, unknown>) => Promise<{ data: unknown; error: unknown }>;
+          };
+          await adminRpc.rpc("refund_consumed_credits", {
+            p_user_id: userId,
+            p_request_id: requestId,
+            p_reason: "Scene image generation failed",
+            p_metadata: { feature: "generate-scene-image", provider: creditsProvider, stage: "scene_update_exception" },
+          });
+        }
+      } catch {
+        void 0;
+      }
+      try {
+        await admin.storage.from("scene-images").remove([fileName]);
+      } catch {
+        void 0;
+      }
+      await updateAttempt({
+        status: "failed",
+        error_stage: "scene_update_exception",
+        error_message: "Failed to update scene with image",
+      });
+      return json(500, {
+        error: "Failed to update scene with image",
+        requestId,
+        stage: "scene_update_exception",
+        details: String(e),
+        credits: creditsResult
+          ? {
+              remaining_monthly: creditsResult.remaining_monthly,
+              remaining_bonus: creditsResult.remaining_bonus,
+            }
+          : undefined,
+      });
     }
 
+    await updateAttempt({
+      status: "succeeded",
+      model: actualModel,
+      metadata: { timings, warnings: warnings.length > 0 ? warnings : undefined },
+    });
     return json(200, {
       success: true,
       imageUrl: urlData.publicUrl,
@@ -2268,7 +2637,9 @@ serve(async (req: Request) => {
   } catch (e) {
     console.error("Unexpected error:", e);
     try {
-      if (admin && creditsConsumed && userId) {
+      if (admin && creditsReserved) {
+        await releaseReservationIfNeeded("Scene image generation failed", { stage: "unexpected_exception" });
+      } else if (admin && creditsConsumed && userId) {
         const adminRpc = admin as unknown as {
           rpc: (fn: string, params: Record<string, unknown>) => Promise<{ data: unknown; error: unknown }>;
         };
@@ -2279,6 +2650,15 @@ serve(async (req: Request) => {
           p_metadata: { feature: "generate-scene-image", provider: creditsProvider, stage: "unexpected_exception" },
         });
       }
+    } catch {
+      void 0;
+    }
+    try {
+      await updateAttempt({
+        status: "failed",
+        error_stage: "unexpected_exception",
+        error_message: String(e),
+      });
     } catch {
       void 0;
     }
