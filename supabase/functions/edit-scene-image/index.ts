@@ -1,5 +1,5 @@
 import { serve } from "https://deno.land/std@0.168.0/http/server.ts";
-import { createClient } from "https://esm.sh/@supabase/supabase-js@2.49.2";
+import { createClient, type SupabaseClientLike } from "https://esm.sh/@supabase/supabase-js@2.49.2";
 import { parseConsumeCreditsResult } from "../_shared/credits.ts";
 
 export const corsHeaders = {
@@ -63,6 +63,76 @@ export function base64ToBytes(base64: string): Uint8Array {
   return bytes;
 }
 
+function toFiniteNumber(value: unknown, fallback = 0) {
+  const n = typeof value === "number" ? value : typeof value === "string" ? Number(value) : NaN;
+  return Number.isFinite(n) ? n : fallback;
+}
+
+function hasFiniteNumberField(obj: Record<string, unknown>, key: string) {
+  return Number.isFinite(toFiniteNumber(obj[key], NaN));
+}
+
+async function backfillProfessionalMonthlyUsage(args: {
+  admin: SupabaseClientLike;
+  userId: string;
+  amount: number;
+}): Promise<{ remaining_monthly: number; remaining_bonus: number; tier: string } | null> {
+  const selectCols =
+    "tier,monthly_credits_per_cycle,monthly_credits_used,bonus_credits_total,bonus_credits_used,reserved_monthly,reserved_bonus";
+
+  const computeRemaining = (row: Record<string, unknown>) => {
+    const perCycle = toFiniteNumber(row.monthly_credits_per_cycle, 0);
+    const usedMonthly = toFiniteNumber(row.monthly_credits_used, 0);
+    const reservedMonthly = toFiniteNumber(row.reserved_monthly, 0);
+    const bonusTotal = toFiniteNumber(row.bonus_credits_total, 0);
+    const bonusUsed = toFiniteNumber(row.bonus_credits_used, 0);
+    const reservedBonus = toFiniteNumber(row.reserved_bonus, 0);
+    const remainingMonthly = Math.max(perCycle - usedMonthly - reservedMonthly, 0);
+    const remainingBonus = Math.max(bonusTotal - bonusUsed - reservedBonus, 0);
+    return { remainingMonthly, remainingBonus };
+  };
+
+  let lastRow: Record<string, unknown> | null = null;
+  for (let attempt = 0; attempt < 2; attempt += 1) {
+    const { data: row, error: rowErr } = await args.admin
+      .from("user_credits")
+      .select(selectCols)
+      .eq("user_id", args.userId)
+      .maybeSingle();
+    if (rowErr || !row) return null;
+
+    lastRow = row as unknown as Record<string, unknown>;
+    const currentUsed = toFiniteNumber(lastRow.monthly_credits_used, 0);
+    const nextUsed = currentUsed + args.amount;
+
+    const { data: updated, error: updErr } = await args.admin
+      .from("user_credits")
+      .update({ monthly_credits_used: nextUsed })
+      .eq("user_id", args.userId)
+      .eq("monthly_credits_used", currentUsed)
+      .select(selectCols)
+      .maybeSingle();
+
+    if (!updErr && updated) {
+      const updatedRec = updated as unknown as Record<string, unknown>;
+      const remaining = computeRemaining(updatedRec);
+      return {
+        remaining_monthly: remaining.remainingMonthly,
+        remaining_bonus: remaining.remainingBonus,
+        tier: typeof updatedRec.tier === "string" ? updatedRec.tier : "professional",
+      };
+    }
+  }
+
+  if (!lastRow) return null;
+  const remaining = computeRemaining(lastRow);
+  return {
+    remaining_monthly: remaining.remainingMonthly,
+    remaining_bonus: remaining.remainingBonus,
+    tier: typeof lastRow.tier === "string" ? lastRow.tier : "professional",
+  };
+}
+
 type PreviewRequest = {
   mode: "preview";
   prompt?: string;
@@ -102,11 +172,13 @@ serve(async (req: Request) => {
   const supabaseUrl = Deno.env.get("SUPABASE_URL")!;
   const supabaseServiceKey = Deno.env.get("SUPABASE_SERVICE_ROLE_KEY")!;
   const supabaseAnonKey = Deno.env.get("SUPABASE_ANON_KEY")!;
-  const veniceApiKey = Deno.env.get("VENICE_API_KEY")!;
+  const veniceApiKeyRaw = Deno.env.get("VENICE_API_KEY");
+  const veniceApiKey = typeof veniceApiKeyRaw === "string" ? veniceApiKeyRaw.trim().replace(/^["']|["']$/g, "") : "";
+  if (!veniceApiKey) return json(500, { error: "Configuration error", requestId, details: "Missing VENICE_API_KEY" });
 
   const authClient = createClient(supabaseUrl, supabaseAnonKey, {
     global: { headers: { Authorization: authHeader } },
-  });
+  }) as SupabaseClientLike;
 
   const { data: userData, error: userErr } = await authClient.auth.getUser();
   const user = userData?.user;
@@ -114,38 +186,7 @@ serve(async (req: Request) => {
     return json(401, { error: "Invalid or expired session", requestId });
   }
 
-  const admin = createClient(supabaseUrl, supabaseServiceKey);
-
-  const syncProfileCreditsBalance = async () => {
-    try {
-      const { data: creditsRow, error: creditsErr } = await admin
-        .from("user_credits")
-        .select("monthly_credits_per_cycle,monthly_credits_used,bonus_credits_total,bonus_credits_used")
-        .eq("user_id", user.id)
-        .maybeSingle();
-      if (creditsErr || !creditsRow) return;
-
-      const row = creditsRow as unknown as {
-        monthly_credits_per_cycle?: unknown;
-        monthly_credits_used?: unknown;
-        bonus_credits_total?: unknown;
-        bonus_credits_used?: unknown;
-      };
-
-      const monthlyPerCycle =
-        typeof row.monthly_credits_per_cycle === "number" ? row.monthly_credits_per_cycle : Number(row.monthly_credits_per_cycle);
-      const monthlyUsed = typeof row.monthly_credits_used === "number" ? row.monthly_credits_used : Number(row.monthly_credits_used);
-      const bonusTotal = typeof row.bonus_credits_total === "number" ? row.bonus_credits_total : Number(row.bonus_credits_total);
-      const bonusUsed = typeof row.bonus_credits_used === "number" ? row.bonus_credits_used : Number(row.bonus_credits_used);
-
-      if (![monthlyPerCycle, monthlyUsed, bonusTotal, bonusUsed].every((n) => Number.isFinite(n))) return;
-
-      const nextBalance = Math.max(monthlyPerCycle - monthlyUsed + (bonusTotal - bonusUsed), 0);
-      await admin.from("profiles").update({ credits_balance: nextBalance }).eq("user_id", user.id);
-    } catch {
-      return;
-    }
-  };
+  const admin = createClient(supabaseUrl, supabaseServiceKey) as SupabaseClientLike;
 
   if (mode === "preview") {
     const prompt = asString((requestBody as PreviewRequest).prompt) ?? "";
@@ -198,7 +239,26 @@ serve(async (req: Request) => {
       return json(400, { error: "Credit check failed", requestId, details: { reason } });
     }
 
-    await syncProfileCreditsBalance();
+    const parsedOk = parsedCredits as unknown as Record<string, unknown>;
+    const parsedTier = typeof parsedOk.tier === "string" ? parsedOk.tier : null;
+    const parsedUnlimited = typeof parsedOk.unlimited === "boolean" ? parsedOk.unlimited : false;
+    const parsedIdempotent = parsedOk.idempotent === true;
+    const creditsBackfilled =
+      parsedTier === "professional" &&
+      parsedUnlimited === true &&
+      !parsedIdempotent &&
+      !hasFiniteNumberField(parsedOk, "remaining_monthly") &&
+      !hasFiniteNumberField(parsedOk, "remaining_bonus")
+        ? await backfillProfessionalMonthlyUsage({ admin, userId: user.id, amount: 1 })
+        : null;
+
+    const credits = {
+      consumed: 1,
+      remaining_monthly: creditsBackfilled?.remaining_monthly ?? parsedCredits.remaining_monthly,
+      remaining_bonus: creditsBackfilled?.remaining_bonus ?? parsedCredits.remaining_bonus,
+      tier: creditsBackfilled?.tier ?? parsedCredits.tier,
+      unlimited: creditsBackfilled ? false : parsedCredits.unlimited,
+    };
 
     let veniceRes: Response;
     try {
@@ -221,7 +281,6 @@ serve(async (req: Request) => {
       } catch {
         void 0;
       }
-      await syncProfileCreditsBalance();
       return json(502, { error: "Failed to reach Venice API", requestId, details: e instanceof Error ? e.message : String(e) });
     }
 
@@ -237,7 +296,6 @@ serve(async (req: Request) => {
       } catch {
         void 0;
       }
-      await syncProfileCreditsBalance();
       return json(veniceRes.status, {
         error: "Venice image edit failed",
         requestId,
@@ -248,7 +306,7 @@ serve(async (req: Request) => {
     const mime = veniceRes.headers.get("content-type") ?? "image/png";
     const bytes = new Uint8Array(await veniceRes.arrayBuffer());
     const editedBase64 = bytesToBase64(bytes);
-    return json(200, { success: true, requestId, mime, edited_image_base64: editedBase64 });
+    return json(200, { success: true, requestId, credits, mime, edited_image_base64: editedBase64 });
   }
 
   const sceneId = asString((requestBody as CommitRequest).sceneId);

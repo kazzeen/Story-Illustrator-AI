@@ -1,5 +1,5 @@
 import { serve } from "https://deno.land/std@0.168.0/http/server.ts";
-import { createClient } from "https://esm.sh/@supabase/supabase-js@2.49.2";
+import { createClient, type SupabaseClientLike } from "https://esm.sh/@supabase/supabase-js@2.49.2";
 import {
   buildStoryStyleGuideGuidance,
   buildStyleGuidance,
@@ -87,6 +87,76 @@ async function sha256Hex(text: string): Promise<string> {
   const hashBuffer = await crypto.subtle.digest("SHA-256", data);
   const hashArray = Array.from(new Uint8Array(hashBuffer));
   return hashArray.map((b) => b.toString(16).padStart(2, "0")).join("");
+}
+
+function toFiniteNumber(value: unknown, fallback = 0) {
+  const n = typeof value === "number" ? value : typeof value === "string" ? Number(value) : NaN;
+  return Number.isFinite(n) ? n : fallback;
+}
+
+function hasFiniteNumberField(obj: Record<string, unknown>, key: string) {
+  return Number.isFinite(toFiniteNumber(obj[key], NaN));
+}
+
+async function backfillProfessionalMonthlyUsage(args: {
+  admin: SupabaseClientLike;
+  userId: string;
+  amount: number;
+}): Promise<{ remaining_monthly: number; remaining_bonus: number; tier: string } | null> {
+  const selectCols =
+    "tier,monthly_credits_per_cycle,monthly_credits_used,bonus_credits_total,bonus_credits_used,reserved_monthly,reserved_bonus";
+
+  const computeRemaining = (row: Record<string, unknown>) => {
+    const perCycle = toFiniteNumber(row.monthly_credits_per_cycle, 0);
+    const usedMonthly = toFiniteNumber(row.monthly_credits_used, 0);
+    const reservedMonthly = toFiniteNumber(row.reserved_monthly, 0);
+    const bonusTotal = toFiniteNumber(row.bonus_credits_total, 0);
+    const bonusUsed = toFiniteNumber(row.bonus_credits_used, 0);
+    const reservedBonus = toFiniteNumber(row.reserved_bonus, 0);
+    const remainingMonthly = Math.max(perCycle - usedMonthly - reservedMonthly, 0);
+    const remainingBonus = Math.max(bonusTotal - bonusUsed - reservedBonus, 0);
+    return { remainingMonthly, remainingBonus };
+  };
+
+  let lastRow: Record<string, unknown> | null = null;
+  for (let attempt = 0; attempt < 2; attempt += 1) {
+    const { data: row, error: rowErr } = await args.admin
+      .from("user_credits")
+      .select(selectCols)
+      .eq("user_id", args.userId)
+      .maybeSingle();
+    if (rowErr || !row) return null;
+
+    lastRow = row as unknown as Record<string, unknown>;
+    const currentUsed = toFiniteNumber(lastRow.monthly_credits_used, 0);
+    const nextUsed = currentUsed + args.amount;
+
+    const { data: updated, error: updErr } = await args.admin
+      .from("user_credits")
+      .update({ monthly_credits_used: nextUsed })
+      .eq("user_id", args.userId)
+      .eq("monthly_credits_used", currentUsed)
+      .select(selectCols)
+      .maybeSingle();
+
+    if (!updErr && updated) {
+      const updatedRec = updated as unknown as Record<string, unknown>;
+      const remaining = computeRemaining(updatedRec);
+      return {
+        remaining_monthly: remaining.remainingMonthly,
+        remaining_bonus: remaining.remainingBonus,
+        tier: typeof updatedRec.tier === "string" ? updatedRec.tier : "professional",
+      };
+    }
+  }
+
+  if (!lastRow) return null;
+  const remaining = computeRemaining(lastRow);
+  return {
+    remaining_monthly: remaining.remainingMonthly,
+    remaining_bonus: remaining.remainingBonus,
+    tier: typeof lastRow.tier === "string" ? lastRow.tier : "professional",
+  };
 }
 
 // Reuse truncate from shared if possible, or inline
@@ -234,18 +304,22 @@ serve(async (req: Request) => {
   if (req.method === "OPTIONS") return new Response(null, { headers: corsHeaders });
 
   const serverRequestId = crypto.randomUUID();
-  let requestId = serverRequestId;
-  let adminClient: ReturnType<typeof createClient> | null = null;
+  let requestId: string = String(serverRequestId);
+  let adminClient: SupabaseClientLike | null = null;
   let creditConsumed = false;
   let creditRefunded = false;
   let refundUserId: string | null = null;
   let refundCharacterId: string | null = null;
   let refundStoryId: string | null = null;
+  let creditsResult:
+    | { remaining_monthly?: number; remaining_bonus?: number; tier?: string; unlimited?: boolean }
+    | null = null;
   
   try {
     const supabaseUrl = Deno.env.get("SUPABASE_URL");
     const supabaseServiceKey = Deno.env.get("SUPABASE_SERVICE_ROLE_KEY");
-    const veniceApiKey = Deno.env.get("VENICE_API_KEY");
+    const veniceApiKeyRaw = Deno.env.get("VENICE_API_KEY");
+    const veniceApiKey = typeof veniceApiKeyRaw === "string" ? veniceApiKeyRaw.trim().replace(/^["']|["']$/g, "") : "";
 
     if (!supabaseUrl || !supabaseServiceKey || !veniceApiKey) {
       console.error("Missing environment variables");
@@ -266,7 +340,7 @@ serve(async (req: Request) => {
       requestId = clientRequestId;
     }
 
-    const admin = createClient(supabaseUrl, supabaseServiceKey);
+    const admin = createClient(supabaseUrl, supabaseServiceKey) as SupabaseClientLike;
     adminClient = admin;
 
     // Auth check
@@ -300,7 +374,8 @@ serve(async (req: Request) => {
       forceRegenerate,
     } = requestBody as Record<string, unknown>;
 
-    if (!characterId || !UUID_REGEX.test(characterId)) {
+    const characterIdValue = asString(characterId);
+    if (!characterIdValue || !UUID_REGEX.test(characterIdValue)) {
       return json(400, { error: "Valid characterId is required", requestId }, { "x-request-id": requestId });
     }
 
@@ -312,7 +387,7 @@ serve(async (req: Request) => {
     const { data: characterRow, error: characterError } = await admin
       .from("characters")
       .select("id, story_id, name, description, physical_attributes, clothing, accessories, stories!inner(user_id, art_style, consistency_settings, active_style_guide_id)")
-      .eq("id", characterId)
+      .eq("id", characterIdValue)
       .maybeSingle();
 
     if (characterError) {
@@ -332,7 +407,7 @@ serve(async (req: Request) => {
 
     const storyId = String(character.story_id);
     refundStoryId = storyId;
-    refundCharacterId = characterId;
+    refundCharacterId = characterIdValue;
     const characterName = String(character.name || "Character");
     const desc = String(character.description || "");
     const physical = String(character.physical_attributes || "");
@@ -570,39 +645,31 @@ serve(async (req: Request) => {
       );
     }
 
+    const creditOk = creditParsed as unknown as Record<string, unknown>;
+    const parsedTier = typeof creditOk.tier === "string" ? creditOk.tier : null;
+    const parsedUnlimited = typeof creditOk.unlimited === "boolean" ? creditOk.unlimited : false;
+    const parsedIdempotent = creditOk.idempotent === true;
+
     creditConsumed = true;
-
-    const syncProfileCreditsBalance = async () => {
-      try {
-        const { data: creditsRow, error: creditsErr } = await admin
-          .from("user_credits")
-          .select("monthly_credits_per_cycle,monthly_credits_used,bonus_credits_total,bonus_credits_used")
-          .eq("user_id", user.id)
-          .maybeSingle();
-        if (creditsErr || !creditsRow) return;
-
-        const row = creditsRow as unknown as {
-          monthly_credits_per_cycle?: unknown;
-          monthly_credits_used?: unknown;
-          bonus_credits_total?: unknown;
-          bonus_credits_used?: unknown;
-        };
-
-        const monthlyPerCycle = typeof row.monthly_credits_per_cycle === "number" ? row.monthly_credits_per_cycle : Number(row.monthly_credits_per_cycle);
-        const monthlyUsed = typeof row.monthly_credits_used === "number" ? row.monthly_credits_used : Number(row.monthly_credits_used);
-        const bonusTotal = typeof row.bonus_credits_total === "number" ? row.bonus_credits_total : Number(row.bonus_credits_total);
-        const bonusUsed = typeof row.bonus_credits_used === "number" ? row.bonus_credits_used : Number(row.bonus_credits_used);
-
-        if (![monthlyPerCycle, monthlyUsed, bonusTotal, bonusUsed].every((n) => Number.isFinite(n))) return;
-
-        const nextBalance = Math.max((monthlyPerCycle - monthlyUsed) + (bonusTotal - bonusUsed), 0);
-        await admin.from("profiles").update({ credits_balance: nextBalance }).eq("user_id", user.id);
-      } catch {
-        return;
-      }
-    };
-
-    await syncProfileCreditsBalance();
+    if (
+      parsedTier === "professional" &&
+      parsedUnlimited === true &&
+      !parsedIdempotent &&
+      !hasFiniteNumberField(creditOk, "remaining_monthly") &&
+      !hasFiniteNumberField(creditOk, "remaining_bonus")
+    ) {
+      const backfilled = await backfillProfessionalMonthlyUsage({ admin, userId: user.id, amount: 1 });
+      creditsResult = backfilled
+        ? { remaining_monthly: backfilled.remaining_monthly, remaining_bonus: backfilled.remaining_bonus, tier: backfilled.tier, unlimited: false }
+        : { remaining_monthly: creditParsed.remaining_monthly, remaining_bonus: creditParsed.remaining_bonus, tier: creditParsed.tier, unlimited: false };
+    } else {
+      creditsResult = {
+        remaining_monthly: creditParsed.remaining_monthly,
+        remaining_bonus: creditParsed.remaining_bonus,
+        tier: creditParsed.tier,
+        unlimited: creditParsed.unlimited,
+      };
+    }
     const refundIfNeeded = async (reason: string, details: unknown) => {
       if (creditRefunded) return;
       creditRefunded = true;
@@ -621,7 +688,6 @@ serve(async (req: Request) => {
         console.error("Credit refund error:", { requestId, refundError });
       } else {
         console.log("Credits refunded:", { requestId, refundData });
-        await syncProfileCreditsBalance();
       }
     };
 
@@ -805,8 +871,8 @@ serve(async (req: Request) => {
 
     const mime = detectImageMime(bytes);
     const ext = extFromMime(mime);
-    const fileName = `references/${user.id}/${characterId}/${Date.now()}-ref.${ext}`;
-    const file = new Blob([bytes], { type: mime });
+    const fileName = `references/${user.id}/${characterIdValue}/${Date.now()}-ref.${ext}`;
+    const file = new Blob([bytes as unknown as BlobPart], { type: mime });
 
     const tryUpload = async (bucket: string) => {
       try {
@@ -848,7 +914,7 @@ serve(async (req: Request) => {
     const { data: maxVersionRow } = await admin
       .from("character_reference_sheets")
       .select("version, id")
-      .eq("character_id", characterId)
+      .eq("character_id", characterIdValue)
       .order("version", { ascending: false })
       .limit(1)
       .maybeSingle();
@@ -860,7 +926,7 @@ serve(async (req: Request) => {
 
     const sheetInsertPayload = {
       story_id: storyId,
-      character_id: characterId,
+      character_id: characterIdValue,
       version: nextVersion,
       status: "approved",
       reference_image_url: publicUrl,
@@ -944,6 +1010,15 @@ serve(async (req: Request) => {
         attempts,
         model: selectedModel,
         promptHash,
+        credits: creditsResult
+          ? {
+              consumed: 1,
+              remaining_monthly: creditsResult.remaining_monthly,
+              remaining_bonus: creditsResult.remaining_bonus,
+              tier: creditsResult.tier,
+              unlimited: creditsResult.unlimited,
+            }
+          : undefined,
         style: {
           id: effectiveStyle,
           intensity: effectiveIntensity,

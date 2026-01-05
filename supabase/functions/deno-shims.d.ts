@@ -14,6 +14,7 @@ declare module "https://esm.sh/@supabase/supabase-js@2.49.2" {
     eq(...args: unknown[]): PostgrestBuilderLike;
     in(...args: unknown[]): PostgrestBuilderLike;
     not(...args: unknown[]): PostgrestBuilderLike;
+    contains(...args: unknown[]): PostgrestBuilderLike;
     lte(...args: unknown[]): PostgrestBuilderLike;
     order(...args: unknown[]): PostgrestBuilderLike;
     limit(...args: unknown[]): PostgrestBuilderLike;
@@ -31,6 +32,7 @@ declare module "https://esm.sh/@supabase/supabase-js@2.49.2" {
 
   type StorageBucketLike = {
     upload(...args: unknown[]): Promise<{ data?: any; error?: any }>;
+    remove(...args: unknown[]): Promise<{ data?: any; error?: any }>;
     getPublicUrl(...args: unknown[]): { data: { publicUrl: string } };
   };
 
@@ -42,7 +44,7 @@ declare module "https://esm.sh/@supabase/supabase-js@2.49.2" {
     getUser(...args: unknown[]): Promise<{ data: { user: any }; error: any }>;
   };
 
-  type SupabaseClientLike = {
+  export type SupabaseClientLike = {
     auth: AuthLike;
     from(table: string): PostgrestBuilderLike;
     storage: StorageLike;

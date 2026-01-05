@@ -185,7 +185,9 @@ serve(async (req: Request) => {
     const supabaseUrl = Deno.env.get("SUPABASE_URL")!;
     const supabaseServiceKey = Deno.env.get("SUPABASE_SERVICE_ROLE_KEY")!;
     const supabaseAnonKey = Deno.env.get("SUPABASE_ANON_KEY")!;
-    const veniceApiKey = Deno.env.get("VENICE_API_KEY")!;
+    const veniceApiKeyRaw = Deno.env.get("VENICE_API_KEY");
+    const veniceApiKey = typeof veniceApiKeyRaw === "string" ? veniceApiKeyRaw.trim().replace(/^["']|["']$/g, "") : "";
+    if (!veniceApiKey) return json(500, { error: "Configuration error" });
 
     // Validate user manually (since verify_jwt is disabled)
     const authClient = createClient(supabaseUrl, supabaseAnonKey, {

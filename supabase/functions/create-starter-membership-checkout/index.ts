@@ -1,5 +1,5 @@
 import { serve } from "https://deno.land/std@0.168.0/http/server.ts";
-import { createClient } from "https://esm.sh/@supabase/supabase-js@2.49.2";
+import { createClient, type SupabaseClientLike } from "https://esm.sh/@supabase/supabase-js@2.49.2";
 
 export const corsHeaders = {
   "Access-Control-Allow-Origin": "*",
@@ -210,7 +210,7 @@ serve(async (req: Request) => {
   if (!authHeader?.startsWith("Bearer ")) return json(401, { error: "Missing Authorization header" });
   const token = authHeader.slice("Bearer ".length);
 
-  const admin = createClient(supabaseUrl, supabaseServiceKey);
+  const admin = createClient(supabaseUrl, supabaseServiceKey) as SupabaseClientLike;
   const { data: userData, error: userErr } = await admin.auth.getUser(token);
   const user = userData?.user;
   if (userErr || !user) return json(401, { error: "Invalid or expired session" });

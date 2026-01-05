@@ -1,5 +1,5 @@
 import { serve } from "https://deno.land/std@0.168.0/http/server.ts";
-import { createClient } from "https://esm.sh/@supabase/supabase-js@2.49.2";
+import { createClient, type SupabaseClientLike } from "https://esm.sh/@supabase/supabase-js@2.49.2";
 
 const corsHeaders = {
   "Access-Control-Allow-Origin": "*",
@@ -33,11 +33,15 @@ function asInt(value: unknown): number | null {
 function computeRemaining(row: {
   monthly_credits_per_cycle: number;
   monthly_credits_used: number;
+  reserved_monthly?: number | null;
   bonus_credits_total: number;
   bonus_credits_used: number;
+  reserved_bonus?: number | null;
 }) {
-  const remainingMonthly = Math.max(row.monthly_credits_per_cycle - row.monthly_credits_used, 0);
-  const remainingBonus = Math.max(row.bonus_credits_total - row.bonus_credits_used, 0);
+  const reservedMonthly = typeof row.reserved_monthly === "number" ? row.reserved_monthly : 0;
+  const reservedBonus = typeof row.reserved_bonus === "number" ? row.reserved_bonus : 0;
+  const remainingMonthly = Math.max(row.monthly_credits_per_cycle - row.monthly_credits_used - reservedMonthly, 0);
+  const remainingBonus = Math.max(row.bonus_credits_total - row.bonus_credits_used - reservedBonus, 0);
   return { remainingMonthly, remainingBonus };
 }
 
@@ -56,7 +60,7 @@ serve(async (req: Request) => {
   const supabaseServiceKey = Deno.env.get("SUPABASE_SERVICE_ROLE_KEY");
   if (!supabaseUrl || !supabaseServiceKey) return json(500, { error: "Configuration error" });
 
-  const admin = createClient(supabaseUrl, supabaseServiceKey);
+  const admin = createClient(supabaseUrl, supabaseServiceKey) as SupabaseClientLike;
 
   const authHeader = req.headers.get("authorization") ?? req.headers.get("Authorization");
   if (!authHeader?.startsWith("Bearer ")) return json(401, { error: "Missing Authorization header" });
@@ -191,7 +195,7 @@ serve(async (req: Request) => {
   const { data: credits, error: creditsErr } = await admin
     .from("user_credits")
     .select(
-      "user_id,tier,monthly_credits_per_cycle,monthly_credits_used,bonus_credits_total,bonus_credits_used,cycle_start_at,cycle_end_at,cycle_source,stripe_customer_id,stripe_subscription_id,stripe_price_id",
+      "user_id,tier,monthly_credits_per_cycle,monthly_credits_used,reserved_monthly,bonus_credits_total,bonus_credits_used,reserved_bonus,cycle_start_at,cycle_end_at,cycle_source,stripe_customer_id,stripe_subscription_id,stripe_price_id",
     )
     .eq("user_id", user.id)
     .maybeSingle();
@@ -202,8 +206,10 @@ serve(async (req: Request) => {
   const remaining = computeRemaining(credits as unknown as {
     monthly_credits_per_cycle: number;
     monthly_credits_used: number;
+    reserved_monthly?: number | null;
     bonus_credits_total: number;
     bonus_credits_used: number;
+    reserved_bonus?: number | null;
   });
 
   const { data: transactions, error: txErr } = await admin

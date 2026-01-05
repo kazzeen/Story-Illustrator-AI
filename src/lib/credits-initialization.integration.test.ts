@@ -164,6 +164,96 @@ describe("credits initialization (integration)", () => {
     }
   });
 
+  test.skipIf(!enabled)("consume_credits updates profiles.credits_balance via sync trigger", async () => {
+    if (!supabase) throw new Error("Test client not initialized");
+    const { userId } = await createTestUser(supabase);
+    try {
+      await waitForUserCredits(supabase, userId);
+
+      const requestId = crypto.randomUUID();
+      const { data, error } = await rpc(supabase, "consume_credits", {
+        p_user_id: userId,
+        p_amount: 1,
+        p_description: "integration_test_profile_sync",
+        p_metadata: { feature: "credits-profile-sync" },
+        p_request_id: requestId,
+      });
+      if (error) throw error;
+      if (!data || typeof data !== "object") throw new Error("Unexpected consume_credits response");
+      expect((data as Record<string, unknown>).ok).toBe(true);
+
+      const { data: profile, error: profileErr } = await supabase
+        .from("profiles")
+        .select("credits_balance,subscription_tier")
+        .eq("user_id", userId)
+        .maybeSingle();
+      if (profileErr) throw profileErr;
+      if (!profile || typeof profile !== "object") throw new Error("Missing profile row");
+
+      expect((profile as Record<string, unknown>).credits_balance).toBe(4);
+      expect((profile as Record<string, unknown>).subscription_tier).toBe("free");
+    } finally {
+      await deleteTestUser(supabase, userId);
+    }
+  });
+
+  test.skipIf(!enabled)("consume_credits respects reserved credits", async () => {
+    if (!supabase) throw new Error("Test client not initialized");
+    const { userId } = await createTestUser(supabase);
+    try {
+      await waitForUserCredits(supabase, userId);
+
+      const reservationId = crypto.randomUUID();
+      const { data: reserved, error: reserveErr } = await rpc(supabase, "reserve_credits", {
+        p_user_id: userId,
+        p_amount: 5,
+        p_description: "integration_test_reservation",
+        p_metadata: { feature: "generate-scene-image" },
+        p_request_id: reservationId,
+      });
+      if (reserveErr) throw reserveErr;
+      if (!reserved || typeof reserved !== "object") throw new Error("Unexpected reserve_credits response");
+      expect((reserved as Record<string, unknown>).ok).toBe(true);
+
+      const requestId = crypto.randomUUID();
+      const { data: consumed, error: consumeErr } = await rpc(supabase, "consume_credits", {
+        p_user_id: userId,
+        p_amount: 1,
+        p_description: "integration_test_should_fail_due_to_reservation",
+        p_metadata: { feature: "reservation-block" },
+        p_request_id: requestId,
+      });
+      if (consumeErr) throw consumeErr;
+      if (!consumed || typeof consumed !== "object") throw new Error("Unexpected consume_credits response");
+      expect((consumed as Record<string, unknown>).ok).toBe(false);
+      expect((consumed as Record<string, unknown>).reason).toBe("insufficient_credits");
+
+      const { data: released, error: releaseErr } = await rpc(supabase, "release_reserved_credits", {
+        p_user_id: userId,
+        p_request_id: reservationId,
+        p_reason: "integration_test_release",
+        p_metadata: { feature: "reservation-release" },
+      });
+      if (releaseErr) throw releaseErr;
+      if (!released || typeof released !== "object") throw new Error("Unexpected release_reserved_credits response");
+      expect((released as Record<string, unknown>).ok).toBe(true);
+
+      const requestId2 = crypto.randomUUID();
+      const { data: consumed2, error: consumeErr2 } = await rpc(supabase, "consume_credits", {
+        p_user_id: userId,
+        p_amount: 1,
+        p_description: "integration_test_after_release",
+        p_metadata: { feature: "reservation-release" },
+        p_request_id: requestId2,
+      });
+      if (consumeErr2) throw consumeErr2;
+      if (!consumed2 || typeof consumed2 !== "object") throw new Error("Unexpected consume_credits response");
+      expect((consumed2 as Record<string, unknown>).ok).toBe(true);
+    } finally {
+      await deleteTestUser(supabase, userId);
+    }
+  });
+
   test.skipIf(!enabled)("refund_consumed_credits returns credits and is idempotent", async () => {
     if (!supabase) throw new Error("Test client not initialized");
     const { userId } = await createTestUser(supabase);

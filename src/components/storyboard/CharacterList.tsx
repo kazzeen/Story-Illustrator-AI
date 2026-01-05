@@ -270,6 +270,7 @@ export function CharacterList({ storyId, selectedArtStyle, selectedModel, styleI
           description: message,
           variant: "destructive",
         });
+        await refreshProfile();
       }
     } finally {
       setGeneratingCharacterById((prev) => {

@@ -1,5 +1,5 @@
 import { serve } from "https://deno.land/std@0.168.0/http/server.ts";
-import { createClient } from "https://esm.sh/@supabase/supabase-js@2.49.2";
+import { createClient, type SupabaseClientLike } from "https://esm.sh/@supabase/supabase-js@2.49.2";
 
 const corsHeaders = {
   "Access-Control-Allow-Origin": "*",
@@ -149,7 +149,7 @@ serve(async (req: Request) => {
   }
   if (!event?.id || !event?.type) return json(400, { error: "Invalid event shape" });
 
-  const admin = createClient(supabaseUrl, supabaseServiceKey);
+  const admin = createClient(supabaseUrl, supabaseServiceKey) as SupabaseClientLike;
 
   const { error: dedupeErr } = await admin.from("stripe_webhook_events").insert({ event_id: event.id });
   if (dedupeErr) {

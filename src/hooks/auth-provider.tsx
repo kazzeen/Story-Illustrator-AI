@@ -1,4 +1,4 @@
-import { useState, useEffect, type ReactNode } from 'react';
+import { useCallback, useState, useEffect, type ReactNode } from 'react';
 import type { User, Session } from '@supabase/supabase-js';
 import { supabase } from '@/integrations/supabase/client';
 import { AuthContext, type AuthContextType, type UserProfile } from './auth-context';
@@ -8,6 +8,62 @@ export function AuthProvider({ children }: { children: ReactNode }) {
   const [session, setSession] = useState<Session | null>(null);
   const [loading, setLoading] = useState(true);
   const [profile, setProfile] = useState<UserProfile>(null);
+
+  const applyCreditsFromUserCredits = useCallback(
+    (row: unknown, existingProfile: UserProfile) => {
+      if (!row || typeof row !== "object" || Array.isArray(row)) return false;
+      const rec = row as Record<string, unknown>;
+
+      const tierRaw = typeof rec.tier === "string" ? rec.tier.trim() : "";
+      const nextSubscriptionTier = tierRaw ? (tierRaw === "basic" ? "free" : tierRaw) : null;
+
+      const monthlyPerCycle = typeof rec.monthly_credits_per_cycle === "number" ? rec.monthly_credits_per_cycle : Number(rec.monthly_credits_per_cycle);
+      const monthlyUsed = typeof rec.monthly_credits_used === "number" ? rec.monthly_credits_used : Number(rec.monthly_credits_used);
+      const reservedMonthly = typeof rec.reserved_monthly === "number" ? rec.reserved_monthly : Number(rec.reserved_monthly ?? 0);
+      const bonusTotal = typeof rec.bonus_credits_total === "number" ? rec.bonus_credits_total : Number(rec.bonus_credits_total);
+      const bonusUsed = typeof rec.bonus_credits_used === "number" ? rec.bonus_credits_used : Number(rec.bonus_credits_used);
+      const reservedBonus = typeof rec.reserved_bonus === "number" ? rec.reserved_bonus : Number(rec.reserved_bonus ?? 0);
+
+      if (
+        Number.isFinite(monthlyPerCycle) &&
+        Number.isFinite(monthlyUsed) &&
+        Number.isFinite(reservedMonthly) &&
+        Number.isFinite(bonusTotal) &&
+        Number.isFinite(bonusUsed) &&
+        Number.isFinite(reservedBonus)
+      ) {
+        const remainingMonthly = Math.max(monthlyPerCycle - monthlyUsed - reservedMonthly, 0);
+        const remainingBonus = Math.max(bonusTotal - bonusUsed - reservedBonus, 0);
+        const nextBalance = Math.max(remainingMonthly + remainingBonus, 0);
+
+        setProfile((prev) => {
+          const base = prev ?? existingProfile;
+          if (!base) return prev;
+          if (
+            base.credits_balance === nextBalance &&
+            (nextSubscriptionTier ? base.subscription_tier === nextSubscriptionTier : true)
+          ) {
+            return base;
+          }
+          return { ...base, credits_balance: nextBalance, subscription_tier: nextSubscriptionTier ?? base.subscription_tier };
+        });
+        return true;
+      }
+
+      if (nextSubscriptionTier) {
+        setProfile((prev) => {
+          const base = prev ?? existingProfile;
+          if (!base) return prev;
+          if (base.subscription_tier === nextSubscriptionTier) return base;
+          return { ...base, subscription_tier: nextSubscriptionTier };
+        });
+        return true;
+      }
+
+      return false;
+    },
+    [],
+  );
 
   const isMissingProfileError = (error: unknown) => {
     if (!error || typeof error !== "object") return false;
@@ -20,7 +76,7 @@ export function AuthProvider({ children }: { children: ReactNode }) {
     return combined.includes("0 rows") || combined.includes("no rows") || combined.includes("results contain 0 rows");
   };
 
-  const refreshCreditsBalance = async (_userId: string, existingProfile: UserProfile) => {
+  const refreshCreditsBalance = useCallback(async (_userId: string, existingProfile: UserProfile) => {
     try {
       const { data: sessionData } = await supabase.auth.getSession();
       const token = sessionData.session?.access_token;
@@ -54,7 +110,7 @@ export function AuthProvider({ children }: { children: ReactNode }) {
     } catch {
       return;
     }
-  };
+  }, []);
 
   const fetchProfile = async (authUser: User) => {
     const userId = authUser.id;
@@ -149,21 +205,72 @@ export function AuthProvider({ children }: { children: ReactNode }) {
   useEffect(() => {
     if (!user) return;
 
-    const channel = supabase
-      .channel(`credits:${user.id}`)
-      .on(
-        "postgres_changes",
-        { event: "*", schema: "public", table: "user_credits", filter: `user_id=eq.${user.id}` },
-        () => {
-          void refreshCreditsBalance(user.id, null);
-        },
-      )
-      .subscribe();
+    const channel = supabase.channel(`credits:${user.id}`);
+
+    channel.on(
+      "postgres_changes",
+      { event: "*", schema: "public", table: "profiles", filter: `user_id=eq.${user.id}` },
+      (payload) => {
+        const next = payload?.new as Record<string, unknown> | null | undefined;
+        const nextCredits = typeof next?.credits_balance === "number" ? next.credits_balance : null;
+        const nextTier = typeof next?.subscription_tier === "string" ? next.subscription_tier : null;
+
+        if (nextCredits !== null || nextTier !== null) {
+          setProfile((prev) => {
+            if (!prev) return prev;
+            if (nextCredits !== null && prev.credits_balance !== nextCredits) {
+              return { ...prev, credits_balance: nextCredits, subscription_tier: nextTier ?? prev.subscription_tier };
+            }
+            if (nextTier !== null && prev.subscription_tier !== nextTier) {
+              return { ...prev, subscription_tier: nextTier };
+            }
+            return prev;
+          });
+        }
+
+        void refreshCreditsBalance(user.id, null);
+      },
+    );
+
+    channel.on(
+      "postgres_changes",
+      { event: "*", schema: "public", table: "user_credits", filter: `user_id=eq.${user.id}` },
+      (payload) => {
+        const applied = applyCreditsFromUserCredits(payload?.new, null);
+        if (!applied) void refreshCreditsBalance(user.id, null);
+      },
+    );
+
+    channel.subscribe();
 
     return () => {
       void supabase.removeChannel(channel);
     };
-  }, [user?.id]);
+  }, [applyCreditsFromUserCredits, refreshCreditsBalance, user?.id]);
+
+  useEffect(() => {
+    if (!user) return;
+
+    const onFocus = () => {
+      void refreshCreditsBalance(user.id, profile);
+    };
+    const onVisibility = () => {
+      if (document.visibilityState === "visible") void refreshCreditsBalance(user.id, profile);
+    };
+
+    window.addEventListener("focus", onFocus);
+    document.addEventListener("visibilitychange", onVisibility);
+
+    const interval = window.setInterval(() => {
+      void refreshCreditsBalance(user.id, profile);
+    }, 30000);
+
+    return () => {
+      window.removeEventListener("focus", onFocus);
+      document.removeEventListener("visibilitychange", onVisibility);
+      window.clearInterval(interval);
+    };
+  }, [profile, refreshCreditsBalance, user]);
 
   const refreshProfile = async () => {
     if (user) {

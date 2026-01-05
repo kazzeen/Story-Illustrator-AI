@@ -1,5 +1,5 @@
 import { serve } from "https://deno.land/std@0.168.0/http/server.ts";
-import { createClient } from "https://esm.sh/@supabase/supabase-js@2.49.2";
+import { createClient, type SupabaseClientLike } from "https://esm.sh/@supabase/supabase-js@2.49.2";
 import { encode as encodeBase64 } from "https://deno.land/std@0.168.0/encoding/base64.ts";
 import { Image } from "https://deno.land/x/imagescript@1.3.0/mod.ts";
 import { ensureClothingColors, validateClothingColorCoverage } from "../_shared/clothing-colors.ts";
@@ -198,6 +198,76 @@ async function sha256Hex(text: string): Promise<string> {
   return hashArray.map((b) => b.toString(16).padStart(2, "0")).join("");
 }
 
+function toFiniteNumber(value: unknown, fallback = 0) {
+  const n = typeof value === "number" ? value : typeof value === "string" ? Number(value) : NaN;
+  return Number.isFinite(n) ? n : fallback;
+}
+
+function hasFiniteNumberField(obj: Record<string, unknown>, key: string) {
+  return Number.isFinite(toFiniteNumber(obj[key], NaN));
+}
+
+async function backfillProfessionalMonthlyUsage(args: {
+  admin: SupabaseClientLike;
+  userId: string;
+  amount: number;
+}): Promise<{ remaining_monthly: number; remaining_bonus: number; tier: string } | null> {
+  const selectCols =
+    "tier,monthly_credits_per_cycle,monthly_credits_used,bonus_credits_total,bonus_credits_used,reserved_monthly,reserved_bonus";
+
+  const computeRemaining = (row: Record<string, unknown>) => {
+    const perCycle = toFiniteNumber(row.monthly_credits_per_cycle, 0);
+    const usedMonthly = toFiniteNumber(row.monthly_credits_used, 0);
+    const reservedMonthly = toFiniteNumber(row.reserved_monthly, 0);
+    const bonusTotal = toFiniteNumber(row.bonus_credits_total, 0);
+    const bonusUsed = toFiniteNumber(row.bonus_credits_used, 0);
+    const reservedBonus = toFiniteNumber(row.reserved_bonus, 0);
+    const remainingMonthly = Math.max(perCycle - usedMonthly - reservedMonthly, 0);
+    const remainingBonus = Math.max(bonusTotal - bonusUsed - reservedBonus, 0);
+    return { remainingMonthly, remainingBonus };
+  };
+
+  let lastRow: Record<string, unknown> | null = null;
+  for (let attempt = 0; attempt < 2; attempt += 1) {
+    const { data: row, error: rowErr } = await args.admin
+      .from("user_credits")
+      .select(selectCols)
+      .eq("user_id", args.userId)
+      .maybeSingle();
+    if (rowErr || !row) return null;
+
+    lastRow = row as unknown as Record<string, unknown>;
+    const currentUsed = toFiniteNumber((lastRow as Record<string, unknown>).monthly_credits_used, 0);
+    const nextUsed = currentUsed + args.amount;
+
+    const { data: updated, error: updErr } = await args.admin
+      .from("user_credits")
+      .update({ monthly_credits_used: nextUsed })
+      .eq("user_id", args.userId)
+      .eq("monthly_credits_used", currentUsed)
+      .select(selectCols)
+      .maybeSingle();
+
+    if (!updErr && updated) {
+      const updatedRec = updated as unknown as Record<string, unknown>;
+      const remaining = computeRemaining(updatedRec);
+      return {
+        remaining_monthly: remaining.remainingMonthly,
+        remaining_bonus: remaining.remainingBonus,
+        tier: typeof updatedRec.tier === "string" ? updatedRec.tier : "professional",
+      };
+    }
+  }
+
+  if (!lastRow) return null;
+  const remaining = computeRemaining(lastRow);
+  return {
+    remaining_monthly: remaining.remainingMonthly,
+    remaining_bonus: remaining.remainingBonus,
+    tier: typeof lastRow.tier === "string" ? lastRow.tier : "professional",
+  };
+}
+
 const CHARACTER_IMAGE_REFERENCE_MAX_SIDE = 512;
 const CHARACTER_IMAGE_REFERENCE_JPEG_QUALITY = 85;
 const CHARACTER_IMAGE_REFERENCE_CACHE_TTL_MS = 6 * 60 * 60 * 1000;
@@ -273,7 +343,15 @@ async function prepareCharacterReferenceImage(args: { url: string; timeoutMs: nu
     throw new Error(`Unsupported image type: ${contentType || "unknown"}`);
   }
 
-  const decoded = await Image.decode(bytes);
+  const ImageLib = Image as unknown as {
+    decode: (bytes: Uint8Array) => Promise<{
+      width: number;
+      height: number;
+      resize: (width: number, height: number) => void;
+      encodeJPEG: (quality?: number) => Promise<Uint8Array>;
+    }>;
+  };
+  const decoded = await ImageLib.decode(bytes);
   const iw = decoded.width;
   const ih = decoded.height;
   const maxSide = Math.max(iw, ih);
@@ -411,7 +489,7 @@ async function describeCharactersFromReferenceImages(args: {
 }
 
 async function fetchCharacterReferenceInputs(args: {
-  admin: ReturnType<typeof createClient>;
+  admin: SupabaseClientLike;
   storyId: string;
   characterNames: string[];
   requestId: string;
@@ -1031,7 +1109,7 @@ serve(async (req: Request) => {
   if (req.method === "OPTIONS") return new Response(null, { headers: corsHeaders });
 
   const requestId = crypto.randomUUID();
-  let admin: ReturnType<typeof createClient> | null = null;
+  let admin: SupabaseClientLike | null = null;
   let currentSceneRow: SceneRow | null = null;
   let requestedSceneId: string | null = null;
   let creditsConsumed = false;
@@ -1096,20 +1174,22 @@ serve(async (req: Request) => {
           .filter(Boolean)
           .slice(0, 48)
       : [];
-    const veniceApiKey = Deno.env.get("VENICE_API_KEY") ?? "";
+    const veniceApiKeyRaw = Deno.env.get("VENICE_API_KEY");
+    const veniceApiKey =
+      typeof veniceApiKeyRaw === "string" ? veniceApiKeyRaw.trim().replace(/^["']|["']$/g, "") : "";
     const geminiApiKeyRaw = Deno.env.get("GEMINI_API_KEY");
     const geminiApiKey = typeof geminiApiKeyRaw === "string" ? geminiApiKeyRaw.trim() : "";
     const isPromptOnly = typeof promptOnly === "boolean" ? promptOnly : false;
     const forceFullPromptText = asString(forceFullPrompt);
 
     if (!resetFlag) {
-      if (!veniceApiKey.trim() && !geminiApiKey.trim()) {
+      if (!veniceApiKey && !geminiApiKey) {
         console.error("Missing upstream API keys");
         return json(500, { error: "Configuration error", requestId, details: "Missing VENICE_API_KEY and GEMINI_API_KEY" });
       }
     }
 
-    admin = createClient(supabaseUrl, supabaseServiceKey);
+    admin = createClient(supabaseUrl, supabaseServiceKey) as SupabaseClientLike;
 
     const authHeader = req.headers.get("Authorization");
     if (!authHeader) return json(401, { error: "Missing authorization header", requestId });
@@ -1125,37 +1205,6 @@ serve(async (req: Request) => {
     }
 
     userId = user.id;
-
-    const syncProfileCreditsBalance = async () => {
-      try {
-        const { data: creditsRow, error: creditsErr } = await admin!
-          .from("user_credits")
-          .select("monthly_credits_per_cycle,monthly_credits_used,bonus_credits_total,bonus_credits_used")
-          .eq("user_id", user.id)
-          .maybeSingle();
-        if (creditsErr || !creditsRow) return;
-
-        const row = creditsRow as unknown as {
-          monthly_credits_per_cycle?: unknown;
-          monthly_credits_used?: unknown;
-          bonus_credits_total?: unknown;
-          bonus_credits_used?: unknown;
-        };
-
-        const monthlyPerCycle =
-          typeof row.monthly_credits_per_cycle === "number" ? row.monthly_credits_per_cycle : Number(row.monthly_credits_per_cycle);
-        const monthlyUsed = typeof row.monthly_credits_used === "number" ? row.monthly_credits_used : Number(row.monthly_credits_used);
-        const bonusTotal = typeof row.bonus_credits_total === "number" ? row.bonus_credits_total : Number(row.bonus_credits_total);
-        const bonusUsed = typeof row.bonus_credits_used === "number" ? row.bonus_credits_used : Number(row.bonus_credits_used);
-
-        if (![monthlyPerCycle, monthlyUsed, bonusTotal, bonusUsed].every((n) => Number.isFinite(n))) return;
-
-        const nextBalance = Math.max(monthlyPerCycle - monthlyUsed + (bonusTotal - bonusUsed), 0);
-        await admin!.from("profiles").update({ credits_balance: nextBalance }).eq("user_id", user.id);
-      } catch {
-        return;
-      }
-    };
 
     const refundIfNeeded = async (reason: string, extraMetadata?: Record<string, unknown>) => {
       if (!admin || !creditsConsumed) return;
@@ -1176,7 +1225,6 @@ serve(async (req: Request) => {
       } catch {
         void 0;
       }
-      await syncProfileCreditsBalance();
     };
 
     // --- RESET LOGIC ---
@@ -1407,15 +1455,32 @@ serve(async (req: Request) => {
         return json(400, { error: "Credit check failed", requestId, details: { reason } });
       }
 
-      creditsResult = {
-        remaining_monthly: parsedCredits.remaining_monthly,
-        remaining_bonus: parsedCredits.remaining_bonus,
-        tier: parsedCredits.tier,
-        unlimited: parsedCredits.unlimited,
-      };
+      const parsedOk = parsedCredits as unknown as Record<string, unknown>;
+      const parsedTier = typeof parsedOk.tier === "string" ? parsedOk.tier : null;
+      const parsedUnlimited = typeof parsedOk.unlimited === "boolean" ? parsedOk.unlimited : false;
+      const parsedIdempotent = parsedOk.idempotent === true;
+
+      if (
+        parsedTier === "professional" &&
+        parsedUnlimited === true &&
+        !parsedIdempotent &&
+        !hasFiniteNumberField(parsedOk, "remaining_monthly") &&
+        !hasFiniteNumberField(parsedOk, "remaining_bonus")
+      ) {
+        const backfilled = await backfillProfessionalMonthlyUsage({ admin, userId: user.id, amount: 1 });
+        creditsResult = backfilled
+          ? { remaining_monthly: backfilled.remaining_monthly, remaining_bonus: backfilled.remaining_bonus, tier: backfilled.tier, unlimited: false }
+          : { remaining_monthly: parsedCredits.remaining_monthly, remaining_bonus: parsedCredits.remaining_bonus, tier: parsedCredits.tier, unlimited: false };
+      } else {
+        creditsResult = {
+          remaining_monthly: parsedCredits.remaining_monthly,
+          remaining_bonus: parsedCredits.remaining_bonus,
+          tier: parsedCredits.tier,
+          unlimited: parsedCredits.unlimited,
+        };
+      }
 
       creditsConsumed = true;
-      await syncProfileCreditsBalance();
       await admin.from("scenes").update({ generation_status: "generating" }).eq("id", sceneId);
       logTiming("status_update_generating");
     }
@@ -1992,7 +2057,7 @@ serve(async (req: Request) => {
       }
 
       try {
-        if (!veniceApiKey.trim()) {
+        if (!veniceApiKey) {
           return new Response(JSON.stringify({ error: "Venice API key not configured" }), { status: 500, statusText: "Venice Key Missing" });
         }
         const res = await fetchWithTimeout("https://api.venice.ai/api/v1/image/generate", {
@@ -2054,13 +2119,22 @@ serve(async (req: Request) => {
        const responseHeaders = collectResponseHeaders(aiResponse);
        const statusText = String(aiResponse.statusText ?? "");
        const body = typeof aiErrorText === "string" && aiErrorText.length > 0 ? truncateText(aiErrorText, 4000) : "No error details provided";
+       const isAuthFailure = aiResponse.status === 401 || aiResponse.status === 403;
        
        await admin.from("scenes").update({ generation_status: "error" }).eq("id", sceneId);
-       await refundIfNeeded("Scene image generation failed", { stage: "upstream_error", upstream_status: aiResponse.status });
+       await refundIfNeeded("Scene image generation failed", {
+         stage: isAuthFailure ? "upstream_auth" : "upstream_error",
+         upstream_status: aiResponse.status,
+       });
        return json(502, { 
-         error: `Upstream Generation Failed (${aiResponse.status})`, 
+         error: isAuthFailure ? "Upstream Authentication Failed" : `Upstream Generation Failed (${aiResponse.status})`, 
          requestId,
-         details: { statusText, upstream_error: body, headers: responseHeaders },
+         details: {
+           statusText,
+           upstream_error: body,
+           headers: responseHeaders,
+           hint: isAuthFailure ? "Verify VENICE_API_KEY is valid in Supabase secrets and redeploy the function." : undefined,
+         },
          model: actualModel
        });
     }

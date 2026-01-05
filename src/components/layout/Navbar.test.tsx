@@ -27,6 +27,7 @@ vi.mock("@/components/ui/dropdown-menu", () => ({
       {children}
     </button>
   ),
+  DropdownMenuSeparator: () => <div />,
 }));
 
 describe("Navbar", () => {
@@ -60,4 +61,3 @@ describe("Navbar", () => {
     expect(screen.getByText("Pro")).toBeTruthy();
   });
 });
-

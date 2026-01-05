@@ -313,7 +313,7 @@ export default function Storyboard() {
   };
 
   const applyCreditsFromResponse = (credits: unknown) => {
-    if (!credits || typeof credits !== "object" || Array.isArray(credits)) return;
+    if (!credits || typeof credits !== "object" || Array.isArray(credits)) return false;
     const c = credits as Record<string, unknown>;
     const unlimited = typeof c.unlimited === "boolean" ? c.unlimited : false;
 
@@ -326,12 +326,27 @@ export default function Storyboard() {
     if (Number.isFinite(remainingMonthly) && Number.isFinite(remainingBonus)) {
       const nextBalance = Math.max(remainingMonthly + remainingBonus, 0);
       applyProfilePatch({ credits_balance: nextBalance, ...(tier ? { subscription_tier: tier } : {}) });
-      return;
+      return true;
     }
 
     if (unlimited && tier) {
       applyProfilePatch({ subscription_tier: tier });
+      return true;
     }
+    return false;
+  };
+
+  const applyCreditsFromInvokeError = async (err: unknown) => {
+    const e = err as { context?: { body?: unknown } } | null;
+    const bodyObj = await parseInvokeBodyObject(e?.context?.body);
+    if (!bodyObj || typeof bodyObj !== "object" || Array.isArray(bodyObj)) return false;
+    const rec = bodyObj as Record<string, unknown>;
+    if (applyCreditsFromResponse(rec.credits)) return true;
+    const details = rec.details;
+    if (details && typeof details === "object" && !Array.isArray(details)) {
+      if (applyCreditsFromResponse(details)) return true;
+    }
+    return false;
   };
 
   const extractInvokeDebugInfo = async (error: unknown, preParsedBody?: unknown) => {
@@ -933,6 +948,8 @@ export default function Storyboard() {
       if (!rawResponse.ok) {
         const bodyObj = responseBody && typeof responseBody === "object" ? responseBody as Record<string, unknown> : null;
         const detailsObj = bodyObj?.details as Record<string, unknown> | undefined;
+        applyCreditsFromResponse(bodyObj?.credits);
+        applyCreditsFromResponse(detailsObj?.credits);
         
         // Merge headers from the body details if they exist (they might be richer)
         const bodyHeaders = detailsObj?.headers as Record<string, string> | undefined;
@@ -1092,6 +1109,7 @@ export default function Storyboard() {
 
       const ok = response?.success === true || Boolean(response?.imageUrl);
       if (!ok) {
+        applyCreditsFromResponse(response?.credits);
         const bodyHeaders = response?.headers as Record<string, string> | undefined;
         const finalHeaders = { ...responseHeaders, ...(bodyHeaders || {}) };
 
@@ -1331,6 +1349,7 @@ export default function Storyboard() {
     } catch (error) {
       console.error("Error generating image:", error);
       const message = error instanceof Error ? error.message : "Failed to generate image";
+      await applyCreditsFromInvokeError(error);
       recordSceneDebugInfo(sceneId, { timestamp: new Date(), error: message, requestParams });
       await hydrateSceneDebugFromDb(sceneId);
       setScenes((prev) =>
@@ -1366,6 +1385,7 @@ export default function Storyboard() {
         description: message,
         variant: "destructive",
       });
+      await refreshProfile();
     } finally {
       setGeneratingSceneId(null);
     }
@@ -1511,6 +1531,8 @@ export default function Storyboard() {
           if (!rawResponse.ok) {
             const bodyObj = responseBody && typeof responseBody === "object" ? responseBody as Record<string, unknown> : null;
             const detailsObj = bodyObj?.details as Record<string, unknown> | undefined;
+            applyCreditsFromResponse(bodyObj?.credits);
+            applyCreditsFromResponse(detailsObj?.credits);
             
             // Merge headers from the body details if they exist (they might be richer)
             const bodyHeaders = detailsObj?.headers as Record<string, string> | undefined;
@@ -1622,6 +1644,7 @@ export default function Storyboard() {
           const response = responseBody as GenerateSceneImageResponse | null;
           const ok = response?.success === true || Boolean(response?.imageUrl);
           if (!ok) {
+            applyCreditsFromResponse(response?.credits);
             const bodyHeaders = response?.headers as Record<string, string> | undefined;
             const finalHeaders = { ...responseHeaders, ...(bodyHeaders || {}) };
 
@@ -1814,6 +1837,7 @@ export default function Storyboard() {
           );
         } catch (error) {
           const message = error instanceof Error ? error.message : "Failed to generate image";
+          await applyCreditsFromInvokeError(error);
           recordSceneDebugInfo(scene.id, { timestamp: new Date(), error: message, requestParams });
           await hydrateSceneDebugFromDb(scene.id);
           console.error(`Error generating scene ${scene.id}:`, message);
