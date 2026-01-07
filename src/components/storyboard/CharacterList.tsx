@@ -19,7 +19,7 @@ import { ScrollArea } from "@/components/ui/scroll-area";
 import { Tooltip, TooltipContent, TooltipProvider, TooltipTrigger } from "@/components/ui/tooltip";
 import { useToast } from "@/hooks/use-toast";
 import { useAuth } from "@/hooks/useAuth";
-import { SUPABASE_KEY, SUPABASE_URL, supabase } from "@/integrations/supabase/client";
+import { supabase } from "@/integrations/supabase/client";
 import { extractDetailedError } from "@/lib/error-reporting";
 
 interface CharacterListProps {
@@ -138,10 +138,9 @@ export function CharacterList({ storyId, selectedArtStyle, selectedModel, styleI
         }
       };
 
-      const functionUrl = `${SUPABASE_URL.replace(/\/$/, "")}/functions/v1/generate-character-reference`;
-      const apikey = String(import.meta.env.VITE_SUPABASE_ANON_KEY ?? import.meta.env.VITE_SUPABASE_PUBLISHABLE_KEY ?? SUPABASE_KEY);
+      const functionUrl = `${import.meta.env.VITE_SUPABASE_URL ?? "https://placeholder.supabase.co"}/functions/v1/generate-character-reference`;
+      const apikey = String(import.meta.env.VITE_SUPABASE_PUBLISHABLE_KEY ?? "");
       const expectedStyleId = selectedArtStyle || "digital_illustration";
-      const requestId = crypto.randomUUID();
 
       const invokeGenerate = async (attempt: number) => {
         let rawResponse: Response;
@@ -155,7 +154,6 @@ export function CharacterList({ storyId, selectedArtStyle, selectedModel, styleI
             },
             body: JSON.stringify({
               characterId: char.id,
-              requestId,
               style: selectedArtStyle || "digital_illustration",
               styleIntensity,
               strictStyle,
@@ -260,17 +258,11 @@ export function CharacterList({ storyId, selectedArtStyle, selectedModel, styleI
             message = `Style application failed (${expectedStyleId}).`;
           }
         }
-        const status =
-          isRecord(lastError) && "_status" in lastError ? (typeof lastError._status === "number" ? (lastError._status as number) : null) : null;
-        if (status === 402) {
-          message = "Insufficient credits to generate a character image.";
-        }
         toast({
           title: "Generation failed",
           description: message,
           variant: "destructive",
         });
-        await refreshProfile();
       }
     } finally {
       setGeneratingCharacterById((prev) => {
@@ -351,11 +343,11 @@ export function CharacterList({ storyId, selectedArtStyle, selectedModel, styleI
         }
       };
 
-      const functionUrl = `${SUPABASE_URL.replace(/\/$/, "")}/functions/v1/generate-character-reference`;
-      const apikey = String(import.meta.env.VITE_SUPABASE_ANON_KEY ?? import.meta.env.VITE_SUPABASE_PUBLISHABLE_KEY ?? SUPABASE_KEY);
+      const functionUrl = `${import.meta.env.VITE_SUPABASE_URL ?? "https://placeholder.supabase.co"}/functions/v1/generate-character-reference`;
+      const apikey = String(import.meta.env.VITE_SUPABASE_PUBLISHABLE_KEY ?? "");
       const expectedStyleId = selectedArtStyle || "digital_illustration";
 
-      const invokeGenerate = async (char: Character, requestId: string, attempt: number) => {
+      const invokeGenerate = async (char: Character, attempt: number) => {
         let rawResponse: Response;
         try {
           rawResponse = await fetch(functionUrl, {
@@ -367,7 +359,6 @@ export function CharacterList({ storyId, selectedArtStyle, selectedModel, styleI
             },
             body: JSON.stringify({
               characterId: char.id,
-              requestId,
               style: selectedArtStyle || "digital_illustration",
               styleIntensity,
               strictStyle,
@@ -437,23 +428,19 @@ export function CharacterList({ storyId, selectedArtStyle, selectedModel, styleI
         throw new Error(message);
       };
 
-      let outOfCredits = false;
-
       // Process characters sequentially to avoid rate limits
       for (const char of characters) {
         try {
-          const requestId = crypto.randomUUID();
           let lastError: unknown = null;
           for (let attempt = 1; attempt <= 3; attempt++) {
             try {
-              await invokeGenerate(char, requestId, attempt);
+              await invokeGenerate(char, attempt);
               lastError = null;
               break;
             } catch (e) {
               lastError = e;
               const status =
                 isRecord(e) && "_status" in e ? (typeof e._status === "number" ? (e._status as number) : null) : null;
-              if (status === 402) break;
               if (attempt < 3 && status === 401) {
                 const refreshed = await tryRefresh();
                 if (refreshed) continue;
@@ -471,16 +458,6 @@ export function CharacterList({ storyId, selectedArtStyle, selectedModel, styleI
           successCount++;
         } catch (err) {
           console.error(`Failed to generate for ${char.name}:`, err);
-          const status =
-            isRecord(err) && "_status" in err ? (typeof err._status === "number" ? (err._status as number) : null) : null;
-          if (status === 402) {
-            outOfCredits = true;
-            toast({
-              title: "Insufficient credits",
-              description: "You don’t have enough credits to generate more character images.",
-              variant: "destructive",
-            });
-          }
           failCount++;
           failedNames.push(char.name);
           // We continue to the next character even if one fails
@@ -488,7 +465,6 @@ export function CharacterList({ storyId, selectedArtStyle, selectedModel, styleI
         
         // Small delay to be gentle on the API
         await sleep(250);
-        if (outOfCredits) break;
       }
 
       // Refresh character list to show new images

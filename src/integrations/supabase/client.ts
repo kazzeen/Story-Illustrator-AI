@@ -2,30 +2,13 @@
 import { createClient } from '@supabase/supabase-js';
 import type { Database } from './types';
 
-const getCleanEnv = (value: unknown) => {
-  const raw = typeof value === "string" ? value : "";
-  const trimmed = raw.trim();
-  if (
-    (trimmed.startsWith("\"") && trimmed.endsWith("\"")) ||
-    (trimmed.startsWith("'") && trimmed.endsWith("'"))
-  ) {
-    return trimmed.slice(1, -1).trim();
-  }
-  return trimmed;
-};
-
-const DEFAULT_SUPABASE_URL = "https://gaxmjxiqjirjeyemjcyc.supabase.co";
-const DEFAULT_SUPABASE_KEY = "sb_publishable_qwdJGiv5sj_wBMXyTJ48Sg_1KIB0dSr";
-
-export const SUPABASE_URL = getCleanEnv(import.meta.env.VITE_SUPABASE_URL) || DEFAULT_SUPABASE_URL;
-export const SUPABASE_KEY =
-  getCleanEnv(import.meta.env.VITE_SUPABASE_ANON_KEY ?? import.meta.env.VITE_SUPABASE_PUBLISHABLE_KEY) ||
-  DEFAULT_SUPABASE_KEY;
+const SUPABASE_URL = import.meta.env.VITE_SUPABASE_URL;
+const SUPABASE_PUBLISHABLE_KEY = import.meta.env.VITE_SUPABASE_PUBLISHABLE_KEY;
 
 // Import the supabase client like this:
 // import { supabase } from "@/integrations/supabase/client";
 
-export const supabase = createClient<Database>(SUPABASE_URL, SUPABASE_KEY, {
+export const supabase = createClient<Database>(SUPABASE_URL, SUPABASE_PUBLISHABLE_KEY, {
   auth: {
     storage: localStorage,
     persistSession: true,

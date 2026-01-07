@@ -8,26 +8,8 @@ import Pricing, { formatUsd } from "./Pricing";
 import { TooltipProvider } from "@/components/ui/tooltip";
 import type { ReactNode } from "react";
 
-const mocks = vi.hoisted(() => ({
-  authState: {
-    user: null as { id: string; email?: string | null } | null,
-    refreshProfile: vi.fn(async () => {}),
-  },
-  getSession: vi.fn(async () => ({ data: { session: { access_token: "token" } }, error: null })),
-}));
-
 vi.mock("@/components/layout/Layout", () => ({
   Layout: ({ children }: { children: ReactNode }) => <div>{children}</div>,
-}));
-
-vi.mock("@/hooks/useAuth", () => ({
-  useAuth: () => mocks.authState,
-}));
-
-vi.mock("@/integrations/supabase/client", () => ({
-  SUPABASE_URL: "https://example.supabase.co",
-  SUPABASE_KEY: "sb_publishable_test",
-  supabase: { auth: { getSession: mocks.getSession } },
 }));
 
 describe("Pricing toggle", () => {
@@ -99,53 +81,5 @@ describe("Pricing toggle", () => {
     expect(formatUsd(0.1, "en-US")).toBe("$0.10");
     expect(formatUsd(1, "en-US")).toBe("$1.00");
     expect(formatUsd(0.1, "de-DE")).toMatch(/0[,.]10/);
-  });
-
-  test("starts credit pack checkout for logged-in users", async () => {
-    mocks.authState.user = { id: "user-1", email: "test@example.com" };
-    const fetchMock = vi.fn(async () => ({
-      ok: true,
-      status: 200,
-      text: async () => JSON.stringify({ url: "https://stripe.example/checkout" }),
-    }));
-    vi.stubGlobal("fetch", fetchMock as unknown as typeof fetch);
-    const assignMock = vi.fn();
-    const originalLocation = window.location;
-    vi.stubGlobal(
-      "location",
-      {
-        origin: originalLocation.origin,
-        href: originalLocation.href,
-        assign: assignMock,
-      } as unknown as Location,
-    );
-
-    const user = userEvent.setup();
-    render(
-      <MemoryRouter>
-        <TooltipProvider>
-          <Pricing />
-        </TooltipProvider>
-      </MemoryRouter>,
-    );
-
-    const btn = await screen.findByRole("button", { name: /buy 50 credits/i });
-    await user.click(btn);
-
-    expect(fetchMock).toHaveBeenCalledTimes(1);
-    const [fetchUrl, fetchInit] = fetchMock.mock.calls[0] as unknown as [unknown, unknown];
-    expect(fetchUrl).toBe("https://example.supabase.co/functions/v1/create-credit-pack-checkout");
-    expect(fetchInit).toMatchObject({
-      method: "POST",
-      headers: {
-        Authorization: "Bearer token",
-        apikey: "sb_publishable_test",
-        "Content-Type": "application/json",
-      },
-    });
-    expect(assignMock).toHaveBeenCalledTimes(1);
-    expect(assignMock).toHaveBeenCalledWith("https://stripe.example/checkout");
-    vi.unstubAllGlobals();
-    mocks.authState.user = null;
   });
 });

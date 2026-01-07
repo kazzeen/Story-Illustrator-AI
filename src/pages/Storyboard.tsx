@@ -11,10 +11,10 @@ import { Card } from "@/components/ui/card";
 import { Label } from "@/components/ui/label";
 import { Slider } from "@/components/ui/slider";
 import { Switch } from "@/components/ui/switch";
-import { 
-  Download, 
-  Play, 
-  Wand2, 
+import {
+  Download,
+  Play,
+  Wand2,
   ChevronDown,
   BookOpen,
   Loader2,
@@ -46,11 +46,14 @@ import {
 import { useScenes, useStories, Scene, Story } from "@/hooks/useStories";
 import { useAuth } from "@/hooks/useAuth";
 import { useToast } from "@/hooks/use-toast";
-import { SUPABASE_KEY, SUPABASE_URL, supabase } from "@/integrations/supabase/client";
+import { supabase } from "@/integrations/supabase/client";
 import { Skeleton } from "@/components/ui/skeleton";
 import type { Json } from "@/integrations/supabase/types";
 import { buildAnchoredStoryHtmlDocument, buildStoryHtmlDocument, validateStoryHtmlDocument, validateStoryHtmlSceneCoverage } from "@/lib/story-html";
 import { StorySceneDragDropEditor, type StorySceneAnchors } from "@/components/storyboard/StorySceneDragDropEditor";
+
+import { validateGeneratedImage } from "@/lib/image-validation";
+import { reconcileFailedGenerationCredits } from "@/lib/credit-reconciliation";
 
 import { Tabs, TabsContent, TabsList, TabsTrigger } from "@/components/ui/tabs";
 import { CharacterList } from "@/components/storyboard/CharacterList";
@@ -60,11 +63,11 @@ import { Select, SelectContent, SelectItem, SelectTrigger, SelectValue } from "@
 export default function Storyboard() {
   const { storyId } = useParams();
   const navigate = useNavigate();
-  const { user, refreshProfile, applyProfilePatch } = useAuth();
+  const { user, refreshProfile } = useAuth();
   const { stories, deleteStory, updateStory, fetchStories } = useStories();
   const { scenes, loading: scenesLoading, fetchScenes, setScenes, updateScene, stopAllGeneration } = useScenes(storyId || null);
   const { toast } = useToast();
-  
+
   type BatchMode = "generate" | "regenerate";
 
   const [story, setStory] = useState<Story | null>(null);
@@ -72,7 +75,7 @@ export default function Storyboard() {
   const [generatingSceneId, setGeneratingSceneId] = useState<string | null>(null);
   const [selectedStyle, setSelectedStyle] = useState("cinematic");
   const [selectedModel, setSelectedModel] = useState("venice-sd35");
-  const [selectedResolution, setSelectedResolution] = useState<{width: number, height: number} | undefined>(undefined);
+  const [selectedResolution, setSelectedResolution] = useState<{ width: number, height: number } | undefined>(undefined);
   const [styleIntensity, setStyleIntensity] = useState(70);
   const [characterIdentityLock, setCharacterIdentityLock] = useState(true);
   const [characterAnchorStrength, setCharacterAnchorStrength] = useState(70);
@@ -277,7 +280,7 @@ export default function Storyboard() {
       if (typeof d === "string") return d;
       if (d && typeof d === "object" && !Array.isArray(d)) {
         const rec = d as Record<string, unknown>;
-        
+
         // Handle content violation details
         if (rec.suggestion) {
           return String(rec.suggestion);
@@ -312,48 +315,97 @@ export default function Storyboard() {
     return parts.join(" • ") || "Request failed";
   };
 
-  const applyCreditsFromResponse = (credits: unknown) => {
-    if (!credits || typeof credits !== "object" || Array.isArray(credits)) return false;
-    const c = credits as Record<string, unknown>;
-    const unlimited = typeof c.unlimited === "boolean" ? c.unlimited : false;
+  const UUID_REGEX = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
 
-    const tierRaw = typeof c.tier === "string" ? c.tier.trim() : "";
-    const tier = tierRaw ? (tierRaw === "basic" ? "free" : tierRaw) : null;
+  const applyCreditsFromResponse = useCallback(
+    (credits: unknown) => {
+      const rec = credits && typeof credits === "object" && !Array.isArray(credits) ? (credits as Record<string, unknown>) : null;
+      const hasRemainingMonthly = typeof rec?.remaining_monthly === "number";
+      const hasRemainingBonus = typeof rec?.remaining_bonus === "number";
+      if (!hasRemainingMonthly && !hasRemainingBonus) return;
+      void refreshProfile();
+    },
+    [refreshProfile],
+  );
 
-    const remainingMonthly = typeof c.remaining_monthly === "number" ? c.remaining_monthly : Number(c.remaining_monthly);
-    const remainingBonus = typeof c.remaining_bonus === "number" ? c.remaining_bonus : Number(c.remaining_bonus);
+  const refundConsumedCredits = async (args: {
+    requestId: string;
+    reason: string;
+    refresh?: boolean;
+    metadata?: Record<string, unknown>;
+  }) => {
+    // Moved to lib/credit-reconciliation.ts but kept here if other components use it locally?
+    // Actually, only used inside Storyboard.tsx for manual refund triggers (e.g. debug buttons)
+    // We can keep it or refactor. Let's keep it as a wrapper around the lib function or direct RPC call.
+    // The previous implementation was:
+    if (!user?.id) return null;
+    if (!args.requestId || !UUID_REGEX.test(args.requestId)) return null;
 
-    if (Number.isFinite(remainingMonthly) && Number.isFinite(remainingBonus)) {
-      const nextBalance = Math.max(remainingMonthly + remainingBonus, 0);
-      applyProfilePatch({ credits_balance: nextBalance, ...(tier ? { subscription_tier: tier } : {}) });
-      return true;
+    try {
+      const { data, error } = await supabase.rpc("refund_consumed_credits", {
+        p_user_id: user.id,
+        p_request_id: args.requestId,
+        p_reason: args.reason,
+        p_metadata: (args.metadata ?? {}) as Json,
+      });
+      if (error) return null;
+      applyCreditsFromResponse(data);
+      if (args.refresh !== false) await refreshProfile();
+      return data;
+    } catch {
+      return null;
     }
-
-    if (unlimited && tier) {
-      applyProfilePatch({ subscription_tier: tier });
-      return true;
-    }
-    return false;
   };
 
-  const applyCreditsFromInvokeError = async (err: unknown) => {
-    const e = err as { context?: { body?: unknown } } | null;
-    const bodyObj = await parseInvokeBodyObject(e?.context?.body);
-    if (!bodyObj || typeof bodyObj !== "object" || Array.isArray(bodyObj)) return false;
-    const rec = bodyObj as Record<string, unknown>;
-    if (applyCreditsFromResponse(rec.credits)) return true;
-    const details = rec.details;
-    if (details && typeof details === "object" && !Array.isArray(details)) {
-      if (applyCreditsFromResponse(details)) return true;
+  const releaseReservedCredits = async (args: {
+    requestId: string;
+    reason: string;
+    refresh?: boolean;
+    metadata?: Record<string, unknown>;
+  }) => {
+    if (!user?.id) return null;
+    if (!args.requestId || !UUID_REGEX.test(args.requestId)) return null;
+
+    try {
+      const { data, error } = await (supabase as unknown as {
+        rpc: (fn: string, args: Record<string, unknown>) => Promise<{ data: unknown; error: unknown }>;
+      }).rpc("release_reserved_credits", {
+        p_user_id: user.id,
+        p_request_id: args.requestId,
+        p_reason: args.reason,
+        p_metadata: (args.metadata ?? {}) as Json,
+      });
+      if (error) return null;
+      applyCreditsFromResponse(data);
+      if (args.refresh !== false) await refreshProfile();
+      return data;
+    } catch {
+      return null;
     }
-    return false;
+  };
+
+  const handleReconcileCredits = async (args: {
+    requestId: string;
+    reason: string;
+    refresh?: boolean;
+    metadata?: Record<string, unknown>;
+  }) => {
+    if (!user?.id) return null;
+    const result = await reconcileFailedGenerationCredits(supabase, {
+      requestId: args.requestId,
+      reason: args.reason,
+      metadata: args.metadata,
+      userId: user.id,
+    });
+    if (args.refresh !== false) await refreshProfile();
+    return result;
   };
 
   const extractInvokeDebugInfo = async (error: unknown, preParsedBody?: unknown) => {
     try {
       const e = error as { context?: { body?: unknown; status?: unknown } } | null;
       const bodyObj = preParsedBody !== undefined ? preParsedBody : await parseInvokeBodyObject(e?.context?.body);
-      
+
       if (bodyObj && typeof bodyObj === "object" && !Array.isArray(bodyObj)) {
         const rec = bodyObj as Record<string, unknown>;
         const detailsRaw = rec.details;
@@ -362,15 +414,15 @@ export default function Storyboard() {
             ? (detailsRaw as Record<string, unknown>)
             : typeof detailsRaw === "string"
               ? (() => {
-                  try {
-                    const parsed = JSON.parse(detailsRaw) as unknown;
-                    return parsed && typeof parsed === "object" && !Array.isArray(parsed)
-                      ? (parsed as Record<string, unknown>)
-                      : null;
-                  } catch {
-                    return null;
-                  }
-                })()
+                try {
+                  const parsed = JSON.parse(detailsRaw) as unknown;
+                  return parsed && typeof parsed === "object" && !Array.isArray(parsed)
+                    ? (parsed as Record<string, unknown>)
+                    : null;
+                } catch {
+                  return null;
+                }
+              })()
               : null;
 
         const headersObj =
@@ -379,14 +431,14 @@ export default function Storyboard() {
             : null;
         const headers = headersObj
           ? (() => {
-              const out: Record<string, string> = {};
-              for (const [k, v] of Object.entries(headersObj)) {
-                if (typeof v === "string" || typeof v === "number" || typeof v === "boolean") {
-                  out[String(k).toLowerCase()] = String(v);
-                }
+            const out: Record<string, string> = {};
+            for (const [k, v] of Object.entries(headersObj)) {
+              if (typeof v === "string" || typeof v === "number" || typeof v === "boolean") {
+                out[String(k).toLowerCase()] = String(v);
               }
-              return out;
-            })()
+            }
+            return out;
+          })()
           : undefined;
 
         const requestId = typeof rec.requestId === "string" ? rec.requestId : undefined;
@@ -498,7 +550,7 @@ export default function Storyboard() {
         rawDetails && typeof rawDetails === "object" && !Array.isArray(rawDetails)
           ? (rawDetails as Record<string, unknown>)
           : null;
-      
+
       const rawGen = details?.generation_debug;
       const parsedGen = parseJsonIfString(rawGen);
       const gen =
@@ -520,29 +572,29 @@ export default function Storyboard() {
         return;
       }
 
-      const prompt = 
-        typeof gen?.prompt === "string" ? gen.prompt : 
-        typeof gen?.prompt_used === "string" ? gen.prompt_used : 
-        typeof rootDetails?.prompt === "string" ? rootDetails.prompt :
-        typeof rootDetails?.prompt_used === "string" ? rootDetails.prompt_used :
-        undefined;
-        
+      const prompt =
+        typeof gen?.prompt === "string" ? gen.prompt :
+          typeof gen?.prompt_used === "string" ? gen.prompt_used :
+            typeof rootDetails?.prompt === "string" ? rootDetails.prompt :
+              typeof rootDetails?.prompt_used === "string" ? rootDetails.prompt_used :
+                undefined;
+
       const promptFull =
-        typeof gen?.prompt_full === "string" ? gen.prompt_full : 
-        typeof gen?.promptFull === "string" ? gen.promptFull : 
-        typeof rootDetails?.prompt_full === "string" ? rootDetails.prompt_full :
-        typeof rootDetails?.promptFull === "string" ? rootDetails.promptFull :
-        undefined;
+        typeof gen?.prompt_full === "string" ? gen.prompt_full :
+          typeof gen?.promptFull === "string" ? gen.promptFull :
+            typeof rootDetails?.prompt_full === "string" ? rootDetails.prompt_full :
+              typeof rootDetails?.promptFull === "string" ? rootDetails.promptFull :
+                undefined;
 
       const preprocessingSteps = Array.isArray(gen?.preprocessingSteps)
         ? (gen!.preprocessingSteps as unknown[]).filter((v): v is string => typeof v === "string")
         : undefined;
-      
-      const promptHash = 
-        typeof gen?.prompt_hash === "string" ? gen.prompt_hash : 
-        typeof gen?.promptHash === "string" ? gen.promptHash : 
-        undefined;
-        
+
+      const promptHash =
+        typeof gen?.prompt_hash === "string" ? gen.prompt_hash :
+          typeof gen?.promptHash === "string" ? gen.promptHash :
+            undefined;
+
       const model = typeof gen?.model === "string" ? gen.model : undefined;
       const requestId = typeof gen?.requestId === "string" ? gen.requestId : undefined;
       const stage = typeof gen?.stage === "string" ? gen.stage : undefined;
@@ -573,70 +625,8 @@ export default function Storyboard() {
     void hydrateSceneDebugFromDb(selectedScene.id);
   }, [hydrateSceneDebugFromDb, isModalOpen, selectedScene?.id]);
 
-  const validateGeneratedImage = async (url: string) => {
-    try {
-      const res = await fetch(url, { mode: "cors" });
-      if (!res.ok) {
-        return {
-          ok: false,
-          reason: `Failed to load generated image (HTTP ${res.status})`,
-          size: undefined as number | undefined,
-          mean: undefined as number | undefined,
-          std: undefined as number | undefined,
-        };
-      }
-
-      const blob = await res.blob();
-      const size = blob.size;
-      const bitmap = await createImageBitmap(blob);
-
-      const canvas = document.createElement("canvas");
-      const w = 64;
-      const h = 64;
-      canvas.width = w;
-      canvas.height = h;
-
-      const ctx = canvas.getContext("2d");
-      if (!ctx) {
-        bitmap.close();
-        return { ok: true, size, mean: undefined, std: undefined };
-      }
-
-      ctx.drawImage(bitmap, 0, 0, w, h);
-      bitmap.close();
-
-      const data = ctx.getImageData(0, 0, w, h).data;
-      let sum = 0;
-      let sumSq = 0;
-      let count = 0;
-
-      for (let i = 0; i < data.length; i += 16) {
-        const r = data[i] ?? 0;
-        const g = data[i + 1] ?? 0;
-        const b = data[i + 2] ?? 0;
-        const lum = 0.2126 * r + 0.7152 * g + 0.0722 * b;
-        sum += lum;
-        sumSq += lum * lum;
-        count += 1;
-      }
-
-      const mean = count > 0 ? sum / count : 0;
-      const variance = count > 0 ? sumSq / count - mean * mean : 0;
-      const std = Math.sqrt(Math.max(0, variance));
-      const blank = std < 2.5 && (mean < 6 || mean > 249);
-
-      return {
-        ok: !blank,
-        reason: blank ? `Generated image appears blank (mean=${mean.toFixed(1)}, std=${std.toFixed(1)})` : undefined,
-        size,
-        mean,
-        std,
-      };
-    } catch (e) {
-      const msg = e instanceof Error ? e.message : String(e);
-      return { ok: false, reason: `Failed to validate generated image: ${msg}`, size: undefined, mean: undefined, std: undefined };
-    }
-  };
+  // Remove internal implementation of validateGeneratedImage since we now import it
+  // validateGeneratedImage was previously defined here
 
   useEffect(() => {
     if (storyId && stories.length > 0) {
@@ -667,7 +657,7 @@ export default function Storyboard() {
         const intensityRaw = settings.style_intensity;
         const intensity = typeof intensityRaw === "number" ? intensityRaw : Number(intensityRaw);
         setStyleIntensity(Number.isFinite(intensity) ? Math.max(0, Math.min(100, intensity)) : 70);
-        
+
         const savedModel = settings.model;
         if (typeof savedModel === "string") {
           if (syncedStoryId !== storyId) {
@@ -756,15 +746,15 @@ export default function Storyboard() {
   const handleModelChange = async (modelId: string) => {
     if (storyId) localModelOverrideRef.current = { storyId, modelId };
     setSelectedModel(modelId);
-    
+
     // Set default resolution if supported
     const model = imageModels.find(m => m.id === modelId);
     if (model?.supportedResolutions && model.supportedResolutions.length > 0) {
-        setSelectedResolution({width: model.supportedResolutions[0].width, height: model.supportedResolutions[0].height});
+      setSelectedResolution({ width: model.supportedResolutions[0].width, height: model.supportedResolutions[0].height });
     } else {
-        setSelectedResolution(undefined);
+      setSelectedResolution(undefined);
     }
-    
+
     await updateConsistencySettings({ model: modelId });
   };
 
@@ -798,12 +788,12 @@ export default function Storyboard() {
 
   const handleDeleteStory = async () => {
     if (!storyToDelete) return;
-    
+
     setIsDeleting(true);
     const success = await deleteStory(storyToDelete.id);
     setIsDeleting(false);
     setStoryToDelete(null);
-    
+
     if (success) {
       toast({
         title: "Story deleted",
@@ -817,577 +807,260 @@ export default function Storyboard() {
     opts?: { artStyle?: string; styleIntensity?: number; strictStyle?: boolean; forceFullPrompt?: string },
   ) => {
     if (!user) {
-      toast({
-        title: "Sign in required",
-        description: "Please sign in to generate images",
-        variant: "destructive",
-      });
+      toast({ title: "Sign in required", description: "Please sign in to generate images", variant: "destructive" });
+      return;
+    }
+    if (!storyId) {
+      toast({ title: "Story unavailable", description: "Missing story id", variant: "destructive" });
       return;
     }
 
+    const sceneRow = scenes.find((s) => s.id === sceneId);
+    if (!sceneRow) {
+      toast({ title: "Scene unavailable", description: "Could not find that scene", variant: "destructive" });
+      return;
+    }
+
+    const artStyle = opts?.artStyle ?? selectedStyleRef.current;
+    const intensity = opts?.styleIntensity ?? styleIntensityRef.current;
+    const strictStyle = opts?.strictStyle ?? true;
+    const forceFullPrompt =
+      typeof opts?.forceFullPrompt === "string" && opts.forceFullPrompt.trim() ? opts.forceFullPrompt : undefined;
+    const disabledStyleElements = disabledStyleElementsByStyle[artStyle] ?? [];
+    const width = selectedResolution?.width;
+    const height = selectedResolution?.height;
+
+    const requestParams: Record<string, unknown> = {
+      sceneId,
+      storyId,
+      model: selectedModel,
+      artStyle,
+      styleIntensity: intensity,
+      strictStyle,
+      width,
+      height,
+      disabledStyleElements,
+      forceFullPrompt,
+      characterImageReferenceEnabled,
+    };
+
     setGeneratingSceneId(sceneId);
-    let requestParams: Record<string, unknown> | undefined;
+    setScenes((prev) => prev.map((s) => (s.id === sceneId ? { ...s, generation_status: "generating" } : s)));
+
+    let clientRequestId: string | null = null;
 
     try {
-      type GenerateSceneImageResponse = {
-        success?: boolean;
-        imageUrl?: string;
-        credits?: {
-          consumed?: number;
-          remaining_monthly?: number;
-          remaining_bonus?: number;
-          tier?: string;
-          unlimited?: boolean;
-        };
-        generationStatus?: string;
-        consistency?: unknown;
-        warnings?: string[];
-        headers?: Record<string, string>;
-        redactedHeaders?: string[];
-        requestId?: string;
-        stage?: string;
-        model?: string;
-        prompt?: string;
-        promptFull?: string;
-        preprocessingSteps?: string[];
-        promptHash?: string;
-        modelConfig?: unknown;
-        error?: string;
-        message?: string;
-        details?: string;
-      };
       const { data: { session } } = await supabase.auth.getSession();
-      
       if (!session) {
-        toast({
-          title: "Not authenticated",
-          description: "Please sign in to generate images",
-          variant: "destructive",
-        });
+        toast({ title: "Not authenticated", description: "Please sign in to generate images", variant: "destructive" });
         return;
       }
 
-      const artStyle = opts?.artStyle ?? selectedStyleRef.current;
-      const intensity = opts?.styleIntensity ?? styleIntensityRef.current;
-      const strictStyle = opts?.strictStyle ?? true;
-      const forceFullPrompt = typeof opts?.forceFullPrompt === "string" && opts.forceFullPrompt.trim() ? opts.forceFullPrompt : undefined;
-      const disabledStyleElements = disabledStyleElementsByStyle[artStyle] ?? [];
-      const width = selectedResolution?.width;
-      const height = selectedResolution?.height;
-
-      requestParams = {
-        model: selectedModel,
-        artStyle,
-        styleIntensity: intensity,
-        strictStyle,
-        width,
-        height,
-        disabledStyleElements,
-        forceFullPrompt,
-        characterImageReferenceEnabled,
-      };
-
-      // Use direct fetch to bypass supabase-js error wrapping that might obscure headers
-      const { data: { session: currentSession } } = await supabase.auth.getSession();
-      const token = currentSession?.access_token ?? session.access_token;
-      
-      const functionUrl = `${SUPABASE_URL.replace(/\/$/, "")}/functions/v1/generate-scene-image`;
-      
-      let rawResponse: Response;
-      try {
-        const apikey = (import.meta.env.VITE_SUPABASE_ANON_KEY ?? import.meta.env.VITE_SUPABASE_PUBLISHABLE_KEY ?? SUPABASE_KEY).trim();
-        if (!apikey) {
-          throw new Error("Missing VITE_SUPABASE_ANON_KEY or VITE_SUPABASE_PUBLISHABLE_KEY; cannot call Supabase Functions endpoint");
-        }
-        rawResponse = await fetch(functionUrl, {
-          method: "POST",
-          headers: {
-            "Authorization": `Bearer ${token}`,
-            "apikey": apikey,
-            "Content-Type": "application/json"
-          },
-          body: JSON.stringify({ 
-            sceneId, 
-            artStyle,
-            styleIntensity: intensity,
-            strictStyle,
-            model: selectedModel,
-            width,
-            height,
-            disabledStyleElements,
-            forceFullPrompt,
-            characterImageReferenceEnabled,
-          })
-        });
-      } catch (netError) {
-        throw new Error(`Network error: ${netError instanceof Error ? netError.message : String(netError)}`);
+      const supabaseUrl = (import.meta.env.VITE_SUPABASE_URL ?? "").trim();
+      if (!supabaseUrl) {
+        throw new Error("Missing VITE_SUPABASE_URL; cannot call Supabase Functions endpoint");
       }
 
-      // Extract all headers immediately
+      const apikey = (import.meta.env.VITE_SUPABASE_PUBLISHABLE_KEY ?? "").trim();
+      if (!apikey) {
+        throw new Error("Missing VITE_SUPABASE_PUBLISHABLE_KEY; cannot call Supabase Functions endpoint");
+      }
+
+      clientRequestId = typeof crypto !== "undefined" && typeof crypto.randomUUID === "function" ? crypto.randomUUID() : null;
+      const functionUrl = `${supabaseUrl.replace(/\/$/, "")}/functions/v1/generate-scene-image`;
+
+      const rawResponse = await fetch(functionUrl, {
+        method: "POST",
+        headers: {
+          Authorization: `Bearer ${session.access_token}`,
+          apikey,
+          "Content-Type": "application/json",
+        },
+        body: JSON.stringify({
+          sceneId,
+          clientRequestId: clientRequestId ?? undefined,
+          artStyle,
+          styleIntensity: intensity,
+          strictStyle,
+          model: selectedModel,
+          width,
+          height,
+          disabledStyleElements,
+          forceFullPrompt,
+          characterImageReferenceEnabled,
+        }),
+      });
+
       const responseHeaders: Record<string, string> = {};
       rawResponse.headers.forEach((value, key) => {
         responseHeaders[key.toLowerCase()] = value;
       });
 
-      const responseStatus = rawResponse.status;
-      const responseStatusText = rawResponse.statusText;
-      
+      const text = await rawResponse.text();
       let responseBody: unknown;
       try {
-        const text = await rawResponse.text();
-        try {
-          responseBody = JSON.parse(text);
-        } catch {
-          responseBody = text;
-        }
+        responseBody = JSON.parse(text);
       } catch {
-        responseBody = null;
+        responseBody = text;
       }
 
-      // Handle non-200 responses
+      const pickFirstUuid = (...candidates: Array<unknown>) => {
+        for (const c of candidates) {
+          if (typeof c === "string" && UUID_REGEX.test(c)) return c;
+        }
+        return undefined;
+      };
+
       if (!rawResponse.ok) {
-        const bodyObj = responseBody && typeof responseBody === "object" ? responseBody as Record<string, unknown> : null;
-        const detailsObj = bodyObj?.details as Record<string, unknown> | undefined;
+        const bodyObj = responseBody && typeof responseBody === "object" ? (responseBody as Record<string, unknown>) : null;
+        const detailsObj = bodyObj?.details && typeof bodyObj.details === "object" ? (bodyObj.details as Record<string, unknown>) : null;
+
         applyCreditsFromResponse(bodyObj?.credits);
         applyCreditsFromResponse(detailsObj?.credits);
-        
-        // Merge headers from the body details if they exist (they might be richer)
-        const bodyHeaders = detailsObj?.headers as Record<string, string> | undefined;
-        const finalHeaders = { ...responseHeaders, ...(bodyHeaders || {}) };
-        
-        const reasons = Array.isArray(detailsObj?.reasons) ? detailsObj.reasons as string[] : undefined;
-        const upstreamError = detailsObj?.upstream_error as string | undefined;
-        const redactedHeaders = Array.isArray(detailsObj?.redactedHeaders) ? detailsObj.redactedHeaders as string[] : undefined;
-        const prompt =
-          typeof detailsObj?.prompt === "string"
-            ? detailsObj.prompt
-            : typeof (detailsObj as Record<string, unknown> | undefined)?.prompt_used === "string"
-              ? ((detailsObj as Record<string, unknown>).prompt_used as string)
-              : typeof bodyObj?.prompt === "string"
-                ? (bodyObj.prompt as string)
-                : typeof (bodyObj as Record<string, unknown> | null)?.prompt_used === "string"
-                  ? ((bodyObj as Record<string, unknown>).prompt_used as string)
-                  : undefined;
-        const promptFull =
-          typeof (detailsObj as Record<string, unknown> | undefined)?.prompt_full === "string"
-            ? ((detailsObj as Record<string, unknown>).prompt_full as string)
-            : typeof (detailsObj as Record<string, unknown> | undefined)?.promptFull === "string"
-              ? ((detailsObj as Record<string, unknown>).promptFull as string)
-              : typeof (bodyObj as Record<string, unknown> | null)?.promptFull === "string"
-                ? ((bodyObj as Record<string, unknown>).promptFull as string)
-                : typeof (bodyObj as Record<string, unknown> | null)?.prompt_full === "string"
-                  ? ((bodyObj as Record<string, unknown>).prompt_full as string)
-                  : undefined;
-        const preprocessingSteps =
-          Array.isArray((detailsObj as Record<string, unknown> | undefined)?.preprocessingSteps)
-            ? ((detailsObj as Record<string, unknown>).preprocessingSteps as unknown[]).filter((v): v is string => typeof v === "string")
-            : Array.isArray((bodyObj as Record<string, unknown> | null)?.preprocessingSteps)
-              ? (((bodyObj as Record<string, unknown>).preprocessingSteps as unknown[]) || []).filter((v): v is string => typeof v === "string")
-              : undefined;
-        const model = typeof bodyObj?.model === "string" ? (bodyObj.model as string) : undefined;
-        const promptHash =
-          typeof (detailsObj as Record<string, unknown> | undefined)?.prompt_hash === "string"
-            ? ((detailsObj as Record<string, unknown>).prompt_hash as string)
-            : typeof (bodyObj as Record<string, unknown> | null)?.promptHash === "string"
-              ? ((bodyObj as Record<string, unknown>).promptHash as string)
-              : typeof (bodyObj as Record<string, unknown> | null)?.prompt_hash === "string"
-                ? ((bodyObj as Record<string, unknown>).prompt_hash as string)
-                : undefined;
-        
-        const requestId =
-          typeof bodyObj?.requestId === "string"
-            ? (bodyObj.requestId as string)
-            : typeof responseHeaders["x-request-id"] === "string"
-              ? responseHeaders["x-request-id"]
-              : undefined;
-        const stage = typeof bodyObj?.stage === "string" ? (bodyObj.stage as string) : undefined;
-        const details =
-          typeof bodyObj?.details === "string"
-            ? (bodyObj.details as string)
-            : bodyObj?.details && typeof bodyObj.details === "object"
-              ? (bodyObj.details as Record<string, unknown>)
-              : undefined;
-        const detailMessage =
-          details && typeof details === "object" && typeof (details as Record<string, unknown>).message === "string"
-            ? String((details as Record<string, unknown>).message)
-            : undefined;
-        const detailText = typeof details === "string" ? details : undefined;
-        let errorMsg = String(bodyObj?.error || `HTTP ${responseStatus} ${responseStatusText}`);
-        if (errorMsg === "Internal Server Error" && detailMessage) {
-          errorMsg = `${errorMsg}: ${detailMessage}`;
-        }
-        if (detailText && !errorMsg.toLowerCase().includes(detailText.toLowerCase())) {
-          errorMsg = `${errorMsg}: ${detailText}`;
-        }
-        if (upstreamError && typeof upstreamError === "string") {
-          const snippet = upstreamError.length > 600 ? `${upstreamError.slice(0, 600)}…` : upstreamError;
-          if (snippet.trim() && !errorMsg.toLowerCase().includes(snippet.trim().toLowerCase())) {
-            errorMsg = `${errorMsg}: ${snippet.trim()}`;
-          }
-        }
-        if (requestId) {
-          errorMsg = `${errorMsg} (requestId=${requestId}${stage ? `, stage=${stage}` : ""})`;
-        }
+
+        const requestId = pickFirstUuid(bodyObj?.requestId, responseHeaders["x-request-id"], clientRequestId);
+
+        const errorMsg =
+          (typeof bodyObj?.error === "string" ? (bodyObj.error as string) : undefined) ||
+          (typeof bodyObj?.message === "string" ? (bodyObj.message as string) : undefined) ||
+          `HTTP ${rawResponse.status} ${rawResponse.statusText}`;
+
+        await handleReconcileCredits({
+          requestId,
+          reason: "Scene image generation failed",
+          refresh: false,
+          metadata: {
+            feature: "generate-scene-image",
+            stage: "http_error",
+            scene_id: sceneId,
+            story_id: storyId,
+            http_status: rawResponse.status,
+            error: errorMsg,
+          },
+        });
 
         recordSceneDebugInfo(sceneId, {
           timestamp: new Date(),
-          headers: finalHeaders,
-          redactedHeaders,
-          status: responseStatus,
-          statusText: responseStatusText,
+          headers: responseHeaders,
+          requestId,
+          stage: "http_error",
           error: errorMsg,
-          reasons,
-          upstreamError,
-          requestId: requestId ?? responseHeaders["x-request-id"],
-          model,
-          prompt,
-          promptFull,
-          preprocessingSteps,
-          promptHash,
-          requestParams
+          requestParams,
         });
 
         setScenes((prev) =>
-          prev.map((s) =>
-            s.id === sceneId
-              ? {
-                  ...s,
-                  updated_at: new Date().toISOString(),
-                  generation_status: "error",
-                  consistency_details: {
-                    ...(s.consistency_details && typeof s.consistency_details === "object" && !Array.isArray(s.consistency_details)
-                      ? (s.consistency_details as Record<string, unknown>)
-                      : {}),
-                    generation_debug: {
-                      timestamp: new Date().toISOString(),
-                      headers: finalHeaders,
-                      redactedHeaders,
-                      status: responseStatus,
-                      statusText: responseStatusText,
-                      error: errorMsg,
-                      reasons,
-                      upstream_error: upstreamError,
-                      requestId: requestId ?? responseHeaders["x-request-id"],
-                      model,
-                      prompt,
-                      prompt_full: promptFull,
-                      preprocessingSteps,
-                      prompt_hash: promptHash,
-                      requestParams
-                    },
-                  } as Json,
-                }
-              : s,
-          ),
+          prev.map((s) => (s.id === sceneId ? { ...s, generation_status: "error", image_url: s.image_url ?? null } : s)),
         );
         throw new Error(errorMsg);
       }
 
-      const response = responseBody as GenerateSceneImageResponse | null;
-      console.log("[Storyboard] Generation response:", response);
+      const responseObj = responseBody && typeof responseBody === "object" ? (responseBody as Record<string, unknown>) : null;
+      const imageUrl = typeof responseObj?.imageUrl === "string" ? (responseObj.imageUrl as string) : null;
+      const requestId = pickFirstUuid(responseObj?.requestId, responseHeaders["x-request-id"], clientRequestId);
 
-      const responsePromptFull =
-        typeof (response as Record<string, unknown> | null)?.promptFull === "string"
-          ? ((response as Record<string, unknown>).promptFull as string)
-          : typeof (response as Record<string, unknown> | null)?.prompt_full === "string"
-            ? ((response as Record<string, unknown>).prompt_full as string)
-            : undefined;
+      applyCreditsFromResponse(responseObj?.credits);
 
-      const responsePrompt =
-        typeof (response as Record<string, unknown> | null)?.prompt === "string"
-          ? ((response as Record<string, unknown>).prompt as string)
-          : typeof (response as Record<string, unknown> | null)?.prompt_used === "string"
-            ? ((response as Record<string, unknown>).prompt_used as string)
-            : undefined;
+      if (!imageUrl) {
+        const errorMsg =
+          (typeof responseObj?.error === "string" ? (responseObj.error as string) : undefined) ||
+          (typeof responseObj?.message === "string" ? (responseObj.message as string) : undefined) ||
+          "No image URL returned";
 
-      const responsePromptHash =
-        typeof (response as Record<string, unknown> | null)?.promptHash === "string"
-          ? ((response as Record<string, unknown>).promptHash as string)
-          : typeof (response as Record<string, unknown> | null)?.prompt_hash === "string"
-            ? ((response as Record<string, unknown>).prompt_hash as string)
-            : undefined;
-
-      const ok = response?.success === true || Boolean(response?.imageUrl);
-      if (!ok) {
-        applyCreditsFromResponse(response?.credits);
-        const bodyHeaders = response?.headers as Record<string, string> | undefined;
-        const finalHeaders = { ...responseHeaders, ...(bodyHeaders || {}) };
-
-        // Extract actual error details from response instead of using generic message
-        const errorMessage = response?.error || 
-                           response?.message || 
-                           response?.details || 
-                           finalHeaders["x-failure-reason"] || 
-                           finalHeaders["x-error-message"] || 
-                           finalHeaders["warning"] || 
-                           "Generation did not return an image";
+        await handleReconcileCredits({
+          requestId,
+          reason: "Scene image generation failed",
+          refresh: false,
+          metadata: {
+            feature: "generate-scene-image",
+            stage: "no_image_returned",
+            scene_id: sceneId,
+            story_id: storyId,
+            error: errorMsg,
+          },
+        });
 
         recordSceneDebugInfo(sceneId, {
           timestamp: new Date(),
-          headers: finalHeaders,
-          redactedHeaders: response?.redactedHeaders,
-          requestId: response?.requestId,
-          stage: response?.stage,
-          error: errorMessage,
-          model: response?.model,
-          prompt: responsePrompt ?? response?.prompt,
-          promptFull: responsePromptFull,
-          preprocessingSteps: response?.preprocessingSteps,
-          promptHash: responsePromptHash ?? response?.promptHash,
-          requestParams
+          headers: responseHeaders,
+          requestId,
+          stage: "no_image_returned",
+          error: errorMsg,
+          requestParams,
+        });
+
+        setScenes((prev) =>
+          prev.map((s) => (s.id === sceneId ? { ...s, generation_status: "error", image_url: null } : s)),
+        );
+        toast({ title: "Generation failed", description: errorMsg, variant: "destructive" });
+        return;
+      }
+
+      const validation = await validateGeneratedImage(imageUrl);
+      if (!validation.ok) {
+        const reason = validation.reason || "Generated image failed client validation";
+        // Explicitly format for user visibility as requested
+        const logReason = reason.includes("Blank image") ? "Blank image generation" : `Generation failed: ${reason}`;
+        
+        await handleReconcileCredits({
+          requestId,
+          reason: logReason,
+          refresh: false,
+          metadata: {
+            feature: "generate-scene-image",
+            stage: "client_image_validation",
+            scene_id: sceneId,
+            story_id: storyId,
+            size: validation.size,
+            mean: validation.mean,
+            std: validation.std,
+          },
+        });
+        recordSceneDebugInfo(sceneId, {
+          timestamp: new Date(),
+          headers: responseHeaders,
+          requestId,
+          stage: "client_image_validation",
+          error: reason,
+          size: validation.size,
+          requestParams,
         });
         setScenes((prev) =>
           prev.map((s) =>
             s.id === sceneId
-              ? {
-                  ...s,
-                  updated_at: new Date().toISOString(),
-                  generation_status: "error",
-                  consistency_details: {
-                    ...(s.consistency_details && typeof s.consistency_details === "object" && !Array.isArray(s.consistency_details)
-                      ? (s.consistency_details as Record<string, unknown>)
-                      : {}),
-                    generation_debug: {
-                      timestamp: new Date().toISOString(),
-                      headers: normalizeHeaderRecord(finalHeaders),
-                      redactedHeaders: response?.redactedHeaders,
-                      requestId: response?.requestId,
-                      stage: response?.stage,
-                      error: errorMessage,
-                      model: response?.model,
-                      prompt: responsePrompt ?? response?.prompt,
-                      prompt_full: responsePromptFull,
-                      preprocessingSteps: response?.preprocessingSteps,
-                      prompt_hash: responsePromptHash ?? response?.promptHash,
-                      requestParams
-                    },
-                  } as Json,
-                }
+              ? { ...s, generation_status: "error", image_url: null, consistency_status: "fail" }
               : s,
           ),
         );
-        throw new Error(errorMessage);
+        void updateScene(sceneId, { image_url: null, generation_status: "error", consistency_status: "fail" });
+        toast({ title: "Generation failed", description: reason, variant: "destructive" });
+        return;
       }
-
-      if (response?.imageUrl) {
-        const validation = await validateGeneratedImage(response.imageUrl);
-        if (!validation.ok) {
-          const reason = validation.reason || "Generated image failed client validation";
-          recordSceneDebugInfo(sceneId, {
-            timestamp: new Date(),
-            headers: response?.headers,
-            redactedHeaders: response?.redactedHeaders,
-            requestId: response?.requestId,
-            stage: "client_image_validation",
-            size: validation.size,
-            error: reason,
-          });
-
-          setScenes((prev) =>
-            prev.map((s) =>
-              s.id === sceneId
-                ? {
-                    ...s,
-                    updated_at: new Date().toISOString(),
-                    image_url: null,
-                    generation_status: "error",
-                    consistency_status: "fail",
-                    consistency_details: {
-                      ...(s.consistency_details && typeof s.consistency_details === "object" && !Array.isArray(s.consistency_details)
-                        ? (s.consistency_details as Record<string, unknown>)
-                        : {}),
-                      generation_debug: {
-                        ...(s.consistency_details &&
-                        typeof s.consistency_details === "object" &&
-                        !Array.isArray(s.consistency_details) &&
-                        (s.consistency_details as Record<string, unknown>).generation_debug &&
-                        typeof (s.consistency_details as Record<string, unknown>).generation_debug === "object" &&
-                        !Array.isArray((s.consistency_details as Record<string, unknown>).generation_debug)
-                          ? ((s.consistency_details as Record<string, unknown>).generation_debug as Record<string, unknown>)
-                          : {}),
-                        timestamp: new Date().toISOString(),
-                        headers: normalizeHeaderRecord(response?.headers),
-                        redactedHeaders: response?.redactedHeaders,
-                        requestId: response?.requestId,
-                        stage: "client_image_validation",
-                        error: reason,
-                        size: validation.size,
-                        model: response?.model,
-                        prompt: responsePrompt ?? response?.prompt,
-                        prompt_full: responsePromptFull,
-                      preprocessingSteps: response?.preprocessingSteps,
-                      prompt_hash: responsePromptHash ?? response?.promptHash,
-                      warnings: response?.warnings,
-                    },
-                  } as Json,
-                }
-              : s,
-            ),
-          );
-
-          void updateScene(sceneId, {
-            image_url: null,
-            generation_status: "error",
-            consistency_status: "fail",
-            consistency_details: {
-              generation_debug: {
-                timestamp: new Date().toISOString(),
-                headers: normalizeHeaderRecord(response?.headers),
-                redactedHeaders: response?.redactedHeaders,
-                requestId: response?.requestId,
-                stage: "client_image_validation",
-                error: reason,
-                size: validation.size,
-                model: response?.model,
-                prompt: responsePrompt ?? response?.prompt,
-                prompt_full: responsePromptFull,
-                preprocessingSteps: response?.preprocessingSteps,
-                prompt_hash: responsePromptHash ?? response?.promptHash,
-                warnings: response?.warnings,
-              },
-            } as Json,
-          });
-
-          toast({
-            title: "Generation failed",
-            description: reason,
-            variant: "destructive",
-          });
-          return;
-        }
-      }
-
-      const bodyHeaders = response?.headers as Record<string, string> | undefined;
-      const finalHeaders = { ...responseHeaders, ...(bodyHeaders || {}) };
 
       recordSceneDebugInfo(sceneId, {
         timestamp: new Date(),
-        headers: Object.keys(finalHeaders).length > 0 ? finalHeaders : undefined,
-        redactedHeaders: response?.redactedHeaders,
-        warnings: response?.warnings,
-        requestId: response?.requestId,
-        stage: response?.stage,
-        model: response?.model,
-        prompt: responsePrompt ?? response?.prompt,
-        promptFull: responsePromptFull,
-        preprocessingSteps: response?.preprocessingSteps,
-        promptHash: responsePromptHash ?? response?.promptHash,
+        headers: responseHeaders,
+        requestId,
+        stage: "success",
         requestParams,
       });
 
       setScenes((prev) =>
         prev.map((s) =>
           s.id === sceneId
-            ? {
-                ...s,
-                updated_at: new Date().toISOString(),
-                image_url: response?.imageUrl ?? s.image_url,
-                generation_status: "completed",
-                consistency_details: {
-                  ...(s.consistency_details && typeof s.consistency_details === "object" && !Array.isArray(s.consistency_details)
-                    ? (s.consistency_details as Record<string, unknown>)
-                    : {}),
-                  generation_debug: {
-                    ...(() => {
-                      const details =
-                        s.consistency_details && typeof s.consistency_details === "object" && !Array.isArray(s.consistency_details)
-                          ? (s.consistency_details as Record<string, unknown>)
-                          : null;
-                      const gen =
-                        details?.generation_debug && typeof details.generation_debug === "object" && !Array.isArray(details.generation_debug)
-                          ? (details.generation_debug as Record<string, unknown>)
-                          : null;
-                      return gen && Object.keys(gen).length > 0 ? gen : {};
-                    })(),
-                    timestamp: new Date().toISOString(),
-                    headers: normalizeHeaderRecord(finalHeaders),
-                    requestId: response?.requestId,
-                    stage: response?.stage,
-                    model: response?.model,
-                    prompt: responsePrompt ?? response?.prompt,
-                    prompt_full:
-                      typeof responsePromptFull === "string"
-                        ? responsePromptFull
-                        : (() => {
-                            const details =
-                              s.consistency_details && typeof s.consistency_details === "object" && !Array.isArray(s.consistency_details)
-                                ? (s.consistency_details as Record<string, unknown>)
-                                : null;
-                            const gen =
-                              details?.generation_debug && typeof details.generation_debug === "object" && !Array.isArray(details.generation_debug)
-                                ? (details.generation_debug as Record<string, unknown>)
-                                : null;
-                            return typeof gen?.prompt_full === "string"
-                              ? (gen.prompt_full as string)
-                              : typeof gen?.promptFull === "string"
-                                ? (gen.promptFull as string)
-                                : undefined;
-                          })(),
-                    preprocessingSteps: response?.preprocessingSteps,
-                    prompt_hash: responsePromptHash ?? response?.promptHash,
-                    warnings: response?.warnings,
-                    requestParams
-                  },
-                } as Json,
-              }
+            ? { ...s, updated_at: new Date().toISOString(), generation_status: "completed", image_url: imageUrl }
             : s,
         ),
       );
 
-      if (!response?.imageUrl) await fetchScenes();
-      applyCreditsFromResponse(response?.credits);
+      await fetchScenes();
       await refreshProfile();
-
-      toast({
-        title: "Image generated!",
-        description: "Scene illustration has been created",
-      });
-
-      window.setTimeout(() => {
-        void hydrateSceneDebugFromDb(sceneId);
-      }, 600);
-    } catch (error) {
-      console.error("Error generating image:", error);
-      const message = error instanceof Error ? error.message : "Failed to generate image";
-      await applyCreditsFromInvokeError(error);
+    } catch (e) {
+      const message = e instanceof Error ? e.message : "Generation failed";
       recordSceneDebugInfo(sceneId, { timestamp: new Date(), error: message, requestParams });
-      await hydrateSceneDebugFromDb(sceneId);
-      setScenes((prev) =>
-        prev.map((s) =>
-          s.id === sceneId
-            ? {
-                ...s,
-                updated_at: new Date().toISOString(),
-                generation_status: "error",
-                consistency_details: {
-                  ...(s.consistency_details && typeof s.consistency_details === "object" && !Array.isArray(s.consistency_details)
-                    ? (s.consistency_details as Record<string, unknown>)
-                    : {}),
-                  generation_debug: {
-                    ...(s.consistency_details &&
-                    typeof s.consistency_details === "object" &&
-                    !Array.isArray(s.consistency_details) &&
-                    (s.consistency_details as Record<string, unknown>).generation_debug &&
-                    typeof (s.consistency_details as Record<string, unknown>).generation_debug === "object" &&
-                    !Array.isArray((s.consistency_details as Record<string, unknown>).generation_debug)
-                      ? ((s.consistency_details as Record<string, unknown>).generation_debug as Record<string, unknown>)
-                      : {}),
-                    timestamp: new Date().toISOString(),
-                    error: message,
-                  },
-                } as Json,
-              }
-            : s,
-        ),
-      );
-      toast({
-        title: "Generation failed",
-        description: message,
-        variant: "destructive",
-      });
-      await refreshProfile();
+      setScenes((prev) => prev.map((s) => (s.id === sceneId ? { ...s, generation_status: "error" } : s)));
+      toast({ title: "Generation failed", description: message, variant: "destructive" });
     } finally {
-      setGeneratingSceneId(null);
+      setGeneratingSceneId((prev) => (prev === sceneId ? null : prev));
     }
   };
 
@@ -1396,47 +1069,21 @@ export default function Storyboard() {
     mode: BatchMode,
     opts?: { resetFirst?: boolean },
   ) => {
-    if (!user || scenesToGenerate.length === 0) return;
-    if (generateAllLockRef.current) return;
-    generateAllLockRef.current = true;
+    if (isGenerating || generateAllLockRef.current) return;
+    if (!user || !storyId) return;
+    if (scenesToGenerate.length === 0) return;
 
+    generateAllLockRef.current = true;
     setIsGenerating(true);
     setBatchMode(mode);
     setBatchSceneIds(scenesToGenerate.map((s) => s.id));
 
-    try {
-      type GenerateSceneImageResponse = {
-        success?: boolean;
-        imageUrl?: string;
-        credits?: {
-          consumed?: number;
-          remaining_monthly?: number;
-          remaining_bonus?: number;
-          tier?: string;
-          unlimited?: boolean;
-        };
-        headers?: Record<string, string>;
-        redactedHeaders?: string[];
-        requestId?: string;
-        stage?: string;
-        model?: string;
-        prompt?: string;
-        promptFull?: string;
-        preprocessingSteps?: string[];
-        promptHash?: string;
-        modelConfig?: unknown;
-        error?: string;
-        message?: string;
-        details?: string;
-      };
-      const { data: { session } } = await supabase.auth.getSession();
+    let failedCount = 0;
 
+    try {
+      const { data: { session } } = await supabase.auth.getSession();
       if (!session) {
-        toast({
-          title: "Not authenticated",
-          description: "Please sign in to generate images",
-          variant: "destructive",
-        });
+        toast({ title: "Not authenticated", description: "Please sign in to generate images", variant: "destructive" });
         return;
       }
 
@@ -1445,433 +1092,13 @@ export default function Storyboard() {
         if (!ok) return;
       }
 
-      let failedCount = 0;
       for (const scene of scenesToGenerate) {
-        setGeneratingSceneId(scene.id);
-        setScenes((prev) =>
-          prev.map((s) =>
-            s.id === scene.id ? { ...s, generation_status: "generating" } : s,
-          ),
-        );
-
-        let requestParams: Record<string, unknown> | undefined;
+        if (!generateAllLockRef.current) break;
         try {
-          // Use direct fetch to bypass supabase-js error wrapping that might obscure headers
-          const functionUrl = `${SUPABASE_URL.replace(/\/$/, "")}/functions/v1/generate-scene-image`;
-          
-          const artStyle = selectedStyleRef.current;
-          const intensity = styleIntensityRef.current;
-          const strictStyle = consistencyModeRef.current === "strict";
-          const disabledStyleElements = disabledStyleElementsByStyle[artStyle] ?? [];
-          const width = selectedResolution?.width;
-          const height = selectedResolution?.height;
-
-          requestParams = {
-            model: selectedModel,
-            artStyle,
-            styleIntensity: intensity,
-            strictStyle,
-            width,
-            height,
-            disabledStyleElements,
-            characterImageReferenceEnabled,
-          };
-
-          let rawResponse: Response;
-          try {
-            const apikey = (import.meta.env.VITE_SUPABASE_ANON_KEY ?? import.meta.env.VITE_SUPABASE_PUBLISHABLE_KEY ?? SUPABASE_KEY).trim();
-            if (!apikey) {
-              throw new Error("Missing VITE_SUPABASE_ANON_KEY or VITE_SUPABASE_PUBLISHABLE_KEY; cannot call Supabase Functions endpoint");
-            }
-            rawResponse = await fetch(functionUrl, {
-              method: "POST",
-              headers: {
-                "Authorization": `Bearer ${session.access_token}`,
-                "apikey": apikey,
-                "Content-Type": "application/json"
-              },
-              body: JSON.stringify({ 
-                sceneId: scene.id, 
-                artStyle,
-                styleIntensity: intensity,
-                strictStyle,
-                model: selectedModel,
-                width,
-                height,
-                disabledStyleElements,
-                characterImageReferenceEnabled,
-              })
-            });
-          } catch (netError) {
-            throw new Error(`Network error: ${netError instanceof Error ? netError.message : String(netError)}`);
-          }
-
-          // Extract all headers immediately
-          const responseHeaders: Record<string, string> = {};
-          rawResponse.headers.forEach((value, key) => {
-            responseHeaders[key.toLowerCase()] = value;
-          });
-
-          const responseStatus = rawResponse.status;
-          const responseStatusText = rawResponse.statusText;
-          
-          let responseBody: unknown;
-          try {
-            const text = await rawResponse.text();
-            try {
-              responseBody = JSON.parse(text);
-            } catch {
-              responseBody = text;
-            }
-          } catch {
-            responseBody = null;
-          }
-
-          // Handle non-200 responses
-          if (!rawResponse.ok) {
-            const bodyObj = responseBody && typeof responseBody === "object" ? responseBody as Record<string, unknown> : null;
-            const detailsObj = bodyObj?.details as Record<string, unknown> | undefined;
-            applyCreditsFromResponse(bodyObj?.credits);
-            applyCreditsFromResponse(detailsObj?.credits);
-            
-            // Merge headers from the body details if they exist (they might be richer)
-            const bodyHeaders = detailsObj?.headers as Record<string, string> | undefined;
-            const finalHeaders = { ...responseHeaders, ...(bodyHeaders || {}) };
-            
-            const reasons = Array.isArray(detailsObj?.reasons) ? detailsObj.reasons as string[] : undefined;
-            const upstreamError = detailsObj?.upstream_error as string | undefined;
-            const redactedHeaders = Array.isArray(detailsObj?.redactedHeaders) ? detailsObj.redactedHeaders as string[] : undefined;
-            const prompt =
-              typeof detailsObj?.prompt === "string"
-                ? detailsObj.prompt
-                : typeof (detailsObj as Record<string, unknown> | undefined)?.prompt_used === "string"
-                  ? ((detailsObj as Record<string, unknown>).prompt_used as string)
-                  : typeof bodyObj?.prompt === "string"
-                    ? (bodyObj.prompt as string)
-                    : typeof (bodyObj as Record<string, unknown> | null)?.prompt_used === "string"
-                      ? ((bodyObj as Record<string, unknown>).prompt_used as string)
-                      : undefined;
-            const promptFull =
-              typeof (detailsObj as Record<string, unknown> | undefined)?.prompt_full === "string"
-                ? ((detailsObj as Record<string, unknown>).prompt_full as string)
-                : typeof (detailsObj as Record<string, unknown> | undefined)?.promptFull === "string"
-                  ? ((detailsObj as Record<string, unknown>).promptFull as string)
-                  : typeof (bodyObj as Record<string, unknown> | null)?.promptFull === "string"
-                    ? ((bodyObj as Record<string, unknown>).promptFull as string)
-                    : typeof (bodyObj as Record<string, unknown> | null)?.prompt_full === "string"
-                      ? ((bodyObj as Record<string, unknown>).prompt_full as string)
-                      : undefined;
-            const preprocessingSteps =
-              Array.isArray((detailsObj as Record<string, unknown> | undefined)?.preprocessingSteps)
-                ? ((detailsObj as Record<string, unknown>).preprocessingSteps as unknown[]).filter((v): v is string => typeof v === "string")
-                : Array.isArray((bodyObj as Record<string, unknown> | null)?.preprocessingSteps)
-                  ? (((bodyObj as Record<string, unknown>).preprocessingSteps as unknown[]) || []).filter((v): v is string => typeof v === "string")
-                  : undefined;
-            const model = typeof bodyObj?.model === "string" ? (bodyObj.model as string) : undefined;
-            const promptHash =
-              typeof (detailsObj as Record<string, unknown> | undefined)?.prompt_hash === "string"
-                ? ((detailsObj as Record<string, unknown>).prompt_hash as string)
-                : typeof (bodyObj as Record<string, unknown> | null)?.promptHash === "string"
-                  ? ((bodyObj as Record<string, unknown>).promptHash as string)
-                  : typeof (bodyObj as Record<string, unknown> | null)?.prompt_hash === "string"
-                    ? ((bodyObj as Record<string, unknown>).prompt_hash as string)
-                    : undefined;
-            
-            const errorMsg = String(bodyObj?.error || `HTTP ${responseStatus} ${responseStatusText}`);
-
-            recordSceneDebugInfo(scene.id, {
-              timestamp: new Date(),
-              headers: finalHeaders,
-              redactedHeaders,
-              status: responseStatus,
-              statusText: responseStatusText,
-              error: errorMsg,
-              reasons,
-              upstreamError,
-              requestId: (bodyObj?.requestId as string) || responseHeaders["x-request-id"],
-              model,
-              prompt,
-              promptFull,
-              preprocessingSteps,
-              promptHash,
-              requestParams
-            });
-
-            console.error(`Error generating scene ${scene.id}:`, errorMsg);
-            if (failedCount === 0) {
-              toast({
-                title: "Generation failed",
-                description: errorMsg,
-                variant: "destructive",
-              });
-            }
-            failedCount += 1;
-            setScenes((prev) =>
-              prev.map((s) =>
-                s.id === scene.id
-                  ? {
-                      ...s,
-                      generation_status: "error",
-                      consistency_details: {
-                        ...(s.consistency_details && typeof s.consistency_details === "object" && !Array.isArray(s.consistency_details)
-                          ? (s.consistency_details as Record<string, unknown>)
-                          : {}),
-                        generation_debug: {
-                          timestamp: new Date().toISOString(),
-                          headers: finalHeaders,
-                          redactedHeaders,
-                          status: responseStatus,
-                          statusText: responseStatusText,
-                          error: errorMsg,
-                          reasons,
-                          upstream_error: upstreamError,
-                          requestId: (bodyObj?.requestId as string) || responseHeaders["x-request-id"],
-                          model,
-                          prompt,
-                          prompt_full: promptFull,
-                          preprocessingSteps,
-                          prompt_hash: promptHash,
-                          requestParams
-                        },
-                      } as Json,
-                    }
-                  : s,
-              ),
-            );
-            continue;
-          }
-
-          const response = responseBody as GenerateSceneImageResponse | null;
-          const ok = response?.success === true || Boolean(response?.imageUrl);
-          if (!ok) {
-            applyCreditsFromResponse(response?.credits);
-            const bodyHeaders = response?.headers as Record<string, string> | undefined;
-            const finalHeaders = { ...responseHeaders, ...(bodyHeaders || {}) };
-
-            // Extract actual error details from response instead of using generic message
-            const errorMessage = response?.error || 
-                               response?.message || 
-                               response?.details || 
-                               finalHeaders["x-failure-reason"] || 
-                               finalHeaders["x-error-message"] || 
-                               finalHeaders["warning"] || 
-                               "Generation did not return an image";
-
-            recordSceneDebugInfo(scene.id, {
-              timestamp: new Date(),
-              error: errorMessage,
-              requestId: response?.requestId,
-              stage: response?.stage,
-              headers: finalHeaders,
-              redactedHeaders: response?.redactedHeaders,
-              model: response?.model,
-              prompt: response?.prompt,
-              promptFull: response?.promptFull,
-              preprocessingSteps: response?.preprocessingSteps,
-              promptHash: response?.promptHash,
-              requestParams
-            });
-            failedCount += 1;
-            setScenes((prev) =>
-              prev.map((s) =>
-                s.id === scene.id
-                  ? {
-                      ...s,
-                      generation_status: "error",
-                      consistency_details: {
-                        ...(s.consistency_details && typeof s.consistency_details === "object" && !Array.isArray(s.consistency_details)
-                          ? (s.consistency_details as Record<string, unknown>)
-                          : {}),
-                        generation_debug: {
-                          timestamp: new Date().toISOString(),
-                          headers: normalizeHeaderRecord(finalHeaders),
-                          redactedHeaders: response?.redactedHeaders,
-                          requestId: response?.requestId,
-                          stage: response?.stage,
-                          error: errorMessage,
-                          model: response?.model,
-                          prompt: response?.prompt,
-                          prompt_full: response?.promptFull,
-                          preprocessingSteps: response?.preprocessingSteps,
-                          prompt_hash: response?.promptHash,
-                          requestParams
-                        },
-                      } as Json,
-                    }
-                  : s,
-              ),
-            );
-            continue;
-          }
-
-          if (response?.imageUrl) {
-            const validation = await validateGeneratedImage(response.imageUrl);
-            if (!validation.ok) {
-              const reason = validation.reason || "Generated image failed client validation";
-              recordSceneDebugInfo(scene.id, {
-                timestamp: new Date(),
-                error: reason,
-                requestId: response?.requestId,
-                stage: "client_image_validation",
-                headers: response?.headers,
-                redactedHeaders: response?.redactedHeaders,
-                size: validation.size,
-                model: response?.model,
-                prompt: response?.prompt,
-                promptFull: response?.promptFull,
-                preprocessingSteps: response?.preprocessingSteps,
-                promptHash: response?.promptHash,
-                requestParams
-              });
-              failedCount += 1;
-              setScenes((prev) =>
-                prev.map((s) =>
-                  s.id === scene.id
-                    ? {
-                        ...s,
-                        image_url: null,
-                        generation_status: "error",
-                        consistency_status: "fail",
-                        consistency_details: {
-                          ...(s.consistency_details && typeof s.consistency_details === "object" && !Array.isArray(s.consistency_details)
-                            ? (s.consistency_details as Record<string, unknown>)
-                            : {}),
-                          generation_debug: {
-                            ...(s.consistency_details &&
-                            typeof s.consistency_details === "object" &&
-                            !Array.isArray(s.consistency_details) &&
-                            (s.consistency_details as Record<string, unknown>).generation_debug &&
-                            typeof (s.consistency_details as Record<string, unknown>).generation_debug === "object" &&
-                            !Array.isArray((s.consistency_details as Record<string, unknown>).generation_debug)
-                              ? ((s.consistency_details as Record<string, unknown>).generation_debug as Record<string, unknown>)
-                              : {}),
-                            timestamp: new Date().toISOString(),
-                            headers: normalizeHeaderRecord(response?.headers),
-                            redactedHeaders: response?.redactedHeaders,
-                            requestId: response?.requestId,
-                            stage: "client_image_validation",
-                            error: reason,
-                            size: validation.size,
-                            model: response?.model,
-                            prompt: response?.prompt,
-                            prompt_full: response?.promptFull,
-                            preprocessingSteps: response?.preprocessingSteps,
-                            prompt_hash: response?.promptHash,
-                            requestParams,
-                          },
-                        } as Json,
-                      }
-                    : s,
-                ),
-              );
-              void updateScene(scene.id, {
-                image_url: null,
-                generation_status: "error",
-                consistency_status: "fail",
-                consistency_details: {
-                  generation_debug: {
-                    timestamp: new Date().toISOString(),
-                    headers: normalizeHeaderRecord(response?.headers),
-                    redactedHeaders: response?.redactedHeaders,
-                    requestId: response?.requestId,
-                    stage: "client_image_validation",
-                    error: reason,
-                    size: validation.size,
-                    model: response?.model,
-                    prompt: response?.prompt,
-                    prompt_full: response?.promptFull,
-                    preprocessingSteps: response?.preprocessingSteps,
-                    prompt_hash: response?.promptHash,
-                    requestParams,
-                  },
-                } as Json,
-              });
-              continue;
-            }
-          }
-          const bodyHeaders = response?.headers as Record<string, string> | undefined;
-          const finalHeaders = { ...responseHeaders, ...(bodyHeaders || {}) };
-
-          recordSceneDebugInfo(scene.id, {
-            timestamp: new Date(),
-            headers: finalHeaders,
-            redactedHeaders: response?.redactedHeaders,
-            requestId: response?.requestId,
-            stage: response?.stage,
-            model: response?.model,
-            prompt: response?.prompt,
-            promptFull: response?.promptFull,
-            preprocessingSteps: response?.preprocessingSteps,
-            promptHash: response?.promptHash,
-            requestParams
-          });
-          applyCreditsFromResponse(response?.credits);
-          setScenes((prev) =>
-            prev.map((s) =>
-              s.id === scene.id
-                ? {
-                    ...s,
-                    image_url: response?.imageUrl ?? s.image_url,
-                    generation_status: "completed",
-                    consistency_details: {
-                      ...(s.consistency_details && typeof s.consistency_details === "object" && !Array.isArray(s.consistency_details)
-                        ? (s.consistency_details as Record<string, unknown>)
-                        : {}),
-                      generation_debug: {
-                        timestamp: new Date().toISOString(),
-                        headers: normalizeHeaderRecord(finalHeaders),
-                        redactedHeaders: response?.redactedHeaders,
-                        requestId: response?.requestId,
-                        stage: response?.stage,
-                        model: response?.model,
-                        prompt: response?.prompt,
-                        prompt_full: response?.promptFull,
-                        preprocessingSteps: response?.preprocessingSteps,
-                        prompt_hash: response?.promptHash,
-                        requestParams
-                      },
-                    } as Json,
-                  }
-                : s,
-            ),
-          );
-        } catch (error) {
-          const message = error instanceof Error ? error.message : "Failed to generate image";
-          await applyCreditsFromInvokeError(error);
-          recordSceneDebugInfo(scene.id, { timestamp: new Date(), error: message, requestParams });
-          await hydrateSceneDebugFromDb(scene.id);
-          console.error(`Error generating scene ${scene.id}:`, message);
+          await handleGenerateImage(scene.id);
+        } catch {
           failedCount += 1;
-          setScenes((prev) =>
-            prev.map((s) =>
-              s.id === scene.id
-                ? {
-                    ...s,
-                  generation_status: "error",
-                  consistency_details: {
-                    ...(s.consistency_details && typeof s.consistency_details === "object" && !Array.isArray(s.consistency_details)
-                      ? (s.consistency_details as Record<string, unknown>)
-                      : {}),
-                    generation_debug: {
-                      ...(s.consistency_details &&
-                      typeof s.consistency_details === "object" &&
-                      !Array.isArray(s.consistency_details) &&
-                      (s.consistency_details as Record<string, unknown>).generation_debug &&
-                      typeof (s.consistency_details as Record<string, unknown>).generation_debug === "object" &&
-                      !Array.isArray((s.consistency_details as Record<string, unknown>).generation_debug)
-                        ? ((s.consistency_details as Record<string, unknown>).generation_debug as Record<string, unknown>)
-                        : {}),
-                      timestamp: new Date().toISOString(),
-                      error: message,
-                    },
-                  } as Json,
-                }
-                : s,
-            ),
-          );
-          continue;
         }
-
         await new Promise((resolve) => setTimeout(resolve, 1000));
       }
 
@@ -1959,10 +1186,10 @@ export default function Storyboard() {
       // But a better way is to rely on `stopAllGeneration` to clear the DB state,
       // and the frontend will update via realtime or optimistic update.
     }
-    
+
     // 2. Call backend to reset status
     await stopAllGeneration();
-    
+
     // 3. Reset local state
     setIsGenerating(false);
     setGeneratingSceneId(null);
@@ -2134,13 +1361,19 @@ export default function Storyboard() {
   };
 
   const fetchFullScenePrompt = async (sceneId: string) => {
-    if (!user) {
-      throw new Error("Sign in required");
-    }
+    if (!user) throw new Error("Sign in required");
 
     const { data: { session } } = await supabase.auth.getSession();
-    if (!session) {
-      throw new Error("Not authenticated");
+    if (!session) throw new Error("Not authenticated");
+
+    const supabaseUrl = (import.meta.env.VITE_SUPABASE_URL ?? "").trim();
+    if (!supabaseUrl) {
+      throw new Error("Missing VITE_SUPABASE_URL; cannot call Supabase Functions endpoint");
+    }
+
+    const apikey = String(import.meta.env.VITE_SUPABASE_PUBLISHABLE_KEY ?? import.meta.env.VITE_SUPABASE_ANON_KEY ?? "").trim();
+    if (!apikey) {
+      throw new Error("Missing VITE_SUPABASE_PUBLISHABLE_KEY; cannot call Supabase Functions endpoint");
     }
 
     const artStyle = selectedStyleRef.current;
@@ -2150,17 +1383,13 @@ export default function Storyboard() {
     const width = selectedResolution?.width;
     const height = selectedResolution?.height;
 
-    const functionUrl = `${SUPABASE_URL.replace(/\/$/, "")}/functions/v1/generate-scene-image`;
-    const apikey = (import.meta.env.VITE_SUPABASE_ANON_KEY ?? import.meta.env.VITE_SUPABASE_PUBLISHABLE_KEY ?? SUPABASE_KEY).trim();
-    if (!apikey) {
-      throw new Error("Missing VITE_SUPABASE_ANON_KEY or VITE_SUPABASE_PUBLISHABLE_KEY; cannot call Supabase Functions endpoint");
-    }
+    const functionUrl = `${supabaseUrl.replace(/\/$/, "")}/functions/v1/generate-scene-image`;
 
     const rawResponse = await fetch(functionUrl, {
       method: "POST",
       headers: {
-        "Authorization": `Bearer ${session.access_token}`,
-        "apikey": apikey,
+        Authorization: `Bearer ${session.access_token}`,
+        apikey,
         "Content-Type": "application/json",
       },
       body: JSON.stringify({
@@ -2196,7 +1425,10 @@ export default function Storyboard() {
       throw new Error(errorMsg);
     }
 
-    const data = responseBody as Record<string, unknown> | null;
+    const data =
+      responseBody && typeof responseBody === "object" && !Array.isArray(responseBody)
+        ? (responseBody as Record<string, unknown>)
+        : null;
     if (!data || data.success !== true) {
       const errorMsg =
         typeof data?.error === "string"
@@ -2497,10 +1729,10 @@ export default function Storyboard() {
     }
 
     const slidesHtml = scenes.map((scene, i) => {
-      const imageHtml = scene.image_url 
+      const imageHtml = scene.image_url
         ? '<img src="' + scene.image_url + '" alt="Scene ' + scene.scene_number + '" />'
         : '<div style="width:400px;height:300px;background:#222;display:flex;align-items:center;justify-content:center;border-radius:8px;">No image</div>';
-      
+
       return '<div class="slide' + (i === 0 ? ' active' : '') + '" data-index="' + i + '">' +
         imageHtml +
         '<div class="slide-content">' +
@@ -2510,7 +1742,7 @@ export default function Storyboard() {
         '</div></div>';
     }).join('');
 
-    const dotsHtml = scenes.map((_, i) => 
+    const dotsHtml = scenes.map((_, i) =>
       '<div class="dot' + (i === 0 ? ' active' : '') + '" onclick="goToSlide(' + i + ')"></div>'
     ).join('');
 
@@ -2855,79 +2087,79 @@ export default function Storyboard() {
                 const remaining = Math.max(0, sceneCount - completed);
 
                 return (
-                <Card
-                  key={s.id}
-                  variant="interactive"
-                  className="cursor-pointer p-6 hover:border-primary/50 transition-colors relative group"
-                  onClick={() => navigate(`/storyboard/${s.id}`)}
-                >
-                  <Button
-                    variant="ghost"
-                    size="icon"
-                    className="absolute top-2 right-2 opacity-0 group-hover:opacity-100 transition-opacity h-8 w-8 text-destructive hover:text-destructive hover:bg-destructive/10"
-                    onClick={(e) => {
-                      e.stopPropagation();
-                      setStoryToDelete(s);
-                    }}
+                  <Card
+                    key={s.id}
+                    variant="interactive"
+                    className="cursor-pointer p-6 hover:border-primary/50 transition-colors relative group"
+                    onClick={() => navigate(`/storyboard/${s.id}`)}
                   >
-                    <Trash2 className="w-4 h-4" />
-                  </Button>
-                  <div className="flex items-start justify-between mb-3">
-                    <BookOpen className="w-8 h-8 text-primary" />
-                    <Badge 
-                      variant={s.status === 'analyzed' || s.status === 'completed' ? 'default' : 'outline'}
-                      className={s.status === 'analyzed' || s.status === 'completed' ? 'bg-green-500/20 text-green-400' : ''}
+                    <Button
+                      variant="ghost"
+                      size="icon"
+                      className="absolute top-2 right-2 opacity-0 group-hover:opacity-100 transition-opacity h-8 w-8 text-destructive hover:text-destructive hover:bg-destructive/10"
+                      onClick={(e) => {
+                        e.stopPropagation();
+                        setStoryToDelete(s);
+                      }}
                     >
-                      {s.status}
-                    </Badge>
-                  </div>
-                  <h3 className="font-semibold text-lg text-foreground mb-2 line-clamp-1">
-                    {s.title}
-                  </h3>
-                  <p className="text-sm text-muted-foreground mb-3 line-clamp-2">
-                    {s.description || 'No description'}
-                  </p>
-                  <div className="flex items-center gap-4 text-xs text-muted-foreground">
-                    <span>{s.word_count?.toLocaleString() || 0} words</span>
-                    <span>{s.scene_count || 0} scenes</span>
-                  </div>
+                      <Trash2 className="w-4 h-4" />
+                    </Button>
+                    <div className="flex items-start justify-between mb-3">
+                      <BookOpen className="w-8 h-8 text-primary" />
+                      <Badge
+                        variant={s.status === 'analyzed' || s.status === 'completed' ? 'default' : 'outline'}
+                        className={s.status === 'analyzed' || s.status === 'completed' ? 'bg-green-500/20 text-green-400' : ''}
+                      >
+                        {s.status}
+                      </Badge>
+                    </div>
+                    <h3 className="font-semibold text-lg text-foreground mb-2 line-clamp-1">
+                      {s.title}
+                    </h3>
+                    <p className="text-sm text-muted-foreground mb-3 line-clamp-2">
+                      {s.description || 'No description'}
+                    </p>
+                    <div className="flex items-center gap-4 text-xs text-muted-foreground">
+                      <span>{s.word_count?.toLocaleString() || 0} words</span>
+                      <span>{s.scene_count || 0} scenes</span>
+                    </div>
 
-                  <Tooltip>
-                    <TooltipTrigger asChild>
-                      <div className="mt-3">
-                        <div className="flex items-center justify-between text-xs text-muted-foreground mb-1">
-                          <span>{sceneCount} scenes</span>
-                          <span>{progress}%</span>
+                    <Tooltip>
+                      <TooltipTrigger asChild>
+                        <div className="mt-3">
+                          <div className="flex items-center justify-between text-xs text-muted-foreground mb-1">
+                            <span>{sceneCount} scenes</span>
+                            <span>{progress}%</span>
+                          </div>
+                          <div className="h-1.5 bg-secondary rounded-full overflow-hidden">
+                            <div
+                              className={`h-full ${barColorClass} rounded-full transition-all duration-500`}
+                              style={{ width: `${progress}%` }}
+                            />
+                          </div>
                         </div>
-                        <div className="h-1.5 bg-secondary rounded-full overflow-hidden">
-                          <div
-                            className={`h-full ${barColorClass} rounded-full transition-all duration-500`}
-                            style={{ width: `${progress}%` }}
-                          />
+                      </TooltipTrigger>
+                      <TooltipContent>
+                        <div className="space-y-1">
+                          <div className="font-medium">Progress</div>
+                          {sceneCount > 0 ? (
+                            <>
+                              <div className="text-xs text-muted-foreground">
+                                Completed: {completed}/{sceneCount} scenes
+                              </div>
+                              <div className="text-xs text-muted-foreground">Remaining: {remaining}</div>
+                            </>
+                          ) : (
+                            <div className="text-xs text-muted-foreground">No scenes yet</div>
+                          )}
                         </div>
-                      </div>
-                    </TooltipTrigger>
-                    <TooltipContent>
-                      <div className="space-y-1">
-                        <div className="font-medium">Progress</div>
-                        {sceneCount > 0 ? (
-                          <>
-                            <div className="text-xs text-muted-foreground">
-                              Completed: {completed}/{sceneCount} scenes
-                            </div>
-                            <div className="text-xs text-muted-foreground">Remaining: {remaining}</div>
-                          </>
-                        ) : (
-                          <div className="text-xs text-muted-foreground">No scenes yet</div>
-                        )}
-                      </div>
-                    </TooltipContent>
-                  </Tooltip>
+                      </TooltipContent>
+                    </Tooltip>
 
-                  <p className="text-xs text-muted-foreground mt-2">
-                    Updated {new Date(s.updated_at).toLocaleDateString()}
-                  </p>
-                </Card>
+                    <p className="text-xs text-muted-foreground mt-2">
+                      Updated {new Date(s.updated_at).toLocaleDateString()}
+                    </p>
+                  </Card>
                 );
               })}
             </div>
@@ -2956,7 +2188,7 @@ export default function Storyboard() {
             </AlertDialogHeader>
             <AlertDialogFooter>
               <AlertDialogCancel disabled={isDeleting}>Cancel</AlertDialogCancel>
-              <AlertDialogAction 
+              <AlertDialogAction
                 onClick={handleDeleteStory}
                 disabled={isDeleting}
                 className="bg-destructive text-destructive-foreground hover:bg-destructive/90"
@@ -2994,9 +2226,9 @@ export default function Storyboard() {
           </div>
 
           <div className="flex flex-wrap gap-3">
-            <Button 
-              variant="hero" 
-              size="lg" 
+            <Button
+              variant="hero"
+              size="lg"
               className="gap-2"
               onClick={handleGenerateAll}
               disabled={isGenerating || scenes.length === 0}
@@ -3011,10 +2243,10 @@ export default function Storyboard() {
                 : "Generate All"}
             </Button>
             {(isGenerating || scenes.some(s => s.generation_status === 'generating')) && (
-              <Button 
-                variant="destructive" 
-                size="lg" 
-                className="gap-2" 
+              <Button
+                variant="destructive"
+                size="lg"
+                className="gap-2"
                 onClick={handleStopGenerating}
               >
                 <Square className="w-5 h-5 fill-current" />
@@ -3064,7 +2296,7 @@ export default function Storyboard() {
 
         {/* Model Selector */}
         <div className="mb-10">
-          <ModelSelector 
+          <ModelSelector
             selectedModel={selectedModel}
             onModelChange={handleModelChange}
             selectedResolution={selectedResolution}
@@ -3074,7 +2306,7 @@ export default function Storyboard() {
 
         {/* Style Selector */}
         <div className="mb-10">
-          <StyleSelector 
+          <StyleSelector
             selectedStyle={selectedStyle}
             onStyleChange={handleStyleChange}
             styleIntensity={styleIntensity}
@@ -3122,13 +2354,13 @@ export default function Storyboard() {
 
         <Tabs value={activeTab} onValueChange={setActiveTab} className="w-full">
           <TabsList className="mb-8 w-full justify-start border-b rounded-none h-auto p-0 bg-transparent">
-            <TabsTrigger 
+            <TabsTrigger
               value="scenes"
               className="rounded-none border-b-2 border-transparent data-[state=active]:border-primary data-[state=active]:bg-transparent px-6 py-3"
             >
               Scenes
             </TabsTrigger>
-            <TabsTrigger 
+            <TabsTrigger
               value="characters"
               className="rounded-none border-b-2 border-transparent data-[state=active]:border-primary data-[state=active]:bg-transparent px-6 py-3"
             >
@@ -3138,8 +2370,8 @@ export default function Storyboard() {
 
           <TabsContent value="characters">
             {storyId && (
-              <CharacterList 
-                storyId={storyId} 
+              <CharacterList
+                storyId={storyId}
                 selectedArtStyle={selectedStyle}
                 selectedModel={selectedModel}
                 styleIntensity={styleIntensity}
@@ -3164,17 +2396,17 @@ export default function Storyboard() {
                   const isSceneError = scene.generation_status === "error";
 
                   return (
-                    <Card 
-                      key={scene.id} 
-                      variant="interactive" 
+                    <Card
+                      key={scene.id}
+                      variant="interactive"
                       className="overflow-hidden cursor-pointer"
                       onClick={() => handleSceneClick(scene)}
                     >
                       {/* Image Area */}
                       <div className="aspect-video bg-secondary relative overflow-hidden">
                         {scene.image_url ? (
-                          <img 
-                            src={scene.image_url} 
+                          <img
+                            src={scene.image_url}
                             alt={scene.title || `Scene ${scene.scene_number}`}
                             className="w-full h-full object-cover"
                           />
@@ -3191,8 +2423,8 @@ export default function Storyboard() {
                                 {isSceneError && (
                                   <p className="text-sm text-destructive mb-2">Generation failed</p>
                                 )}
-                                <Button 
-                                  size="sm" 
+                                <Button
+                                  size="sm"
                                   variant="outline"
                                   className={isSceneError ? "border-destructive/50 text-destructive hover:text-destructive" : undefined}
                                   onClick={(e) => {
@@ -3207,7 +2439,7 @@ export default function Storyboard() {
                             )}
                           </div>
                         )}
-                      
+
                         {/* Scene number badge */}
                         <Badge className="absolute top-2 left-2 bg-black/60 backdrop-blur-sm text-white border-white/20 shadow-sm">
                           Scene {scene.scene_number}
@@ -3215,13 +2447,12 @@ export default function Storyboard() {
 
                         {scene.consistency_status && (
                           <Badge
-                            className={`absolute bottom-2 left-2 bg-background/80 backdrop-blur-sm ${
-                              scene.consistency_status === "pass"
-                                ? "text-green-600"
-                                : scene.consistency_status === "warn"
-                                  ? "text-yellow-600"
-                                  : "text-red-600"
-                            }`}
+                            className={`absolute bottom-2 left-2 bg-background/80 backdrop-blur-sm ${scene.consistency_status === "pass"
+                              ? "text-green-600"
+                              : scene.consistency_status === "warn"
+                                ? "text-yellow-600"
+                                : "text-red-600"
+                              }`}
                           >
                             Consistency{" "}
                             {typeof scene.consistency_score === "number"
@@ -3229,7 +2460,7 @@ export default function Storyboard() {
                               : "--"}
                           </Badge>
                         )}
-                      
+
                         {/* Regenerate button */}
                         {scene.image_url && (
                           <Button
@@ -3255,7 +2486,7 @@ export default function Storyboard() {
                         <p className="text-sm text-muted-foreground line-clamp-2 mb-3">
                           {scene.summary}
                         </p>
-                      
+
                         <div className="flex flex-wrap gap-2">
                           {scene.emotional_tone && (
                             <Badge variant="outline" className="text-xs">

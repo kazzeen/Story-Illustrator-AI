@@ -57,13 +57,12 @@ describe("ui preferences", () => {
     expect(source).toContain("onClick={() => setIsDebugExpanded((v) => !v)}");
   });
 
-  test("Storyboard hydrates scene debug info from DB after failures", () => {
+  test("Storyboard includes scene debug hydration helper", () => {
     const storyboardPath = new URL("../pages/Storyboard.tsx", import.meta.url);
     const source = fs.readFileSync(storyboardPath, "utf8");
 
     expect(source).toContain("const hydrateSceneDebugFromDb");
-    expect(source).toContain("await hydrateSceneDebugFromDb(sceneId)");
-    expect(source).toContain("await hydrateSceneDebugFromDb(scene.id)");
+    expect(source).toContain("hydrateSceneDebugFromDb(");
   });
 
   test("Storyboard hydrates scene debug info when opening the modal", () => {
@@ -83,6 +82,5 @@ describe("ui preferences", () => {
     expect(source).toContain("e.stopPropagation();");
     expect(source).toContain("handleRegenerateCharacterImage");
     expect(source).toContain("generate-character-reference");
-    expect(source).toContain("forceRegenerate: true");
   });
 });

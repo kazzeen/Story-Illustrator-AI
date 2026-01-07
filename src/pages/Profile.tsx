@@ -180,7 +180,7 @@ export default function Profile() {
       )
       .on(
         "postgres_changes",
-        { event: "INSERT", schema: "public", table: "credit_transactions", filter: `user_id=eq.${user.id}` },
+        { event: "*", schema: "public", table: "credit_transactions", filter: `user_id=eq.${user.id}` },
         () => scheduleRefresh(),
       )
       .subscribe();
@@ -352,6 +352,17 @@ export default function Profile() {
                       const feature = getFeature(tx.metadata);
                       const amountLabel = tx.amount > 0 ? `+${tx.amount}` : String(tx.amount);
                       const amountVariant = tx.amount < 0 ? "destructive" : "secondary";
+                      const fallbackDescription = (() => {
+                        if (!isRecord(tx.metadata)) return null;
+                        const md = tx.metadata;
+                        return (
+                          asString(md.release_reason) ??
+                          asString(md.refund_reason) ??
+                          asString(md.error_message) ??
+                          asString(md.error) ??
+                          null
+                        );
+                      })();
                       return (
                         <TableRow key={tx.id}>
                           <TableCell className="whitespace-nowrap">{new Date(tx.created_at).toLocaleString()}</TableCell>
@@ -360,7 +371,7 @@ export default function Profile() {
                           </TableCell>
                           <TableCell className="whitespace-nowrap">{tx.transaction_type}</TableCell>
                           <TableCell className="whitespace-nowrap">{feature ?? "—"}</TableCell>
-                          <TableCell className="min-w-[16rem]">{tx.description ?? "—"}</TableCell>
+                          <TableCell className="min-w-[16rem]">{tx.description ?? fallbackDescription ?? "—"}</TableCell>
                         </TableRow>
                       );
                     })

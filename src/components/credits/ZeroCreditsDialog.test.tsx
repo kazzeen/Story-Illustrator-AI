@@ -1,3 +1,5 @@
+// @vitest-environment jsdom
+
 import { render, screen, fireEvent, cleanup } from "@testing-library/react";
 import { ZeroCreditsDialog } from "./ZeroCreditsDialog";
 import { BrowserRouter } from "react-router-dom";

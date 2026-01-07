@@ -15,13 +15,12 @@ import { Tabs, TabsContent, TabsList, TabsTrigger } from "@/components/ui/tabs";
 import { Progress } from "@/components/ui/progress";
 import { cn } from "@/lib/utils";
 import { validateSceneReferenceImageCandidate } from "@/lib/reference-images";
-import { SUPABASE_KEY, SUPABASE_URL, supabase } from "@/integrations/supabase/client";
+import { supabase } from "@/integrations/supabase/client";
 import { buildVeniceEditPrompt, type ImageEditTool, inferImageMimeFromUrl, normalizeImageMime, type NormalizedRect, validateVeniceImageConstraints } from "@/lib/venice-image-edit";
 import { Save, X, RefreshCw, Wand2, Copy, Download, Edit3, Undo2, Redo2, Check, Square, Loader2, Upload, Trash2, ZoomIn, ZoomOut, RotateCcw, ChevronDown } from "lucide-react";
 import { Scene } from "@/hooks/useStories";
 import { extractDetailedError, DetailedError } from "@/lib/error-reporting";
 import { useToast } from "@/hooks/use-toast";
-import { useAuth } from "@/hooks/useAuth";
 import { applyClothingColorsToCharacterStates, regenerateImagePromptFromCharacterStates, type SceneCharacterAppearanceState } from "@/lib/scene-character-appearance";
 import { ensureClothingColors, validateClothingColorCoverage } from "@/lib/clothing-colors";
 import { readBooleanPreference, writeBooleanPreference } from "@/lib/ui-preferences";
@@ -195,32 +194,6 @@ export function SceneDetailModal({
   debugInfo,
 }: SceneDetailModalProps) {
   const { toast } = useToast();
-  const { applyProfilePatch, refreshProfile } = useAuth();
-
-  const applyCreditsFromResponse = (credits: unknown) => {
-    if (!isPlainObject(credits)) return false;
-    const c = credits as Record<string, unknown>;
-
-    const unlimited = typeof c.unlimited === "boolean" ? c.unlimited : false;
-    const tierRaw = typeof c.tier === "string" ? c.tier.trim() : "";
-    const tier = tierRaw ? (tierRaw === "basic" ? "free" : tierRaw) : null;
-
-    const remainingMonthly = typeof c.remaining_monthly === "number" ? c.remaining_monthly : Number(c.remaining_monthly);
-    const remainingBonus = typeof c.remaining_bonus === "number" ? c.remaining_bonus : Number(c.remaining_bonus);
-
-    if (Number.isFinite(remainingMonthly) && Number.isFinite(remainingBonus)) {
-      const nextBalance = Math.max(remainingMonthly + remainingBonus, 0);
-      applyProfilePatch({ credits_balance: nextBalance, ...(tier ? { subscription_tier: tier } : {}) });
-      return true;
-    }
-
-    if (unlimited && tier) {
-      applyProfilePatch({ subscription_tier: tier });
-      return true;
-    }
-
-    return false;
-  };
   const [isDebugExpanded, setIsDebugExpanded] = useState(() =>
     readBooleanPreference({
       storage: typeof window !== "undefined" ? window.localStorage : null,
@@ -1149,8 +1122,8 @@ export function SceneDetailModal({
     const session = sessionData.session;
     if (!session) throw new Error("Not authenticated");
 
-    const supabaseUrl = (import.meta.env.VITE_SUPABASE_URL ?? SUPABASE_URL) as string | undefined;
-    const supabaseAnonKey = (import.meta.env.VITE_SUPABASE_ANON_KEY ?? import.meta.env.VITE_SUPABASE_PUBLISHABLE_KEY ?? SUPABASE_KEY) as string | undefined;
+    const supabaseUrl = import.meta.env.VITE_SUPABASE_URL as string | undefined;
+    const supabaseAnonKey = import.meta.env.VITE_SUPABASE_ANON_KEY as string | undefined;
     if (!supabaseUrl || !supabaseAnonKey) throw new Error("Missing Supabase configuration");
 
     const endpoint = `${supabaseUrl.replace(/\/$/, "")}/functions/v1/upload-reference-image`;
@@ -1267,8 +1240,8 @@ export function SceneDetailModal({
     const session = sessionData.session;
     if (!session) throw new Error("Not authenticated");
 
-    const supabaseUrl = (import.meta.env.VITE_SUPABASE_URL ?? SUPABASE_URL) as string | undefined;
-    const supabaseAnonKey = (import.meta.env.VITE_SUPABASE_ANON_KEY ?? import.meta.env.VITE_SUPABASE_PUBLISHABLE_KEY ?? SUPABASE_KEY) as string | undefined;
+    const supabaseUrl = import.meta.env.VITE_SUPABASE_URL as string | undefined;
+    const supabaseAnonKey = import.meta.env.VITE_SUPABASE_ANON_KEY as string | undefined;
     if (!supabaseUrl || !supabaseAnonKey) throw new Error("Missing Supabase configuration");
 
     const endpoint = `${supabaseUrl.replace(/\/$/, "")}/functions/v1/upload-reference-image`;
@@ -1621,25 +1594,19 @@ export function SceneDetailModal({
         return;
       }
 
-      const resp = isPlainObject(data) ? (data as Record<string, unknown>) : null;
-      const editedImageBase64 = typeof resp?.edited_image_base64 === "string" ? resp.edited_image_base64 : null;
-      const mime = typeof resp?.mime === "string" ? resp.mime : null;
-      const respError = typeof resp?.error === "string" ? resp.error : null;
-      const upstreamError = typeof resp?.upstreamError === "string" ? resp.upstreamError : null;
-
-      if (!editedImageBase64 || !mime) {
-        toast({ title: "Edit failed", description: respError || upstreamError || "Invalid edit response", variant: "destructive" });
+      const resp = data as { edited_image_base64?: string; mime?: string; upstreamError?: string; error?: string } | null;
+      if (!resp?.edited_image_base64 || !resp.mime) {
+        toast({ title: "Edit failed", description: resp?.error || resp?.upstreamError || "Invalid edit response", variant: "destructive" });
         return;
       }
 
-      const nextDataUrl = `data:${mime};base64,${editedImageBase64}`;
+      const nextDataUrl = `data:${resp.mime};base64,${resp.edited_image_base64}`;
       setImageHistory((prev) => {
         const base = prev.slice(0, historyIndex + 1);
         return [...base, nextDataUrl];
       });
       setHistoryIndex((idx) => idx + 1);
       setPreviewMode("current");
-      if (!applyCreditsFromResponse(resp?.credits)) await refreshProfile();
     } catch (e) {
       toast({ title: "Edit failed", description: e instanceof Error ? e.message : "Failed to preview edit", variant: "destructive" });
     } finally {

@@ -1,5 +1,5 @@
 import { serve } from "https://deno.land/std@0.168.0/http/server.ts";
-import { createClient, type SupabaseClientLike } from "https://esm.sh/@supabase/supabase-js@2.49.2";
+import { createClient } from "https://esm.sh/@supabase/supabase-js@2.49.2";
 import {
   buildStoryStyleGuideGuidance,
   buildStyleGuidance,
@@ -11,7 +11,6 @@ import {
   validateStyleApplication,
 } from "../_shared/style-prompts.ts";
 import { assemblePrompt, sanitizePrompt } from "../_shared/prompt-assembly.ts";
-import { parseConsumeCreditsResult } from "../_shared/credits.ts";
 
 const corsHeaders = {
   "Access-Control-Allow-Origin": "*",
@@ -87,76 +86,6 @@ async function sha256Hex(text: string): Promise<string> {
   const hashBuffer = await crypto.subtle.digest("SHA-256", data);
   const hashArray = Array.from(new Uint8Array(hashBuffer));
   return hashArray.map((b) => b.toString(16).padStart(2, "0")).join("");
-}
-
-function toFiniteNumber(value: unknown, fallback = 0) {
-  const n = typeof value === "number" ? value : typeof value === "string" ? Number(value) : NaN;
-  return Number.isFinite(n) ? n : fallback;
-}
-
-function hasFiniteNumberField(obj: Record<string, unknown>, key: string) {
-  return Number.isFinite(toFiniteNumber(obj[key], NaN));
-}
-
-async function backfillProfessionalMonthlyUsage(args: {
-  admin: SupabaseClientLike;
-  userId: string;
-  amount: number;
-}): Promise<{ remaining_monthly: number; remaining_bonus: number; tier: string } | null> {
-  const selectCols =
-    "tier,monthly_credits_per_cycle,monthly_credits_used,bonus_credits_total,bonus_credits_used,reserved_monthly,reserved_bonus";
-
-  const computeRemaining = (row: Record<string, unknown>) => {
-    const perCycle = toFiniteNumber(row.monthly_credits_per_cycle, 0);
-    const usedMonthly = toFiniteNumber(row.monthly_credits_used, 0);
-    const reservedMonthly = toFiniteNumber(row.reserved_monthly, 0);
-    const bonusTotal = toFiniteNumber(row.bonus_credits_total, 0);
-    const bonusUsed = toFiniteNumber(row.bonus_credits_used, 0);
-    const reservedBonus = toFiniteNumber(row.reserved_bonus, 0);
-    const remainingMonthly = Math.max(perCycle - usedMonthly - reservedMonthly, 0);
-    const remainingBonus = Math.max(bonusTotal - bonusUsed - reservedBonus, 0);
-    return { remainingMonthly, remainingBonus };
-  };
-
-  let lastRow: Record<string, unknown> | null = null;
-  for (let attempt = 0; attempt < 2; attempt += 1) {
-    const { data: row, error: rowErr } = await args.admin
-      .from("user_credits")
-      .select(selectCols)
-      .eq("user_id", args.userId)
-      .maybeSingle();
-    if (rowErr || !row) return null;
-
-    lastRow = row as unknown as Record<string, unknown>;
-    const currentUsed = toFiniteNumber(lastRow.monthly_credits_used, 0);
-    const nextUsed = currentUsed + args.amount;
-
-    const { data: updated, error: updErr } = await args.admin
-      .from("user_credits")
-      .update({ monthly_credits_used: nextUsed })
-      .eq("user_id", args.userId)
-      .eq("monthly_credits_used", currentUsed)
-      .select(selectCols)
-      .maybeSingle();
-
-    if (!updErr && updated) {
-      const updatedRec = updated as unknown as Record<string, unknown>;
-      const remaining = computeRemaining(updatedRec);
-      return {
-        remaining_monthly: remaining.remainingMonthly,
-        remaining_bonus: remaining.remainingBonus,
-        tier: typeof updatedRec.tier === "string" ? updatedRec.tier : "professional",
-      };
-    }
-  }
-
-  if (!lastRow) return null;
-  const remaining = computeRemaining(lastRow);
-  return {
-    remaining_monthly: remaining.remainingMonthly,
-    remaining_bonus: remaining.remainingBonus,
-    tier: typeof lastRow.tier === "string" ? lastRow.tier : "professional",
-  };
 }
 
 // Reuse truncate from shared if possible, or inline
@@ -303,45 +232,19 @@ function isRetryableUpstreamStatus(status: number) {
 serve(async (req: Request) => {
   if (req.method === "OPTIONS") return new Response(null, { headers: corsHeaders });
 
-  const serverRequestId = crypto.randomUUID();
-  let requestId: string = String(serverRequestId);
-  let adminClient: SupabaseClientLike | null = null;
-  let creditConsumed = false;
-  let creditRefunded = false;
-  let refundUserId: string | null = null;
-  let refundCharacterId: string | null = null;
-  let refundStoryId: string | null = null;
-  let creditsResult:
-    | { remaining_monthly?: number; remaining_bonus?: number; tier?: string; unlimited?: boolean }
-    | null = null;
+  const requestId = crypto.randomUUID();
   
   try {
     const supabaseUrl = Deno.env.get("SUPABASE_URL");
     const supabaseServiceKey = Deno.env.get("SUPABASE_SERVICE_ROLE_KEY");
-    const veniceApiKeyRaw = Deno.env.get("VENICE_API_KEY");
-    const veniceApiKey = typeof veniceApiKeyRaw === "string" ? veniceApiKeyRaw.trim().replace(/^["']|["']$/g, "") : "";
+    const veniceApiKey = Deno.env.get("VENICE_API_KEY");
 
     if (!supabaseUrl || !supabaseServiceKey || !veniceApiKey) {
       console.error("Missing environment variables");
       return json(500, { error: "Configuration error", requestId }, { "x-request-id": requestId });
     }
 
-    let requestBody: unknown = null;
-    try {
-      requestBody = await req.json();
-    } catch (e) {
-      return json(400, { error: "Invalid JSON body", requestId, details: errorToString(e) }, { "x-request-id": requestId });
-    }
-
-    const bodyObj = asJsonObject(requestBody) ?? {};
-    const clientRequestId =
-      asString(bodyObj.requestId) ?? asString(bodyObj.clientRequestId) ?? asString(bodyObj.request_id) ?? null;
-    if (clientRequestId && UUID_REGEX.test(clientRequestId)) {
-      requestId = clientRequestId;
-    }
-
-    const admin = createClient(supabaseUrl, supabaseServiceKey) as SupabaseClientLike;
-    adminClient = admin;
+    const admin = createClient(supabaseUrl, supabaseServiceKey);
 
     // Auth check
     const authHeader = req.headers.get("Authorization");
@@ -359,7 +262,6 @@ serve(async (req: Request) => {
         { "x-request-id": requestId },
       );
     }
-    refundUserId = user.id;
 
     // Parse Input
     const {
@@ -372,10 +274,9 @@ serve(async (req: Request) => {
       model, // e.g., "venice-sd35", "lustify-sdxl"
       pose, // "front", "three-quarter", "portrait"
       forceRegenerate,
-    } = requestBody as Record<string, unknown>;
+    } = await req.json();
 
-    const characterIdValue = asString(characterId);
-    if (!characterIdValue || !UUID_REGEX.test(characterIdValue)) {
+    if (!characterId || !UUID_REGEX.test(characterId)) {
       return json(400, { error: "Valid characterId is required", requestId }, { "x-request-id": requestId });
     }
 
@@ -387,7 +288,7 @@ serve(async (req: Request) => {
     const { data: characterRow, error: characterError } = await admin
       .from("characters")
       .select("id, story_id, name, description, physical_attributes, clothing, accessories, stories!inner(user_id, art_style, consistency_settings, active_style_guide_id)")
-      .eq("id", characterIdValue)
+      .eq("id", characterId)
       .maybeSingle();
 
     if (characterError) {
@@ -406,8 +307,6 @@ serve(async (req: Request) => {
     }
 
     const storyId = String(character.story_id);
-    refundStoryId = storyId;
-    refundCharacterId = characterIdValue;
     const characterName = String(character.name || "Character");
     const desc = String(character.description || "");
     const physical = String(character.physical_attributes || "");
@@ -554,7 +453,7 @@ serve(async (req: Request) => {
         height,
       }),
     );
-
+    
     if (!shouldForce) {
       const { data: existing } = await admin
         .from("character_reference_sheets")
@@ -586,110 +485,6 @@ serve(async (req: Request) => {
         );
       }
     }
-
-    const adminRpc = admin as unknown as {
-      rpc: (fn: string, params: Record<string, unknown>) => Promise<{ data: unknown; error: unknown }>;
-    };
-
-    const { data: creditData, error: creditError } = await adminRpc.rpc("consume_credits", {
-      p_user_id: user.id,
-      p_amount: 1,
-      p_description: "Character image generation",
-      p_metadata: {
-        feature: "generate-character-reference",
-        provider: "venice",
-        character_id: characterId,
-        story_id: storyId,
-        model: selectedModel,
-        style: effectiveStyle,
-        intensity: effectiveIntensity,
-        strict: effectiveStrict,
-        disabled_elements: effectiveDisabledElements,
-      },
-      p_request_id: requestId,
-    });
-
-    if (creditError) {
-      console.error("Credit consume error:", { requestId, creditError, characterId, storyId });
-      return json(500, { error: "Failed to verify credits", requestId, details: creditError }, { "x-request-id": requestId });
-    }
-
-    const creditParsed = parseConsumeCreditsResult(creditData);
-    if (!creditParsed) {
-      console.error("Credit consume returned unexpected payload:", { requestId, creditData });
-      return json(500, { error: "Failed to verify credits", requestId }, { "x-request-id": requestId });
-    }
-
-    if (creditParsed.ok === false) {
-      if (creditParsed.reason === "insufficient_credits") {
-        return json(
-          402,
-          {
-            error: "Insufficient credits",
-            requestId,
-            details: {
-              reason: creditParsed.reason,
-              remaining_monthly: creditParsed.remaining_monthly ?? 0,
-              remaining_bonus: creditParsed.remaining_bonus ?? 0,
-              tier: creditParsed.tier ?? null,
-            },
-          },
-          { "x-request-id": requestId, "x-failure-reason": "insufficient_credits" },
-        );
-      }
-
-      return json(
-        400,
-        { error: "Credit verification failed", requestId, details: creditParsed },
-        { "x-request-id": requestId },
-      );
-    }
-
-    const creditOk = creditParsed as unknown as Record<string, unknown>;
-    const parsedTier = typeof creditOk.tier === "string" ? creditOk.tier : null;
-    const parsedUnlimited = typeof creditOk.unlimited === "boolean" ? creditOk.unlimited : false;
-    const parsedIdempotent = creditOk.idempotent === true;
-
-    creditConsumed = true;
-    if (
-      parsedTier === "professional" &&
-      parsedUnlimited === true &&
-      !parsedIdempotent &&
-      !hasFiniteNumberField(creditOk, "remaining_monthly") &&
-      !hasFiniteNumberField(creditOk, "remaining_bonus")
-    ) {
-      const backfilled = await backfillProfessionalMonthlyUsage({ admin, userId: user.id, amount: 1 });
-      creditsResult = backfilled
-        ? { remaining_monthly: backfilled.remaining_monthly, remaining_bonus: backfilled.remaining_bonus, tier: backfilled.tier, unlimited: false }
-        : { remaining_monthly: creditParsed.remaining_monthly, remaining_bonus: creditParsed.remaining_bonus, tier: creditParsed.tier, unlimited: false };
-    } else {
-      creditsResult = {
-        remaining_monthly: creditParsed.remaining_monthly,
-        remaining_bonus: creditParsed.remaining_bonus,
-        tier: creditParsed.tier,
-        unlimited: creditParsed.unlimited,
-      };
-    }
-    const refundIfNeeded = async (reason: string, details: unknown) => {
-      if (creditRefunded) return;
-      creditRefunded = true;
-      const { data: refundData, error: refundError } = await adminRpc.rpc("refund_consumed_credits", {
-        p_user_id: user.id,
-        p_request_id: requestId,
-        p_reason: reason,
-        p_metadata: {
-          feature: "generate-character-reference",
-          character_id: characterId,
-          story_id: storyId,
-          details,
-        },
-      });
-      if (refundError) {
-        console.error("Credit refund error:", { requestId, refundError });
-      } else {
-        console.log("Credits refunded:", { requestId, refundData });
-      }
-    };
 
     // --- GENERATION ---
     console.log(`[Generate] Creating reference for ${characterName} (${characterId})`);
@@ -749,7 +544,6 @@ serve(async (req: Request) => {
             await sleep(delay);
             continue;
           }
-          await refundIfNeeded("Character image generation failed", { stage: "upstream_fetch", error: String(e) });
           return json(
             502,
             { error: "Failed to reach image generation provider", requestId, details: String(e) },
@@ -784,13 +578,6 @@ serve(async (req: Request) => {
             continue;
           }
 
-          await refundIfNeeded("Character image generation failed", {
-            stage: "upstream_response",
-            upstream_status: veniceRes.status,
-            upstream_status_text: veniceRes.statusText,
-            upstream_error: upstreamBodyText || "No error details provided",
-            headers: upstreamHeaders,
-          });
           return json(
             502,
             {
@@ -811,11 +598,6 @@ serve(async (req: Request) => {
           aiData = await veniceRes.json();
         } catch (e) {
           const raw = await veniceRes.text().catch(() => "");
-          await refundIfNeeded("Character image generation failed", {
-            stage: "upstream_invalid_json",
-            parse_error: String(e),
-            body: truncateText(raw, 2000),
-          });
           return json(
             502,
             {
@@ -833,12 +615,6 @@ serve(async (req: Request) => {
     }
 
     if (!aiData) {
-      await refundIfNeeded("Character image generation failed", {
-        stage: "upstream_retries_exhausted",
-        upstream_status: upstreamStatus,
-        upstream_error: upstreamBodyText || "No error details provided",
-        headers: upstreamHeaders,
-      });
       return json(
         502,
         {
@@ -855,24 +631,20 @@ serve(async (req: Request) => {
     }
 
     const b64 = extractFirstBase64Image(aiData);
-    if (!b64) {
-      await refundIfNeeded("Character image generation failed", { stage: "upstream_missing_image_data" });
-      return json(500, { error: "No image data returned", requestId }, { "x-request-id": requestId });
-    }
+    if (!b64) return json(500, { error: "No image data returned", requestId }, { "x-request-id": requestId });
 
     // --- STORAGE ---
     let bytes: Uint8Array;
     try {
       bytes = Uint8Array.from(atob(b64), (c) => c.charCodeAt(0));
     } catch (e) {
-      await refundIfNeeded("Character image generation failed", { stage: "decode_base64", error: String(e) });
       return json(500, { error: "Failed to decode image data", requestId, details: String(e) }, { "x-request-id": requestId });
     }
 
     const mime = detectImageMime(bytes);
     const ext = extFromMime(mime);
-    const fileName = `references/${user.id}/${characterIdValue}/${Date.now()}-ref.${ext}`;
-    const file = new Blob([bytes as unknown as BlobPart], { type: mime });
+    const fileName = `references/${user.id}/${characterId}/${Date.now()}-ref.${ext}`;
+    const file = new Blob([bytes], { type: mime });
 
     const tryUpload = async (bucket: string) => {
       try {
@@ -890,11 +662,6 @@ serve(async (req: Request) => {
       const fallback = await tryUpload(targetBucket);
       if (!fallback.ok) {
         console.error("Upload error:", { primary: primary.error, fallback: fallback.error });
-        await refundIfNeeded("Character image generation failed", {
-          stage: "upload",
-          primary: errorToString(primary.error),
-          fallback: errorToString(fallback.error),
-        });
         return json(
           500,
           {
@@ -914,7 +681,7 @@ serve(async (req: Request) => {
     const { data: maxVersionRow } = await admin
       .from("character_reference_sheets")
       .select("version, id")
-      .eq("character_id", characterIdValue)
+      .eq("character_id", characterId)
       .order("version", { ascending: false })
       .limit(1)
       .maybeSingle();
@@ -926,7 +693,7 @@ serve(async (req: Request) => {
 
     const sheetInsertPayload = {
       story_id: storyId,
-      character_id: characterIdValue,
+      character_id: characterId,
       version: nextVersion,
       status: "approved",
       reference_image_url: publicUrl,
@@ -963,14 +730,8 @@ serve(async (req: Request) => {
       .single();
 
     const activeSheetId = newSheet?.id ? String(newSheet.id) : null;
-    if (dbError || !activeSheetId) {
+    if (dbError) {
       console.error("DB Insert Error:", dbError);
-      await refundIfNeeded("Character image generation failed", { stage: "db_insert_reference_sheet", dbError });
-      return json(
-        500,
-        { error: "Failed to save reference sheet", requestId, details: dbError },
-        { "x-request-id": requestId },
-      );
     }
 
     const updatePayload: Record<string, unknown> = { image_url: publicUrl };
@@ -991,7 +752,6 @@ serve(async (req: Request) => {
 
     if (characterUpdateError) {
       console.error("Character update error:", characterUpdateError);
-      await refundIfNeeded("Character image generation failed", { stage: "db_update_character", characterUpdateError });
       return json(
         500,
         { error: "Failed to update character with generated image", requestId, details: characterUpdateError },
@@ -1010,15 +770,6 @@ serve(async (req: Request) => {
         attempts,
         model: selectedModel,
         promptHash,
-        credits: creditsResult
-          ? {
-              consumed: 1,
-              remaining_monthly: creditsResult.remaining_monthly,
-              remaining_bonus: creditsResult.remaining_bonus,
-              tier: creditsResult.tier,
-              unlimited: creditsResult.unlimited,
-            }
-          : undefined,
         style: {
           id: effectiveStyle,
           intensity: effectiveIntensity,
@@ -1034,27 +785,6 @@ serve(async (req: Request) => {
 
   } catch (e) {
     console.error("Unexpected error:", e);
-    if (creditConsumed && !creditRefunded && adminClient && refundUserId) {
-      try {
-        const adminRpc = adminClient as unknown as {
-          rpc: (fn: string, params: Record<string, unknown>) => Promise<{ data: unknown; error: unknown }>;
-        };
-        const { error: refundError } = await adminRpc.rpc("refund_consumed_credits", {
-          p_user_id: refundUserId,
-          p_request_id: requestId,
-          p_reason: "Character image generation failed",
-          p_metadata: {
-            feature: "generate-character-reference",
-            character_id: refundCharacterId,
-            story_id: refundStoryId,
-            details: { stage: "unexpected_exception", error: String(e) },
-          },
-        });
-        if (refundError) console.error("Credit refund error:", { requestId, refundError });
-      } catch (refundErr) {
-        console.error("Credit refund error:", { requestId, refundErr });
-      }
-    }
     return json(500, { error: "Internal Server Error", details: String(e), requestId }, { "x-request-id": requestId });
   }
 });

@@ -1,5 +1,5 @@
 import { assertEquals } from "https://deno.land/std@0.168.0/testing/asserts.ts";
-import { asConsistencySettings, clampNumber, detectImageMime, truncateText } from "../index.ts";
+import { asConsistencySettings, clampNumber, detectImageMime, shouldTryReserveAfterCommitFailure, truncateText } from "../index.ts";
 
 Deno.test("clampNumber should restrict values within range", () => {
   assertEquals(clampNumber(50, 0, 100, 70), 50);
@@ -40,4 +40,16 @@ Deno.test("detectImageMime should identify JPEG signature", () => {
 Deno.test("detectImageMime should default to WebP for unknown", () => {
   const unknown = new Uint8Array([0x00, 0x00, 0x00]);
   assertEquals(detectImageMime(unknown), "image/webp");
+});
+
+Deno.test("shouldTryReserveAfterCommitFailure should return true for missing_reservation", () => {
+  assertEquals(shouldTryReserveAfterCommitFailure("missing_reservation", null), true);
+});
+
+Deno.test("shouldTryReserveAfterCommitFailure should return true when commitErr present", () => {
+  assertEquals(shouldTryReserveAfterCommitFailure(null, new Error("rpc failed")), true);
+});
+
+Deno.test("shouldTryReserveAfterCommitFailure should return false for other reasons without error", () => {
+  assertEquals(shouldTryReserveAfterCommitFailure("not_allowed", null), false);
 });

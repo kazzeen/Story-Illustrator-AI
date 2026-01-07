@@ -18,19 +18,21 @@ const navItems = [
   { path: "/pricing", icon: CreditCard, label: "Pricing" },
 ];
 
+function formatPlanLabel(tier: unknown) {
+  const t = typeof tier === "string" ? tier.trim().toLowerCase() : "";
+  if (t === "starter") return "Starter";
+  if (t === "creator") return "Creator";
+  if (t === "professional") return "Pro";
+  if (t === "basic") return "Free";
+  if (!t) return "Free";
+  return t.slice(0, 1).toUpperCase() + t.slice(1);
+}
+
 export function Navbar() {
   const location = useLocation();
   const navigate = useNavigate();
   const { user, signOut, profile } = useAuth();
-  const subscriptionTier = typeof profile?.subscription_tier === "string" ? profile.subscription_tier : null;
-  const planLabel =
-    subscriptionTier === "starter"
-      ? "Starter"
-      : subscriptionTier === "creator"
-        ? "Creator"
-        : subscriptionTier === "professional"
-          ? "Pro"
-          : "Free";
+  const planLabel = formatPlanLabel(profile?.subscription_tier);
 
   const handleSignOut = async () => {
     await signOut();
@@ -79,17 +81,16 @@ export function Navbar() {
           <div className="flex items-center gap-3">
             {user ? (
               <>
-                <Link to="/pricing">
-                  <Button variant="ghost" size="sm" className="flex items-center gap-2">
-                    <CreditCard className="w-4 h-4" />
-                    <span className="font-semibold">{profile?.credits_balance ?? 0}</span>
-                    <span className="text-muted-foreground text-xs">credits</span>
-                    <span className="hidden sm:inline-flex items-center text-muted-foreground text-xs">·</span>
-                    <span className="hidden sm:inline-flex items-center rounded-full bg-secondary px-2 py-0.5 text-xs font-medium text-foreground">
-                      {planLabel}
-                    </span>
-                  </Button>
-                </Link>
+                {profile && (
+                  <Link to="/pricing">
+                    <Button variant="ghost" size="sm" className="hidden sm:flex items-center gap-2">
+                      <CreditCard className="w-4 h-4" />
+                      <span className="font-semibold">{profile.credits_balance ?? 0}</span>
+                      <span className="text-muted-foreground text-xs">credits </span>
+                      <span className="text-muted-foreground text-xs">{planLabel}</span>
+                    </Button>
+                  </Link>
+                )}
                 <Link to="/import">
                   <Button variant="hero" size="sm">
                     New Story
@@ -102,14 +103,16 @@ export function Navbar() {
                     </Button>
                   </DropdownMenuTrigger>
                   <DropdownMenuContent align="end">
-                    <DropdownMenuItem className="text-muted-foreground text-sm">
+                    <DropdownMenuItem className="text-muted-foreground text-sm" disabled>
                       {user.email}
                     </DropdownMenuItem>
-                    <DropdownMenuSeparator />
-                    <DropdownMenuItem onClick={() => navigate("/profile")}>
-                      <User className="w-4 h-4 mr-2" />
-                      Profile
+                    <DropdownMenuItem asChild>
+                      <Link to="/profile">
+                        <User className="w-4 h-4 mr-2" />
+                        Profile
+                      </Link>
                     </DropdownMenuItem>
+                    <DropdownMenuSeparator />
                     <DropdownMenuItem onClick={handleSignOut}>
                       <LogOut className="w-4 h-4 mr-2" />
                       Sign Out

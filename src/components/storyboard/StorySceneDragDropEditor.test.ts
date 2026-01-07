@@ -42,8 +42,6 @@ describe("validateAnchorsContinuity", () => {
 });
 
 describe("undo/redo stacks", () => {
-  type Anchors = Record<string, number>;
-
   it("does nothing when undo stack is empty", () => {
     const result = applyUndo({ anchors: { a: 1 }, past: [], future: [] });
     expect(result.ok).toBe(false);
@@ -55,8 +53,8 @@ describe("undo/redo stacks", () => {
   });
 
   it("supports a single undo and redo", () => {
-    const s0: Anchors = { a: 0 };
-    const s1: Anchors = { a: 1 };
+    const s0 = { a: 0 };
+    const s1 = { a: 1 };
 
     const undoRes = applyUndo({ anchors: s1, past: [s0], future: [] });
     expect(undoRes.ok).toBe(true);
@@ -76,11 +74,11 @@ describe("undo/redo stacks", () => {
   });
 
   it("supports multiple consecutive operations", () => {
-    const s0: Anchors = { a: 0 };
-    const s1: Anchors = { a: 1 };
-    const s2: Anchors = { a: 2 };
+    const s0 = { a: 0 };
+    const s1 = { a: 1 };
+    const s2 = { a: 2 };
 
-    let state: { anchors: Anchors; past: Anchors[]; future: Anchors[] } = { anchors: s2, past: [s0, s1], future: [] };
+    let state = { anchors: s2, past: [s0, s1], future: [] as Array<{ a: number }> };
 
     const u1 = applyUndo(state);
     expect(u1.ok).toBe(true);

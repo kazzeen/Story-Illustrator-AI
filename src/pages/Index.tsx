@@ -1,5 +1,6 @@
 import { Layout } from "@/components/layout/Layout";
 import { StoryCard } from "@/components/dashboard/StoryCard";
+import { QuickActions } from "@/components/dashboard/QuickActions";
 import { Stats } from "@/components/dashboard/Stats";
 import { Button } from "@/components/ui/button";
 import { Plus, ArrowRight, Sparkles, LogIn } from "lucide-react";
@@ -98,6 +99,14 @@ export default function Index() {
                 totalScenes={stories.reduce((acc, s) => acc + s.scene_count, 0)}
                 completedStories={stories.filter(s => s.status === 'completed').length}
               />
+            </section>
+
+            {/* Quick Actions */}
+            <section className="mb-12">
+              <h2 className="font-display text-2xl font-semibold text-foreground mb-6">
+                Quick Actions
+              </h2>
+              <QuickActions />
             </section>
 
             {/* Recent Stories */}
