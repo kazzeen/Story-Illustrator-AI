@@ -117,6 +117,11 @@ function isRecord(value: unknown): value is Record<string, unknown> {
   return typeof value === "object" && value !== null && !Array.isArray(value);
 }
 
+export function shouldLogFailureTransactionForBypassedCredits(value: unknown): boolean {
+  if (!isRecord(value)) return false;
+  return value.bypassed === true;
+}
+
 function serializeSupabaseError(err: unknown): JsonObject | null {
   const e = asJsonObject(err);
   if (!e) return null;
@@ -987,6 +992,142 @@ export function extFromMimeTyped(mime: "image/webp" | "image/png" | "image/jpeg"
   return "png";
 }
 
+export function computeSampleLumaStatsFromBitmap(args: {
+  bitmap: Uint8Array;
+  width: number;
+  height: number;
+  maxSamples?: number;
+}): { mean: number; std: number; samples: number; maxRgb: number; maxAlpha: number } {
+  const w = Number(args.width);
+  const h = Number(args.height);
+  const bitmap = args.bitmap;
+  const maxSamples = typeof args.maxSamples === "number" && args.maxSamples > 0 ? Math.floor(args.maxSamples) : 4096;
+
+  if (!Number.isFinite(w) || !Number.isFinite(h) || w <= 0 || h <= 0) return { mean: 0, std: 0, samples: 0, maxRgb: 0, maxAlpha: 0 };
+  if (!bitmap || bitmap.length < w * h * 4) return { mean: 0, std: 0, samples: 0, maxRgb: 0, maxAlpha: 0 };
+
+  const totalPixels = w * h;
+  const step = Math.max(1, Math.floor(Math.sqrt(totalPixels / Math.min(maxSamples, totalPixels))));
+  const stepX = step;
+  const stepY = step;
+
+  let sum = 0;
+  let sumSq = 0;
+  let samples = 0;
+  let maxRgb = 0;
+  let maxAlpha = 0;
+
+  for (let y = 0; y < h; y += stepY) {
+    for (let x = 0; x < w; x += stepX) {
+      const idx = (y * w + x) * 4;
+      const r = bitmap[idx] ?? 0;
+      const g = bitmap[idx + 1] ?? 0;
+      const b = bitmap[idx + 2] ?? 0;
+      const a = bitmap[idx + 3] ?? 0;
+      const rgbMax = Math.max(r, g, b);
+      if (rgbMax > maxRgb) maxRgb = rgbMax;
+      if (a > maxAlpha) maxAlpha = a;
+      const luma = 0.2126 * r + 0.7152 * g + 0.0722 * b;
+      sum += luma;
+      sumSq += luma * luma;
+      samples += 1;
+    }
+  }
+
+  if (samples <= 0) return { mean: 0, std: 0, samples: 0, maxRgb: maxRgb, maxAlpha: maxAlpha };
+  const mean = sum / samples;
+  const variance = Math.max(0, sumSq / samples - mean * mean);
+  const std = Math.sqrt(variance);
+  return { mean, std, samples, maxRgb, maxAlpha };
+}
+
+function countUniqueColors(bitmap: Uint8Array, width: number, height: number, maxSamples = 1000) {
+  const w = Number(width);
+  const h = Number(height);
+  if (!Number.isFinite(w) || !Number.isFinite(h) || w <= 0 || h <= 0) return 0;
+  if (!bitmap || bitmap.length < w * h * 4) return 0;
+
+  const totalPixels = w * h;
+  const step = Math.max(1, Math.floor(totalPixels / Math.min(maxSamples, totalPixels)));
+  const seen = new Set<string>();
+
+  for (let i = 0; i < totalPixels; i += step) {
+    const idx = i * 4;
+    const r = bitmap[idx] ?? 0;
+    const g = bitmap[idx + 1] ?? 0;
+    const b = bitmap[idx + 2] ?? 0;
+    // Simple quantization to reduce noise sensitivity
+    const qr = Math.floor(r / 8) * 8;
+    const qg = Math.floor(g / 8) * 8;
+    const qb = Math.floor(b / 8) * 8;
+    seen.add(`${qr},${qg},${qb}`);
+    if (seen.size >= 50) break; // Optimization: If we have enough variety, stop
+  }
+  return seen.size;
+}
+
+function roundStat(n: number) {
+  if (!Number.isFinite(n)) return 0;
+  const rounded = Math.round(n * 1000) / 1000;
+  return Math.abs(rounded) < 0.0005 ? 0 : rounded;
+}
+
+async function computeEncodedImageStats(bytes: Uint8Array): Promise<
+  | {
+      ok: true;
+      width: number;
+      height: number;
+      mean: number;
+      std: number;
+      samples: number;
+      maxRgb: number;
+      maxAlpha: number;
+      uniqueColors: number;
+    }
+  | { ok: false; error: string }
+> {
+  try {
+    const decoded = (await (Image as unknown as { decode: (b: Uint8Array) => Promise<unknown> }).decode(bytes)) as Record<string, unknown>;
+    const width = typeof decoded.width === "number" ? decoded.width : NaN;
+    const height = typeof decoded.height === "number" ? decoded.height : NaN;
+    const bitmapRaw = (decoded as Record<string, unknown>).bitmap ?? (decoded as Record<string, unknown>).data ?? (decoded as Record<string, unknown>).pixels;
+    const bitmap =
+      bitmapRaw instanceof Uint8Array || bitmapRaw instanceof Uint8ClampedArray
+        ? new Uint8Array(bitmapRaw)
+        : bitmapRaw instanceof ArrayBuffer
+          ? new Uint8Array(bitmapRaw)
+        : ArrayBuffer.isView(bitmapRaw)
+          ? new Uint8Array(bitmapRaw.buffer, bitmapRaw.byteOffset, bitmapRaw.byteLength)
+          : null;
+    if (!bitmap || !Number.isFinite(width) || !Number.isFinite(height)) return { ok: false, error: "missing_bitmap" };
+    const stats = computeSampleLumaStatsFromBitmap({ bitmap, width, height });
+    const uniqueColors = countUniqueColors(bitmap, width, height);
+    return { ok: true, width, height, mean: stats.mean, std: stats.std, samples: stats.samples, maxRgb: stats.maxRgb, maxAlpha: stats.maxAlpha, uniqueColors };
+  } catch (e) {
+    return { ok: false, error: String(e) };
+  }
+}
+
+function isImageStatsBlank(args: { mean: number; std: number; uniqueColors?: number }) {
+  const mean = roundStat(args.mean);
+  const std = roundStat(args.std);
+  const unique = args.uniqueColors ?? 100; // Default to passing if not provided
+  
+  // Strict blank detection:
+  // 1. Zero or very low variance (solid color or near-solid)
+  if (std < 5) return { blank: true as const, mean, std, unique, reason: "low_variance" };
+
+  // 2. Very few unique colors (flat image)
+  if (unique < 10) return { blank: true as const, mean, std, unique, reason: "low_color_variety" };
+  
+  // 3. Extreme darkness or brightness with low variance
+  // (already covered by std < 5, but let's be explicit for very dark/bright images that might have slight noise)
+  if (mean < 5 && std < 10) return { blank: true as const, mean, std, unique, reason: "too_dark" };
+  if (mean > 250 && std < 10) return { blank: true as const, mean, std, unique, reason: "too_bright" };
+  
+  return { blank: false as const, mean, std, unique, reason: null };
+}
+
 function deriveFailureReasons(args: {
   status: number;
   statusText: string;
@@ -1038,7 +1179,7 @@ async function fetchWithTimeout(url: string, init: RequestInit, timeoutMs: numbe
 serve(async (req: Request) => {
   if (req.method === "OPTIONS") return new Response(null, { headers: corsHeaders });
 
-  const requestId = crypto.randomUUID();
+  let requestId = crypto.randomUUID();
   let admin: ReturnType<typeof createClient> | null = null;
   let currentSceneRow: SceneRow | null = null;
   let requestedSceneId: string | null = null;
@@ -1046,9 +1187,25 @@ serve(async (req: Request) => {
   const creditsAmount = 1;
   let creditsReservationExists = false;
   let creditsInfo: Record<string, unknown> | null = null;
+  let creditsCharged = false;
+  let reserveMetadata: Record<string, unknown> | null = null;
   let attemptStarted = false;
   let updateAttempt: ((patch: Record<string, unknown>) => Promise<void>) | null = null;
   let releaseReservationIfNeeded:
+    | ((
+        reason: string,
+        stage: string,
+        extraMetadata?: Record<string, unknown>,
+      ) => Promise<Record<string, unknown> | null>)
+    | null = null;
+  let recordFailure:
+    | ((
+        reason: string,
+        stage: string,
+        extraMetadata?: Record<string, unknown>,
+      ) => Promise<Record<string, unknown> | null>)
+    | null = null;
+  let handleFailureCredits:
     | ((
         reason: string,
         stage: string,
@@ -1085,6 +1242,7 @@ serve(async (req: Request) => {
     const requestBody = await req.json();
     const {
       sceneId,
+      clientRequestId,
       storyId,
       reset: resetFlag,
       artStyle,
@@ -1100,6 +1258,11 @@ serve(async (req: Request) => {
       characterImageReferenceEnabled,
       character_image_reference_enabled: characterImageReferenceEnabledSnake,
     } = requestBody as Record<string, unknown>;
+
+    const clientRequestIdValue = asString(clientRequestId);
+    if (clientRequestIdValue && UUID_REGEX.test(clientRequestIdValue)) {
+      requestId = clientRequestIdValue;
+    }
     requestedSceneId = sceneId;
 
     const warnings: string[] = [];
@@ -1157,9 +1320,124 @@ serve(async (req: Request) => {
       }
     };
 
+    const logEarlyFailureIfNeeded = async (reason: string, stage: string, extraMetadata?: Record<string, unknown>) => {
+      if (!admin) return;
+      const failureTimestamp = new Date().toISOString();
+      console.error("[Credits] Generation failed (pre-charge)", {
+        requestId,
+        user_id: user.id,
+        restored_amount: 0,
+        stage,
+        reason,
+        timestamp: failureTimestamp,
+      });
+
+      try {
+        await updateAttempt?.({
+          status: "failed",
+          credits_amount: 0,
+          error_stage: stage,
+          error_message: reason,
+          metadata: {
+            feature: creditFeature,
+            stage,
+            scene_id: requestedSceneId,
+            user_id: user.id,
+            failure_timestamp: failureTimestamp,
+            restored_amount: 0,
+            failure_reason: reason,
+            ...(extraMetadata ?? {}),
+          },
+        });
+      } catch {
+        void 0;
+      }
+
+      try {
+        const { data } = await admin
+          .from("credit_transactions")
+          .select("id")
+          .eq("user_id", user.id)
+          .eq("request_id", requestId)
+          .in("transaction_type", ["reservation", "usage", "release", "refund"])
+          .limit(1);
+        if (Array.isArray(data) && data.length > 0) return;
+
+        await admin.from("credit_transactions").insert({
+          user_id: user.id,
+          amount: 0,
+          transaction_type: "release",
+          description: reason,
+          metadata: {
+            feature: creditFeature,
+            stage,
+            scene_id: requestedSceneId,
+            user_id: user.id,
+            failure_timestamp: failureTimestamp,
+            restored_amount: 0,
+            failure_reason: reason,
+            release_reason: reason,
+            ...(extraMetadata ?? {}),
+          },
+          request_id: requestId,
+        });
+      } catch (e) {
+        console.error("[Credits] logZeroAmountFailureTransactionIfNeeded failed:", e);
+      }
+    };
+
+    const ensureFailureTransactionDetails = async (reason: string, stage: string, extraMetadata?: Record<string, unknown>) => {
+      if (!admin) return;
+      try {
+        const md = {
+          feature: creditFeature,
+          stage,
+          scene_id: requestedSceneId,
+          user_id: user.id,
+          failure_reason: reason,
+          release_reason: reason,
+          refund_reason: reason,
+          ...(extraMetadata ?? {}),
+        };
+
+        const { data: txRows } = await admin
+          .from("credit_transactions")
+          .select("id, transaction_type, amount, description, metadata")
+          .eq("user_id", user.id)
+          .eq("request_id", requestId)
+          .in("transaction_type", ["release", "refund"]);
+
+        if (!Array.isArray(txRows)) return;
+
+        for (const row of txRows) {
+          if (!isRecord(row)) continue;
+          const id = asString(row.id);
+          const transactionType = asString(row.transaction_type);
+          const amount = typeof row.amount === "number" ? row.amount : Number(row.amount);
+          if (!id || !transactionType) continue;
+
+          const existingMetadata = isRecord(row.metadata) ? row.metadata : {};
+          if (transactionType === "release" && amount === 0) {
+            const releaseType = asString(existingMetadata.release_type);
+            if (releaseType === "commit") continue;
+          }
+
+          const mergedMetadata = {
+            ...existingMetadata,
+            ...md,
+          };
+
+          await admin.from("credit_transactions").update({ description: reason, metadata: mergedMetadata }).eq("id", id);
+        }
+      } catch {
+        void 0;
+      }
+    };
+
     releaseReservationIfNeeded = async (reason: string, stage: string, extraMetadata?: Record<string, unknown>) => {
       if (!admin || !creditsReservationExists) return null;
       try {
+        const failureTimestamp = new Date().toISOString();
         const { data, error } = await admin.rpc("release_reserved_credits", {
           p_user_id: user.id,
           p_request_id: requestId,
@@ -1168,6 +1446,11 @@ serve(async (req: Request) => {
             feature: creditFeature,
             stage,
             scene_id: requestedSceneId,
+            user_id: user.id,
+            failure_timestamp: failureTimestamp,
+            restored_amount: creditsAmount,
+            failure_reason: reason,
+            release_reason: reason,
             ...(extraMetadata ?? {}),
           },
         });
@@ -1178,6 +1461,12 @@ serve(async (req: Request) => {
           creditsReservationExists = false;
           creditsInfo = parsed;
         }
+        await ensureFailureTransactionDetails(reason, stage, {
+          failure_timestamp: failureTimestamp,
+          restored_amount: creditsAmount,
+          release_reason: reason,
+          ...(extraMetadata ?? {}),
+        });
         return parsed;
       } catch (e) {
         console.warn("[Credits] Release failed", { requestId, error: String(e) });
@@ -1189,6 +1478,9 @@ serve(async (req: Request) => {
     if (resetFlag) {
       // Validate storyId
       if (!storyId || !UUID_REGEX.test(storyId)) {
+        await logEarlyFailureIfNeeded("Scene image reset failed: Valid story ID is required", "reset_validate", {
+          story_id: typeof storyId === "string" ? storyId : null,
+        });
         return json(400, { error: "Valid story ID is required for reset", requestId });
       }
       const storyIdString = String(storyId);
@@ -1201,11 +1493,25 @@ serve(async (req: Request) => {
 
       if (storyError) {
         console.error("Story fetch error:", { requestId, storyError });
+        await logEarlyFailureIfNeeded("Scene image reset failed: Failed to fetch story", "reset_story_fetch", {
+          story_id: storyIdString,
+          details: serializeSupabaseError(storyError),
+        });
         return json(500, { error: "Failed to fetch story", requestId, details: serializeSupabaseError(storyError) });
       }
 
-      if (!story) return json(404, { error: "Story not found", requestId });
-      if (story.user_id !== user.id) return json(403, { error: "Not allowed", requestId });
+      if (!story) {
+        await logEarlyFailureIfNeeded("Scene image reset failed: Story not found", "reset_story_fetch", {
+          story_id: storyIdString,
+        });
+        return json(404, { error: "Story not found", requestId });
+      }
+      if (story.user_id !== user.id) {
+        await logEarlyFailureIfNeeded("Scene image reset failed: Not allowed", "reset_authz", {
+          story_id: storyIdString,
+        });
+        return json(403, { error: "Not allowed", requestId });
+      }
 
       const { data: updatedRows, count, error: resetError } = await admin
         .from("scenes")
@@ -1218,6 +1524,10 @@ serve(async (req: Request) => {
 
       if (resetError) {
         console.error("Scene reset error:", { requestId, resetError });
+        await logEarlyFailureIfNeeded("Scene image reset failed: Failed to reset scenes", "reset_update", {
+          story_id: storyIdString,
+          details: serializeSupabaseError(resetError),
+        });
         return json(500, { error: "Failed to reset scenes", requestId, details: serializeSupabaseError(resetError) });
       }
 
@@ -1230,6 +1540,9 @@ serve(async (req: Request) => {
 
     // Validate sceneId is a valid UUID
     if (!sceneId || !UUID_REGEX.test(sceneId)) {
+      await logEarlyFailureIfNeeded("Scene image generation failed: Valid scene ID is required", "validate_scene_id", {
+        scene_id: typeof sceneId === "string" ? sceneId : null,
+      });
       return json(400, { error: "Valid scene ID is required", requestId });
     }
 
@@ -1265,6 +1578,10 @@ serve(async (req: Request) => {
       console.log(`[Debug] Received request for model: '${usedModel}'`);
       if (!ALLOWED_MODELS.includes(usedModel)) {
         console.error(`[Error] Invalid model requested: '${usedModel}'. Allowed: ${ALLOWED_MODELS.join(", ")}`);
+        await logEarlyFailureIfNeeded("Scene image generation failed: Invalid model", "validate_model", {
+          model: usedModel,
+          allowed_models: ALLOWED_MODELS,
+        });
         return json(400, { error: "Invalid model", requestId, details: `Model '${usedModel}' not supported` });
       }
     }
@@ -1305,6 +1622,12 @@ serve(async (req: Request) => {
       const dbCode = asString(serialized?.code);
       const dbMessage = asString(serialized?.message);
       console.error("Scene fetch error:", { requestId, sceneError, retrySceneError, probeError });
+      await logEarlyFailureIfNeeded("Scene image generation failed: Failed to fetch scene", "scene_fetch", {
+        dbCode,
+        dbMessage,
+        details: serialized ?? sceneError,
+        retryDetails: retrySerialized,
+      });
       return json(500, {
         error: "Failed to fetch scene",
         requestId,
@@ -1316,7 +1639,12 @@ serve(async (req: Request) => {
       });
     }
 
-    if (!scene) return json(404, { error: "Scene not found", requestId });
+    if (!scene) {
+      await logEarlyFailureIfNeeded("Scene image generation failed: Scene not found", "scene_fetch", {
+        scene_id: sceneId,
+      });
+      return json(404, { error: "Scene not found", requestId });
+    }
     currentSceneRow = scene;
 
     const { data: storyRow, error: storyError } = await admin
@@ -1326,10 +1654,19 @@ serve(async (req: Request) => {
       .single();
 
     if (storyError || !storyRow) {
+      await logEarlyFailureIfNeeded("Scene image generation failed: Failed to fetch story", "story_fetch", {
+        details: storyError ? serializeSupabaseError(storyError) : "missing_story_row",
+      });
       return json(500, { error: "Failed to fetch story", requestId });
     }
 
-    if (storyRow.user_id !== user.id) return json(403, { error: "Not allowed", requestId });
+    if (storyRow.user_id !== user.id) {
+      await logEarlyFailureIfNeeded("Scene image generation failed: Not allowed", "story_authz", {
+        story_id: scene.story_id,
+        scene_id: sceneId,
+      });
+      return json(403, { error: "Not allowed", requestId });
+    }
 
     const storyConsistency = asConsistencySettings((storyRow as { consistency_settings?: unknown }).consistency_settings) ?? {};
     const characterImageReferenceEnabledEffective =
@@ -1762,6 +2099,9 @@ serve(async (req: Request) => {
         if (isPromptOnly) {
           return json(200, { success: false, error: "Prompt is empty", requestId, stage: "prompt_only_force_full_prompt" });
         }
+        await logEarlyFailureIfNeeded("Scene image generation failed: Prompt is empty", "prompt_validate", {
+          prompt_source: "force_full_prompt",
+        });
         return json(400, { error: "Prompt is empty", requestId });
       }
       fullPrompt = normalized.length > maxPromptLength ? normalized.slice(0, maxPromptLength) : normalized;
@@ -1786,6 +2126,10 @@ serve(async (req: Request) => {
         if (usedStrictStyle) {
           if (!isPromptOnly) {
             await admin.from("scenes").update({ generation_status: "error" }).eq("id", sceneId);
+            await logEarlyFailureIfNeeded("Scene image generation failed: Style application failed", "style_application", {
+              styleId: selectedStyle,
+              model: selectedModel,
+            });
             return json(500, {
               error: "Style application failed",
               requestId,
@@ -1857,7 +2201,7 @@ serve(async (req: Request) => {
       }
     }
 
-    const reserveMetadata: Record<string, unknown> = {
+    reserveMetadata = {
       feature: creditFeature,
       scene_id: sceneId,
       story_id: scene.story_id,
@@ -1865,6 +2209,141 @@ serve(async (req: Request) => {
       width,
       height,
     };
+
+    const logZeroAmountFailureTransactionIfNeeded = async (reason: string, stage: string, extraMetadata?: Record<string, unknown>) => {
+      if (!admin) return;
+      if (!shouldLogFailureTransactionForBypassedCredits(creditsInfo)) return;
+      try {
+        const { data } = await admin
+          .from("credit_transactions")
+          .select("id")
+          .eq("user_id", user.id)
+          .eq("request_id", requestId)
+          .in("transaction_type", ["release", "refund"])
+          .limit(1);
+        if (Array.isArray(data) && data.length > 0) return;
+
+        const failureTimestamp = new Date().toISOString();
+        await admin.from("credit_transactions").insert({
+          user_id: user.id,
+          amount: 0,
+          transaction_type: "release",
+          description: reason,
+          metadata: {
+            feature: creditFeature,
+            stage,
+            scene_id: requestedSceneId,
+            user_id: user.id,
+            failure_timestamp: failureTimestamp,
+            restored_amount: 0,
+            failure_reason: reason,
+            release_reason: reason,
+            ...(extraMetadata ?? {}),
+          },
+          request_id: requestId,
+        });
+      } catch {
+        void 0;
+      }
+    };
+
+    recordFailure = async (reason: string, stage: string, extraMetadata?: Record<string, unknown>) => {
+      const failureTimestamp = new Date().toISOString();
+      const restoredAmount = creditsReservationExists ? creditsAmount : 0;
+      const metadata = {
+        feature: creditFeature,
+        stage,
+        scene_id: requestedSceneId,
+        user_id: user.id,
+        failure_timestamp: failureTimestamp,
+        restored_amount: restoredAmount,
+        failure_reason: reason,
+        ...(extraMetadata ?? {}),
+      };
+
+      const released = releaseReservationIfNeeded ? await releaseReservationIfNeeded(reason, stage, metadata) : null;
+      if (!released) await logZeroAmountFailureTransactionIfNeeded(reason, stage, metadata);
+      await ensureFailureTransactionDetails(reason, stage, metadata);
+      return released;
+    };
+
+    handleFailureCredits = async (reason: string, stage: string, extraMetadata?: Record<string, unknown>) => {
+      if (!admin) return null;
+
+      const failureTimestamp = new Date().toISOString();
+      const restoredAmount = creditsCharged || creditsReservationExists ? creditsAmount : 0;
+      console.error("[Credits] Generation failed", {
+        requestId,
+        user_id: user.id,
+        restored_amount: restoredAmount,
+        stage,
+        reason,
+        timestamp: failureTimestamp,
+      });
+      const metadata = {
+        feature: creditFeature,
+        stage,
+        scene_id: requestedSceneId,
+        user_id: user.id,
+        failure_timestamp: failureTimestamp,
+        restored_amount: restoredAmount,
+        failure_reason: reason,
+        release_reason: reason,
+        refund_reason: reason,
+        ...(extraMetadata ?? {}),
+      };
+
+      // Use robust force_refund_credits function to ensure user is refunded
+      // This handles both reserved and consumed credits, and is idempotent.
+      let result: Record<string, unknown> | null = null;
+      try {
+        const { data, error } = await admin.rpc("force_refund_credits", {
+          p_user_id: user.id,
+          p_request_id: requestId,
+          p_reason: reason,
+          p_metadata: metadata,
+        });
+
+        if (error) {
+          console.error("[Credits] force_refund_credits RPC failed:", error);
+          // Fallback: try legacy release if RPC fails (e.g. migration not applied yet)
+          if (releaseReservationIfNeeded) {
+             console.log("[Credits] Attempting fallback releaseReservationIfNeeded...");
+             const fallback = await releaseReservationIfNeeded(reason, stage, metadata);
+             result = fallback as Record<string, unknown> | null;
+          }
+        } else {
+          result = data && typeof data === "object" && !Array.isArray(data) ? (data as Record<string, unknown>) : null;
+          console.log("[Credits] force_refund_credits success:", result);
+          
+          if (result && result.ok === true) {
+             creditsInfo = result;
+             creditsReservationExists = false;
+             creditsCharged = false;
+          }
+        }
+      } catch (e) {
+        console.error("[Credits] force_refund_credits exception:", e);
+      }
+
+      try {
+        const { data, error } = await admin.rpc("force_refund_request", {
+          p_request_id: requestId,
+          p_reason: reason,
+        });
+        if (error) {
+          console.error("[Credits] force_refund_request RPC failed:", error);
+        } else {
+          console.log("[Credits] force_refund_request success:", data);
+        }
+      } catch (e) {
+        console.error("[Credits] force_refund_request exception:", e);
+      }
+
+      await ensureFailureTransactionDetails(reason, stage, metadata);
+      return result;
+    };
+
     const { data: reserveData, error: reserveErr } = await admin.rpc("reserve_credits", {
       p_user_id: user.id,
       p_request_id: requestId,
@@ -1887,6 +2366,10 @@ serve(async (req: Request) => {
       const reason = reserveRec && typeof reserveRec.reason === "string" ? String(reserveRec.reason) : "reserve_failed";
       if (reason === "insufficient_credits") {
         await admin.from("scenes").update({ generation_status: "error" }).eq("id", sceneId);
+        await logEarlyFailureIfNeeded("Scene image generation failed: Insufficient credits", "credits_reservation", {
+          credits: reserveRec ?? undefined,
+          details: reserveErr ? serializeSupabaseError(reserveErr) : undefined,
+        });
         return json(402, {
           error: "Insufficient credits",
           requestId,
@@ -2111,25 +2594,31 @@ serve(async (req: Request) => {
        const responseHeaders = collectResponseHeaders(aiResponse);
        const statusText = String(aiResponse.statusText ?? "");
        const body = typeof aiErrorText === "string" && aiErrorText.length > 0 ? truncateText(aiErrorText, 4000) : "No error details provided";
+       const failureReasons = deriveFailureReasons({
+         status: aiResponse.status,
+         statusText,
+         headers: responseHeaders,
+         bodyText: typeof aiErrorText === "string" ? aiErrorText : null,
+       });
+       const failureDescription = `Scene image generation failed: ${failureReasons.join("; ")}`;
        
        await admin.from("scenes").update({ generation_status: "error" }).eq("id", sceneId);
        if (attemptStarted && updateAttempt) {
          await updateAttempt({
            status: "failed",
            error_stage: "upstream_generation",
-           error_message: `Upstream Generation Failed (${aiResponse.status})`,
-           metadata: { ...reserveMetadata, statusText },
+           error_message: failureDescription,
+           metadata: { ...reserveMetadata, statusText, failure_reasons: failureReasons },
          });
        }
-       const released = releaseReservationIfNeeded
-         ? await releaseReservationIfNeeded("Upstream generation failed", "upstream_generation", {
+       const released = await handleFailureCredits(failureDescription, "upstream_generation", {
          status: aiResponse.status,
          statusText,
-       })
-         : null;
+         failure_reasons: failureReasons,
+       });
        
        return json(502, { 
-         error: `Upstream Generation Failed (${aiResponse.status})`, 
+         error: failureDescription,
          requestId,
          details: { statusText, upstream_error: body, headers: responseHeaders },
          model: actualModel,
@@ -2143,37 +2632,36 @@ serve(async (req: Request) => {
     } catch (e) {
       console.error("Failed to parse AI response JSON:", e);
       await admin.from("scenes").update({ generation_status: "error" }).eq("id", sceneId);
+      const errStr = e instanceof Error ? e.message : String(e);
+      const failureDescription = `Scene image generation failed: Invalid JSON from upstream provider (${errStr.substring(0, 100)})`;
       if (attemptStarted && updateAttempt) {
         await updateAttempt({
           status: "failed",
           error_stage: "upstream_parse",
-          error_message: "Invalid JSON from upstream provider",
+          error_message: failureDescription,
           metadata: reserveMetadata,
         });
       }
-      const released = releaseReservationIfNeeded
-        ? await releaseReservationIfNeeded("Invalid JSON from upstream provider", "upstream_parse")
-        : null;
-      return json(502, { error: "Invalid JSON from upstream provider", requestId, details: String(e), credits: released ?? creditsInfo ?? undefined });
+      const released = await handleFailureCredits(failureDescription, "upstream_parse", { error: errStr });
+      return json(502, { error: failureDescription, requestId, details: errStr, credits: released ?? creditsInfo ?? undefined });
     }
 
     const imageDataUrl = extractFirstBase64Image(aiData);
 
     if (!imageDataUrl) {
       console.error("No valid image in response", aiData);
+      const failureDescription = "Scene image generation failed: No image data returned";
       await admin.from("scenes").update({ generation_status: "error" }).eq("id", sceneId);
       if (attemptStarted && updateAttempt) {
         await updateAttempt({
           status: "failed",
           error_stage: "upstream_no_image",
-          error_message: "No image data returned",
+          error_message: failureDescription,
           metadata: reserveMetadata,
         });
       }
-      const released = releaseReservationIfNeeded
-        ? await releaseReservationIfNeeded("No image data returned", "upstream_no_image")
-        : null;
-      return json(500, { error: "No image data returned", requestId, details: "Upstream response missing image data", credits: released ?? creditsInfo ?? undefined });
+      const released = await handleFailureCredits(failureDescription, "upstream_no_image");
+      return json(500, { error: failureDescription, requestId, details: "Upstream response missing image data", credits: released ?? creditsInfo ?? undefined });
     }
 
     let bytes;
@@ -2187,19 +2675,60 @@ serve(async (req: Request) => {
       }
     } catch (e) {
       console.error("Failed to decode or validate base64 image data:", e);
+      const errStr = e instanceof Error ? e.message : String(e);
+      const failureDescription = `Scene image generation failed: Invalid or empty image (${errStr.substring(0, 100)})`;
       await admin.from("scenes").update({ generation_status: "error" }).eq("id", sceneId);
       if (attemptStarted && updateAttempt) {
         await updateAttempt({
           status: "failed",
           error_stage: "decode_base64",
-          error_message: "Failed to process image data: Invalid or empty image",
+          error_message: failureDescription,
           metadata: reserveMetadata,
         });
       }
-      const released = releaseReservationIfNeeded
-        ? await releaseReservationIfNeeded("Failed to process image data: Invalid or empty image", "decode_base64")
-        : null;
-      return json(500, { error: "Failed to process image data", requestId, details: "Invalid or empty image response", credits: released ?? creditsInfo ?? undefined });
+      const released = await handleFailureCredits(failureDescription, "decode_base64", { error: errStr });
+      return json(500, { error: failureDescription, requestId, details: "Invalid or empty image response", credits: released ?? creditsInfo ?? undefined });
+    }
+
+    const encodedStats = await computeEncodedImageStats(bytes);
+    if (encodedStats.ok) {
+      const blank = isImageStatsBlank({ mean: encodedStats.mean, std: encodedStats.std, uniqueColors: encodedStats.uniqueColors });
+      const isFullyTransparent = encodedStats.maxAlpha <= 0;
+      if (blank.blank || isFullyTransparent) {
+        const blankType = isFullyTransparent ? "transparent" : blank.reason;
+        const reason = `Generated image appears blank (mean=${blank.mean}, std=${blank.std}, unique=${blank.unique}, type=${blankType})`;
+        const failureDescription = `Scene image generation failed: ${reason}`;
+        await admin.from("scenes").update({ generation_status: "error" }).eq("id", sceneId);
+        if (attemptStarted && updateAttempt) {
+          await updateAttempt({
+            status: "failed",
+            error_stage: "blank_image",
+            error_message: failureDescription,
+            metadata: {
+              ...reserveMetadata,
+              blank_image: true,
+              blank_reason: blankType,
+              blank_mean: blank.mean,
+              blank_std: blank.std,
+              blank_unique_colors: blank.unique,
+              blank_samples: encodedStats.samples,
+              blank_width: encodedStats.width,
+              blank_height: encodedStats.height,
+            },
+          });
+        }
+        const released = await handleFailureCredits(failureDescription, "blank_image", {
+          blank_image: true,
+          blank_reason: blankType,
+          blank_mean: blank.mean,
+          blank_std: blank.std,
+          blank_unique_colors: blank.unique,
+          blank_samples: encodedStats.samples,
+          blank_width: encodedStats.width,
+          blank_height: encodedStats.height,
+        });
+        return json(500, { error: failureDescription, requestId, stage: "blank_image", credits: released ?? creditsInfo ?? undefined });
+      }
     }
 
     const mime = detectImageMime(bytes);
@@ -2217,23 +2746,23 @@ serve(async (req: Request) => {
 
     if (uploadError) {
       console.error("Upload error:", uploadError);
+      const errDetails = serializeSupabaseError(uploadError);
+      const errStr = errDetails ? JSON.stringify(errDetails) : String(uploadError);
+      const failureDescription = `Scene image generation failed: Failed to store image (${errStr.substring(0, 100)})`;
       await admin.from("scenes").update({ generation_status: "error" }).eq("id", sceneId);
       if (attemptStarted && updateAttempt) {
         await updateAttempt({
           status: "failed",
           error_stage: "storage_upload",
-          error_message: "Failed to store image",
+          error_message: failureDescription,
           metadata: reserveMetadata,
         });
       }
-      const released = releaseReservationIfNeeded
-        ? await releaseReservationIfNeeded("Failed to store image", "storage_upload")
-        : null;
-      return json(500, { error: "Failed to store image", requestId, details: serializeSupabaseError(uploadError), credits: released ?? creditsInfo ?? undefined });
+      const released = await handleFailureCredits(failureDescription, "storage_upload", { error: errDetails });
+      return json(500, { error: failureDescription, requestId, details: errDetails, credits: released ?? creditsInfo ?? undefined });
     }
 
     const { data: urlData } = admin.storage.from("scene-images").getPublicUrl(fileName);
-    let creditsCharged = false;
 
     try {
       const existingDetails =
@@ -2278,33 +2807,34 @@ serve(async (req: Request) => {
         .eq("id", sceneId);
       if (updateError) {
         console.error("Scene update error:", updateError);
+        const errDetails = serializeSupabaseError(updateError);
+        const errStr = errDetails ? JSON.stringify(errDetails) : String(updateError);
+        const failureDescription = `Scene image generation failed: Failed to update scene with image (${errStr.substring(0, 100)})`;
         if (attemptStarted && updateAttempt) {
           await updateAttempt({
             status: "failed",
             error_stage: "scene_update",
-            error_message: "Failed to update scene with image",
+            error_message: failureDescription,
             metadata: reserveMetadata,
           });
         }
-        const released = releaseReservationIfNeeded
-          ? await releaseReservationIfNeeded("Failed to update scene with image", "scene_update")
-          : null;
-        return json(500, { error: "Failed to update scene with image", requestId, details: serializeSupabaseError(updateError), credits: released ?? creditsInfo ?? undefined });
+        const released = await handleFailureCredits(failureDescription, "scene_update", { error: errDetails });
+        return json(500, { error: failureDescription, requestId, details: errDetails, credits: released ?? creditsInfo ?? undefined });
       }
     } catch (e) {
       console.error("Scene update exception:", e);
+      const errStr = e instanceof Error ? e.message : String(e);
+      const failureDescription = `Scene image generation failed: Failed to update scene with image (${errStr.substring(0, 100)})`;
       if (attemptStarted && updateAttempt) {
         await updateAttempt({
           status: "failed",
           error_stage: "scene_update",
-          error_message: "Failed to update scene with image",
+          error_message: failureDescription,
           metadata: reserveMetadata,
         });
       }
-      const released = releaseReservationIfNeeded
-        ? await releaseReservationIfNeeded("Failed to update scene with image", "scene_update")
-        : null;
-      return json(500, { error: "Failed to update scene with image", requestId, details: String(e), credits: released ?? creditsInfo ?? undefined });
+      const released = await handleFailureCredits(failureDescription, "scene_update", { error: errStr });
+      return json(500, { error: failureDescription, requestId, details: errStr, credits: released ?? creditsInfo ?? undefined });
     }
 
     const commitMetadata = {
@@ -2312,6 +2842,7 @@ serve(async (req: Request) => {
       scene_id: sceneId,
       story_id: scene.story_id,
       model: actualModel,
+      image_stats: encodedStats.ok ? { mean: encodedStats.mean, std: encodedStats.std, unique_colors: encodedStats.uniqueColors } : null,
     };
 
     const sceneImagesBucket = admin.storage.from("scene-images") as unknown as {
@@ -2343,35 +2874,46 @@ serve(async (req: Request) => {
       return { rec, error };
     };
 
+    // --- 5. CREDIT COMMITMENT (DEFERRED) ---
+    // Only commit credits if we have successfully generated, validated, and stored the image.
+    // This prevents "deduct first, refund later" issues and ensures zero deduction on failure.
+
     try {
       if (creditsReservationExists) {
         const { commitRec, commitErr } = await commitReservedCredits();
         if (commitErr || !commitRec || commitRec.ok !== true) {
+          // If commit fails, we must rollback the scene update and treat as failure
           try {
             await sceneImagesBucket.remove([fileName]);
-          } catch {
-            void 0;
+          } catch (e) {
+            console.warn("[Cleanup] Failed to remove image on error:", e);
           }
           await admin
             .from("scenes")
             .update({ image_url: null, generation_status: "error", consistency_status: "fail" })
             .eq("id", sceneId);
+            
+          const errDetails = commitErr ? serializeSupabaseError(commitErr) : commitRec ?? undefined;
+          const errStr = errDetails ? JSON.stringify(errDetails) : "Unknown commit error";
+          const failureDescription = `Scene image generation failed: Failed to commit credits (${errStr.substring(0, 100)})`;
+          
           if (attemptStarted && updateAttempt) {
             await updateAttempt({
               status: "failed",
               error_stage: "credit_commit",
-              error_message: "Failed to commit credits",
+              error_message: failureDescription,
               metadata: reserveMetadata,
             });
           }
-          const released = releaseReservationIfNeeded
-            ? await releaseReservationIfNeeded("Failed to commit credits", "credit_commit")
-            : null;
+          // Note: Reservation is still open here, so we must release it
+          const released = await handleFailureCredits(failureDescription, "credit_commit", {
+            commit_error: errDetails,
+          });
           return json(500, {
-            error: "Failed to commit credits",
+            error: failureDescription,
             requestId,
             stage: "credit_commit",
-            details: commitErr ? serializeSupabaseError(commitErr) : commitRec ?? undefined,
+            details: errDetails,
             credits: released ?? creditsInfo ?? undefined,
           });
         }
@@ -2380,27 +2922,36 @@ serve(async (req: Request) => {
       } else {
         const { rec, error } = await consumeCredits();
         if (error || !rec || rec.ok !== true) {
+          // If consume fails (e.g. insufficient balance), rollback
           const reason = rec && typeof rec.reason === "string" ? String(rec.reason) : null;
           const status = reason === "insufficient_credits" ? 402 : 500;
+          const failureDescription =
+            reason === "insufficient_credits"
+              ? "Scene image generation failed: Insufficient credits"
+              : "Scene image generation failed: Failed to consume credits";
+              
           try {
             await sceneImagesBucket.remove([fileName]);
-          } catch {
-            void 0;
+          } catch (e) {
+            console.warn("[Cleanup] Failed to remove image on error:", e);
           }
           await admin
             .from("scenes")
             .update({ image_url: null, generation_status: "error", consistency_status: "fail" })
             .eq("id", sceneId);
+            
           if (attemptStarted && updateAttempt) {
             await updateAttempt({
               status: "failed",
               error_stage: "credit_consume",
-              error_message: "Failed to consume credits",
+              error_message: failureDescription,
               metadata: reserveMetadata,
             });
           }
+          // Nothing to refund since consume failed, but we might need to release if we had a reservation logic error
+          // In this "else" branch, we didn't have a reservation, so no release needed.
           return json(status, {
-            error: reason === "insufficient_credits" ? "Insufficient credits" : "Failed to consume credits",
+            error: failureDescription,
             requestId,
             stage: "credit_consume",
             details: error ? serializeSupabaseError(error) : rec ?? undefined,
@@ -2411,22 +2962,29 @@ serve(async (req: Request) => {
         creditsCharged = true;
       }
     } catch (e) {
+      // Catch unexpected errors during commit/consume
       try {
         await sceneImagesBucket.remove([fileName]);
-      } catch {
-        void 0;
+      } catch (e) {
+        console.warn("[Cleanup] Failed to remove image on error:", e);
       }
       await admin.from("scenes").update({ image_url: null, generation_status: "error", consistency_status: "fail" }).eq("id", sceneId);
+      
+      const errorMessage = e instanceof Error ? e.message : String(e);
+      const cleanError = errorMessage.replace(/^Error:\s*/, "").substring(0, 200);
+      const failureDescription = `Generation failed: ${cleanError}`;
+
       if (attemptStarted && updateAttempt) {
         await updateAttempt({
           status: "failed",
           error_stage: "credit_commit_exception",
-          error_message: "Failed to charge credits",
+          error_message: failureDescription,
           metadata: reserveMetadata,
         });
       }
-      const released = releaseReservationIfNeeded ? await releaseReservationIfNeeded("Failed to charge credits", "credit_commit_exception") : null;
-      return json(500, { error: "Failed to charge credits", requestId, details: String(e), credits: released ?? creditsInfo ?? undefined });
+      
+      const released = await handleFailureCredits(failureDescription, "credit_commit_exception", { error: errorMessage });
+      return json(500, { error: failureDescription, requestId, details: errorMessage, credits: released ?? creditsInfo ?? undefined });
     }
 
     if (attemptStarted && updateAttempt) {
@@ -2453,19 +3011,20 @@ serve(async (req: Request) => {
 
   } catch (e) {
     console.error("Unexpected error:", e);
-    const released = releaseReservationIfNeeded
-      ? await releaseReservationIfNeeded("Internal Server Error", "unexpected_exception", {
-          error: String(e),
-        })
-      : null;
+    const failureDescription = "Scene image generation failed: Internal Server Error";
+    const released = handleFailureCredits
+      ? await handleFailureCredits(failureDescription, "unexpected_exception", { error: String(e) })
+      : releaseReservationIfNeeded
+        ? await releaseReservationIfNeeded(failureDescription, "unexpected_exception", { error: String(e) })
+        : null;
     if (attemptStarted && updateAttempt) {
       await updateAttempt({
         status: "failed",
         error_stage: "unexpected_exception",
-        error_message: "Internal Server Error",
+        error_message: failureDescription,
         metadata: { error: String(e) },
       });
     }
-    return json(500, { error: "Internal Server Error", requestId, details: String(e), credits: released ?? creditsInfo ?? undefined });
+    return json(500, { error: failureDescription, requestId, details: String(e), credits: released ?? creditsInfo ?? undefined });
   }
 });

@@ -8,10 +8,64 @@ const SUPABASE_PUBLISHABLE_KEY = import.meta.env.VITE_SUPABASE_PUBLISHABLE_KEY;
 // Import the supabase client like this:
 // import { supabase } from "@/integrations/supabase/client";
 
+try {
+  if (typeof localStorage !== "undefined" && SUPABASE_URL && SUPABASE_PUBLISHABLE_KEY) {
+    const fingerprintKey = "siai:supabase-fingerprint:v1";
+    const fingerprint = `${SUPABASE_URL}|${SUPABASE_PUBLISHABLE_KEY.slice(0, 16)}`;
+    const previous = localStorage.getItem(fingerprintKey);
+
+    if (previous && previous !== fingerprint) {
+      try {
+        const host = new URL(SUPABASE_URL).hostname;
+        const ref = host.split(".")[0];
+        if (ref) localStorage.removeItem(`sb-${ref}-auth-token`);
+      } catch (e) {
+        void e;
+      }
+    }
+
+    localStorage.setItem(fingerprintKey, fingerprint);
+  }
+} catch (e) {
+  void e;
+}
+
+const wrappedFetch: typeof fetch = async (input, init) => {
+  try {
+    return await fetch(input, init);
+  } catch (e) {
+    const err = e as { name?: unknown; message?: unknown };
+    const name = typeof err?.name === 'string' ? err.name : '';
+    const message = typeof err?.message === 'string' ? err.message : '';
+    const signalAborted =
+      !!init &&
+      typeof init === "object" &&
+      "signal" in init &&
+      (init as { signal?: AbortSignal | null }).signal?.aborted === true;
+    const isAbort =
+      name === 'AbortError' ||
+      message.toLowerCase().includes('aborted') ||
+      message.includes('ERR_ABORTED') ||
+      signalAborted;
+
+    if (isAbort) {
+      return new Response(JSON.stringify({ message: 'Request aborted', code: 'ABORTED' }), {
+        status: 499,
+        headers: { 'Content-Type': 'application/json' }
+      });
+    }
+
+    throw e;
+  }
+};
+
 export const supabase = createClient<Database>(SUPABASE_URL, SUPABASE_PUBLISHABLE_KEY, {
   auth: {
     storage: localStorage,
     persistSession: true,
     autoRefreshToken: true,
+  },
+  global: {
+    fetch: wrappedFetch
   }
 });

@@ -3,7 +3,7 @@ project_id = "gaxmjxiqjirjeyemjcyc"
 [functions.analyze-story]
 verify_jwt = false
 
-[functions.generate-scene-image]
+[functions.generate-character-reference]
 verify_jwt = false
 
 [functions.edit-scene-image]
@@ -12,5 +12,23 @@ verify_jwt = false
 [functions.upload-reference-image]
 verify_jwt = true
 
-[functions.generate-character-reference]
+[functions.credits]
+verify_jwt = false
+
+[functions.create-credit-pack-checkout]
+verify_jwt = false
+
+[functions.create-starter-membership-checkout]
+verify_jwt = false
+
+[functions.create-creator-membership-checkout]
+verify_jwt = false
+
+[functions.stripe-webhook]
+verify_jwt = false
+
+[functions.reconcile-stripe-checkout]
+verify_jwt = false
+
+[functions.reconcile-stripe-credit-pack]
 verify_jwt = false

@@ -1,5 +1,6 @@
 import { serve } from "https://deno.land/std@0.168.0/http/server.ts";
 import { createClient, type SupabaseClientLike } from "https://esm.sh/@supabase/supabase-js@2.49.2";
+import { normalizeSubscriptionTier, resolveSubscriptionTier, resolveTierFromPriceId } from "../_shared/stripe-tier.ts";
 
 const corsHeaders = {
   "Access-Control-Allow-Origin": "*",
@@ -106,16 +107,6 @@ async function postAlertWebhook(params: { url: string; payload: Record<string, u
   }
 }
 
-function resolveTierFromPriceId(priceId: string, env: Record<string, string | undefined>) {
-  const starterIds = [env.STRIPE_PRICE_STARTER_ID, env.STRIPE_PRICE_STARTER_ANNUAL_ID].filter(Boolean) as string[];
-  const creatorIds = [env.STRIPE_PRICE_CREATOR_ID, env.STRIPE_PRICE_CREATOR_ANNUAL_ID].filter(Boolean) as string[];
-  const professionalIds = [env.STRIPE_PRICE_PROFESSIONAL_ID, env.STRIPE_PRICE_PROFESSIONAL_ANNUAL_ID].filter(Boolean) as string[];
-  if (starterIds.includes(priceId)) return "starter";
-  if (creatorIds.includes(priceId)) return "creator";
-  if (professionalIds.includes(priceId)) return "professional";
-  return null;
-}
-
 function parsePositiveInt(value: unknown) {
   if (typeof value === "number" && Number.isFinite(value) && value > 0 && Number.isInteger(value)) return value;
   if (typeof value === "string" && /^\d+$/.test(value)) {
@@ -129,8 +120,8 @@ serve(async (req: Request) => {
   if (req.method === "OPTIONS") return new Response(null, { headers: corsHeaders });
   if (req.method !== "POST") return json(405, { error: "Method not allowed" });
 
-  const supabaseUrl = Deno.env.get("SUPABASE_URL");
-  const supabaseServiceKey = Deno.env.get("SUPABASE_SERVICE_ROLE_KEY");
+  const supabaseUrl = Deno.env.get("SB_SUPABASE_URL") ?? Deno.env.get("SUPABASE_URL");
+  const supabaseServiceKey = Deno.env.get("SB_SERVICE_ROLE_KEY") ?? Deno.env.get("SUPABASE_SERVICE_ROLE_KEY");
   const webhookSecret = Deno.env.get("STRIPE_WEBHOOK_SECRET");
   if (!supabaseUrl || !supabaseServiceKey || !webhookSecret) return json(500, { error: "Configuration error" });
 
@@ -153,9 +144,14 @@ serve(async (req: Request) => {
 
   const { error: dedupeErr } = await admin.from("stripe_webhook_events").insert({ event_id: event.id });
   if (dedupeErr) {
-    if (isDuplicateKeyError(dedupeErr)) return json(200, { received: true, deduped: true });
-    console.error("Failed to record Stripe webhook event:", dedupeErr);
-    return json(500, { error: "Failed to record Stripe webhook event" });
+    if (isDuplicateKeyError(dedupeErr)) {
+      const { data: existing } = await admin.from("stripe_webhook_events").select("status").eq("event_id", event.id).maybeSingle();
+      const status = existing && typeof (existing as Record<string, unknown>).status === "string" ? String((existing as Record<string, unknown>).status) : null;
+      if (status === "ok" || status === "ignored") return json(200, { received: true, deduped: true });
+    } else {
+      console.error("Failed to record Stripe webhook event:", dedupeErr);
+      return json(500, { error: "Failed to record Stripe webhook event" });
+    }
   }
 
   const obj = isRecord(event.data) ? event.data.object : null;
@@ -241,6 +237,22 @@ serve(async (req: Request) => {
     return { data, error };
   };
 
+  const normalizeSubscriptionStatus = (status: string | null) => {
+    if (!status) return null;
+    if (status === "active" || status === "trialing") return "active";
+    if (status === "past_due") return "past_due";
+    if (status === "canceled" || status === "incomplete_expired") return "canceled";
+    return status;
+  };
+
+  const setProfileSubscriptionStatus = async (params: { userId: string; status: string | null }) => {
+    const status = normalizeSubscriptionStatus(params.status);
+    if (!status) return { ok: true as const };
+    const { error } = await admin.from("profiles").update({ subscription_status: status }).eq("user_id", params.userId);
+    if (error) return { ok: false as const, error };
+    return { ok: true as const };
+  };
+
   const fetchStripeSubscription = async (subscriptionId: string) => {
     if (!stripeSecretKey) return { ok: false as const, reason: "missing_stripe_secret" as const };
     const resp = await fetch(`https://api.stripe.com/v1/subscriptions/${subscriptionId}`, {
@@ -281,8 +293,10 @@ serve(async (req: Request) => {
     const subscriptionId = asString(sub.id);
     const currentPeriodStart = typeof sub.current_period_start === "number" ? sub.current_period_start : null;
     const currentPeriodEnd = typeof sub.current_period_end === "number" ? sub.current_period_end : null;
+    const status = asString(sub.status);
     const meta = isRecord(sub.metadata) ? sub.metadata : null;
     const metadataUserId = meta ? asString(meta.supabase_user_id ?? meta.user_id) : null;
+    const metadataTier = meta ? asString(meta.tier) : null;
 
     let priceId: string | null = null;
     const items = isRecord(sub.items) ? sub.items : null;
@@ -291,7 +305,14 @@ serve(async (req: Request) => {
     const price = firstItem && isRecord(firstItem.price) ? (firstItem.price as Record<string, unknown>) : null;
     if (price) priceId = asString(price.id);
 
-    return { customerId, subscriptionId, currentPeriodStart, currentPeriodEnd, priceId, metadataUserId };
+    return { customerId, subscriptionId, currentPeriodStart, currentPeriodEnd, priceId, metadataUserId, metadataTier, status };
+  };
+
+  const resolveTierSource = (params: { metadataTier: string | null; subscriptionTier: string | null; tier: string | null }) => {
+    if (normalizeSubscriptionTier(params.metadataTier)) return "metadata";
+    if (normalizeSubscriptionTier(params.subscriptionTier)) return "subscription_metadata";
+    if (params.tier) return "price_id";
+    return "unknown";
   };
 
   if (event.type === "checkout.session.completed") {
@@ -322,10 +343,17 @@ serve(async (req: Request) => {
       const priceId = meta ? asString(meta.price_id) : null;
 
       if (!userId || !credits || (credits !== 50 && credits !== 200 && credits !== 400) || !sessionId) {
+        console.error("Stripe webhook: credit pack missing metadata", {
+          eventId: event.id,
+          sessionId,
+          hasUserId: Boolean(userId),
+          credits,
+        });
         await logWebhookOutcome({ status: "ignored", reason: "missing_metadata", details: { mode, has_user: Boolean(userId), credits } });
         return json(200, { received: true, ignored: true, reason: "missing_metadata" });
       }
 
+      console.info("Stripe webhook: applying credit pack", { eventId: event.id, userId, sessionId, credits, pack, priceId });
       const { data, error } = await admin.rpc("admin_apply_stripe_credit_pack_purchase", {
         p_user_id: userId,
         p_amount: credits,
@@ -337,8 +365,19 @@ serve(async (req: Request) => {
         p_pack: pack,
       });
       if (error) {
-        await logWebhookOutcome({ status: "error", userId, reason: "credit_pack_apply_failed", details: { error } });
-        await alertIfNeeded({ status: "error", userId, reason: "credit_pack_apply_failed", details: { error } });
+        console.error("Stripe webhook: credit pack apply failed", { eventId: event.id, userId, sessionId, error });
+        await logWebhookOutcome({
+          status: "error",
+          userId,
+          reason: "credit_pack_apply_failed",
+          details: { error, sessionId, customerId, paymentIntentId, credits, pack, priceId },
+        });
+        await alertIfNeeded({
+          status: "error",
+          userId,
+          reason: "credit_pack_apply_failed",
+          details: { error, sessionId, customerId, paymentIntentId, credits, pack, priceId },
+        });
         return json(500, { error: "Failed to apply credit purchase", details: error });
       }
 
@@ -361,6 +400,7 @@ serve(async (req: Request) => {
         metadataTier === "starter" || metadataTier === "creator" || metadataTier === "professional" ? metadataTier : null;
       const intervalFromMetadata = metadataInterval === "month" || metadataInterval === "year" ? metadataInterval : null;
       if (tierFromMetadata && resolvedUserId) {
+        const tierSource = "metadata";
         const nowSec = Math.floor(Date.now() / 1000);
         const cycleStart = nowSec;
         const cycleEnd = nowSec + (intervalFromMetadata === "year" ? 365 * 24 * 60 * 60 : 30 * 24 * 60 * 60);
@@ -377,16 +417,63 @@ serve(async (req: Request) => {
           resetUsage: true,
         });
         if (error) {
-          await logWebhookOutcome({ status: "error", userId: resolvedUserId, reason: "subscription_apply_failed_metadata", details: { error } });
-          await alertIfNeeded({ status: "error", userId: resolvedUserId, reason: "subscription_apply_failed_metadata", details: { error } });
+          await logWebhookOutcome({
+            status: "error",
+            userId: resolvedUserId,
+            reason: "subscription_apply_failed_metadata",
+            details: {
+              error,
+              customerId,
+              subscriptionId,
+              invoiceId,
+              tier: tierFromMetadata,
+              interval: intervalFromMetadata,
+              priceId: metadataPriceId,
+              tierSource,
+              mode,
+            },
+          });
+          await alertIfNeeded({
+            status: "error",
+            userId: resolvedUserId,
+            reason: "subscription_apply_failed_metadata",
+            details: {
+              error,
+              customerId,
+              subscriptionId,
+              invoiceId,
+              tier: tierFromMetadata,
+              interval: intervalFromMetadata,
+              priceId: metadataPriceId,
+              tierSource,
+              mode,
+            },
+          });
           return json(500, { error: "Failed to apply subscription grant", details: error });
+        }
+
+        const prof = await setProfileSubscriptionStatus({ userId: resolvedUserId, status: "active" });
+        if (!prof.ok) {
+          await logWebhookOutcome({
+            status: "error",
+            userId: resolvedUserId,
+            reason: "profile_status_update_failed",
+            details: { error: prof.error, customerId, subscriptionId, invoiceId, tier: tierFromMetadata, priceId: metadataPriceId },
+          });
+          await alertIfNeeded({
+            status: "error",
+            userId: resolvedUserId,
+            reason: "profile_status_update_failed",
+            details: { error: prof.error, customerId, subscriptionId, invoiceId, tier: tierFromMetadata, priceId: metadataPriceId },
+          });
+          return json(500, { error: "Failed to update subscription status", details: prof.error });
         }
 
         await logWebhookOutcome({
           status: "ok",
           userId: resolvedUserId,
           reason: "subscription_grant_applied_metadata",
-          details: { tier: tierFromMetadata, interval: intervalFromMetadata, priceId: metadataPriceId },
+          details: { tier: tierFromMetadata, interval: intervalFromMetadata, priceId: metadataPriceId, tierSource },
         });
         return json(200, { received: true });
       }
@@ -413,13 +500,30 @@ serve(async (req: Request) => {
         return json(200, { received: true, ignored: true, reason: "user_not_found" });
       }
 
-      const tier = subParams.priceId ? resolveTierFromPriceId(subParams.priceId, env) : null;
+      const tier = resolveSubscriptionTier({
+        metadataTier,
+        subscriptionTier: subParams.metadataTier,
+        priceId: subParams.priceId,
+        env,
+      });
+      const tierSource = normalizeSubscriptionTier(metadataTier)
+        ? "metadata"
+        : normalizeSubscriptionTier(subParams.metadataTier)
+          ? "subscription_metadata"
+          : tier
+            ? "price_id"
+            : "unknown";
       if (!tier) {
-        await logWebhookOutcome({ status: "ignored", userId: userIdFromSub, reason: "unknown_price", details: { priceId: subParams.priceId } });
+        await logWebhookOutcome({
+          status: "ignored",
+          userId: userIdFromSub,
+          reason: "unknown_price",
+          details: { priceId: subParams.priceId, metadataTier, subscriptionMetadataTier: subParams.metadataTier, tierSource },
+        });
         return json(200, { received: true, ignored: true, reason: "unknown_price" });
       }
 
-      const { error } = await handleSubscriptionState({
+      const { data, error } = await handleSubscriptionState({
         userId: userIdFromSub,
         tier,
         customerId: subParams.customerId ?? customerId,
@@ -431,12 +535,34 @@ serve(async (req: Request) => {
         resetUsage: true,
       });
       if (error) {
-        await logWebhookOutcome({ status: "error", userId: userIdFromSub, reason: "subscription_apply_failed", details: { error } });
-        await alertIfNeeded({ status: "error", userId: userIdFromSub, reason: "subscription_apply_failed", details: { error } });
+        await logWebhookOutcome({
+          status: "error",
+          userId: userIdFromSub,
+          reason: "subscription_apply_failed",
+          details: { error, customerId: subParams.customerId ?? customerId, subscriptionId: subParams.subscriptionId ?? subscriptionId, invoiceId, priceId: subParams.priceId, tier },
+        });
+        await alertIfNeeded({
+          status: "error",
+          userId: userIdFromSub,
+          reason: "subscription_apply_failed",
+          details: { error, customerId: subParams.customerId ?? customerId, subscriptionId: subParams.subscriptionId ?? subscriptionId, invoiceId, priceId: subParams.priceId, tier },
+        });
         return json(500, { error: "Failed to apply subscription grant", details: error });
       }
 
-      await logWebhookOutcome({ status: "ok", userId: userIdFromSub, reason: "subscription_grant_applied" });
+      const prof = await setProfileSubscriptionStatus({ userId: userIdFromSub, status: subParams.status ?? "active" });
+      if (!prof.ok) {
+        await logWebhookOutcome({ status: "error", userId: userIdFromSub, reason: "profile_status_update_failed", details: { error: prof.error } });
+        await alertIfNeeded({ status: "error", userId: userIdFromSub, reason: "profile_status_update_failed", details: { error: prof.error } });
+        return json(500, { error: "Failed to update subscription status", details: prof.error });
+      }
+
+      await logWebhookOutcome({
+        status: "ok",
+        userId: userIdFromSub,
+        reason: "subscription_grant_applied",
+        details: { customerId: subParams.customerId ?? customerId, subscriptionId: subParams.subscriptionId ?? subscriptionId, invoiceId, priceId: subParams.priceId, tier, applied: data },
+      });
       return json(200, { received: true });
     }
 
@@ -452,13 +578,24 @@ serve(async (req: Request) => {
       await logWebhookOutcome({ status: "ignored", reason: "user_not_found" });
       return json(200, { received: true, ignored: true, reason: "user_not_found" });
     }
-    const tier = subParams.priceId ? resolveTierFromPriceId(subParams.priceId, env) : null;
+    const tier = resolveSubscriptionTier({
+      metadataTier: null,
+      subscriptionTier: subParams.metadataTier,
+      priceId: subParams.priceId,
+      env,
+    });
+    const tierSource = normalizeSubscriptionTier(subParams.metadataTier) ? "subscription_metadata" : tier ? "price_id" : "unknown";
     if (!tier) {
-      await logWebhookOutcome({ status: "ignored", userId, reason: "unknown_price", details: { priceId: subParams.priceId } });
+      await logWebhookOutcome({
+        status: "ignored",
+        userId,
+        reason: "unknown_price",
+        details: { priceId: subParams.priceId, subscriptionMetadataTier: subParams.metadataTier, tierSource },
+      });
       return json(200, { received: true, ignored: true, reason: "unknown_price" });
     }
 
-    const { error } = await handleSubscriptionState({
+    const { data, error } = await handleSubscriptionState({
       userId,
       tier,
       customerId: subParams.customerId,
@@ -474,7 +611,19 @@ serve(async (req: Request) => {
       await alertIfNeeded({ status: "error", userId, reason: "subscription_state_apply_failed", details: { error } });
       return json(500, { error: "Failed to apply subscription state", details: error });
     }
-    await logWebhookOutcome({ status: "ok", userId, reason: "subscription_state_applied" });
+
+    const prof = await setProfileSubscriptionStatus({ userId, status: subParams.status ?? "active" });
+    if (!prof.ok) {
+      await logWebhookOutcome({ status: "error", userId, reason: "profile_status_update_failed", details: { error: prof.error } });
+      await alertIfNeeded({ status: "error", userId, reason: "profile_status_update_failed", details: { error: prof.error } });
+      return json(500, { error: "Failed to update subscription status", details: prof.error });
+    }
+    await logWebhookOutcome({
+      status: "ok",
+      userId,
+      reason: "subscription_state_applied",
+      details: { customerId: subParams.customerId, subscriptionId: subParams.subscriptionId, priceId: subParams.priceId, tier, tierSource, status: subParams.status, applied: data },
+    });
     return json(200, { received: true });
   }
 
@@ -499,35 +648,107 @@ serve(async (req: Request) => {
 
     const meta = isRecord(objRec.metadata) ? objRec.metadata : null;
     const metadataUserId = meta ? asString(meta.supabase_user_id ?? meta.user_id) : null;
+    const metadataTier = meta ? asString(meta.tier) : null;
 
-    const userId = await findUserId({ customerId, subscriptionId, metadataUserId });
-    if (!userId) {
+    let subscriptionParams: ReturnType<typeof subscriptionObjectToParams> | null = null;
+    if (subscriptionId && (!metadataUserId || !metadataTier || !priceId || !cycleStart || !cycleEnd)) {
+      const fetched = await fetchStripeSubscription(subscriptionId);
+      if (fetched.ok) subscriptionParams = subscriptionObjectToParams(fetched.subscription);
+    }
+
+    const resolvedUserId = await findUserId({
+      customerId,
+      subscriptionId,
+      metadataUserId: metadataUserId ?? subscriptionParams?.metadataUserId ?? null,
+    });
+    if (!resolvedUserId) {
       await logWebhookOutcome({ status: "ignored", reason: "user_not_found" });
       return json(200, { received: true, ignored: true, reason: "user_not_found" });
     }
-    const tier = priceId ? resolveTierFromPriceId(priceId, env) : null;
+    const resolvedPriceId = priceId ?? subscriptionParams?.priceId ?? null;
+    const resolvedSubscriptionTier = subscriptionParams?.metadataTier ?? null;
+    const tier = resolveSubscriptionTier({
+      metadataTier,
+      subscriptionTier: resolvedSubscriptionTier,
+      priceId: resolvedPriceId,
+      env,
+    });
+    const tierSource = resolveTierSource({ metadataTier, subscriptionTier: resolvedSubscriptionTier, tier });
     if (!tier) {
-      await logWebhookOutcome({ status: "ignored", userId, reason: "unknown_price", details: { priceId } });
+      await logWebhookOutcome({
+        status: "ignored",
+        userId: resolvedUserId,
+        reason: "unknown_price",
+        details: { priceId: resolvedPriceId, metadataTier, subscriptionMetadataTier: resolvedSubscriptionTier, tierSource, invoiceId, subscriptionId },
+      });
       return json(200, { received: true, ignored: true, reason: "unknown_price" });
     }
 
-    const { error } = await handleSubscriptionState({
-      userId,
+    const resolvedCycleStart = cycleStart ?? subscriptionParams?.currentPeriodStart ?? null;
+    const resolvedCycleEnd = cycleEnd ?? subscriptionParams?.currentPeriodEnd ?? null;
+    const { data, error } = await handleSubscriptionState({
+      userId: resolvedUserId,
       tier,
       customerId,
       subscriptionId,
-      priceId,
-      cycleStart,
-      cycleEnd,
+      priceId: resolvedPriceId,
+      cycleStart: resolvedCycleStart,
+      cycleEnd: resolvedCycleEnd,
       invoiceId,
       resetUsage: true,
     });
     if (error) {
-      await logWebhookOutcome({ status: "error", userId, reason: "invoice_grant_apply_failed", details: { error, invoiceId, subscriptionId } });
-      await alertIfNeeded({ status: "error", userId, reason: "invoice_grant_apply_failed", details: { error, invoiceId, subscriptionId } });
+      await logWebhookOutcome({ status: "error", userId: resolvedUserId, reason: "invoice_grant_apply_failed", details: { error, invoiceId, subscriptionId } });
+      await alertIfNeeded({ status: "error", userId: resolvedUserId, reason: "invoice_grant_apply_failed", details: { error, invoiceId, subscriptionId } });
       return json(500, { error: "Failed to apply invoice grant", details: error });
     }
-    await logWebhookOutcome({ status: "ok", userId, reason: "invoice_grant_applied", details: { invoiceId, subscriptionId } });
+    const prof = await setProfileSubscriptionStatus({ userId: resolvedUserId, status: "active" });
+    if (!prof.ok) {
+      await logWebhookOutcome({ status: "error", userId: resolvedUserId, reason: "profile_status_update_failed", details: { error: prof.error, invoiceId, subscriptionId } });
+      await alertIfNeeded({ status: "error", userId: resolvedUserId, reason: "profile_status_update_failed", details: { error: prof.error, invoiceId, subscriptionId } });
+      return json(500, { error: "Failed to update subscription status", details: prof.error });
+    }
+    await logWebhookOutcome({
+      status: "ok",
+      userId: resolvedUserId,
+      reason: "invoice_grant_applied",
+      details: { invoiceId, subscriptionId, customerId, priceId: resolvedPriceId, tier, tierSource, applied: data },
+    });
+    return json(200, { received: true });
+  }
+
+  if (event.type === "invoice.payment_failed") {
+    if (!objRec) return json(400, { error: "Missing event object" });
+    const customerId = asString(objRec.customer);
+    const invoiceId = asString(objRec.id);
+    const subscriptionId = asString(objRec.subscription);
+    const meta = isRecord(objRec.metadata) ? objRec.metadata : null;
+    const metadataUserId = meta ? asString(meta.supabase_user_id ?? meta.user_id) : null;
+    const userId = await findUserId({ customerId, subscriptionId, metadataUserId });
+    if (!userId) {
+      await logWebhookOutcome({ status: "ignored", reason: "user_not_found", details: { invoiceId, subscriptionId } });
+      return json(200, { received: true, ignored: true, reason: "user_not_found" });
+    }
+    const prof = await setProfileSubscriptionStatus({ userId, status: "past_due" });
+    if (!prof.ok) {
+      await logWebhookOutcome({ status: "error", userId, reason: "profile_status_update_failed", details: { error: prof.error, invoiceId, subscriptionId } });
+      await alertIfNeeded({ status: "error", userId, reason: "profile_status_update_failed", details: { error: prof.error, invoiceId, subscriptionId } });
+      return json(500, { error: "Failed to update subscription status", details: prof.error });
+    }
+    await logWebhookOutcome({ status: "ok", userId, reason: "invoice_payment_failed", details: { invoiceId, subscriptionId } });
+    return json(200, { received: true });
+  }
+
+  if (event.type === "payment_intent.payment_failed") {
+    if (!objRec) return json(400, { error: "Missing event object" });
+    const paymentIntentId = asString(objRec.id);
+    const meta = isRecord(objRec.metadata) ? objRec.metadata : null;
+    const userId = meta ? asString(meta.supabase_user_id ?? meta.user_id) : null;
+    if (!userId) {
+      await logWebhookOutcome({ status: "ignored", reason: "missing_metadata", details: { paymentIntentId } });
+      return json(200, { received: true, ignored: true, reason: "missing_metadata" });
+    }
+    await logWebhookOutcome({ status: "ok", userId, reason: "payment_intent_failed", details: { paymentIntentId } });
     return json(200, { received: true });
   }
 
@@ -549,6 +770,12 @@ serve(async (req: Request) => {
       await logWebhookOutcome({ status: "error", userId, reason: "subscription_cancel_failed", details: { error } });
       await alertIfNeeded({ status: "error", userId, reason: "subscription_cancel_failed", details: { error } });
       return json(500, { error: "Failed to cancel subscription", details: error });
+    }
+    const prof = await setProfileSubscriptionStatus({ userId, status: "canceled" });
+    if (!prof.ok) {
+      await logWebhookOutcome({ status: "error", userId, reason: "profile_status_update_failed", details: { error: prof.error } });
+      await alertIfNeeded({ status: "error", userId, reason: "profile_status_update_failed", details: { error: prof.error } });
+      return json(500, { error: "Failed to update subscription status", details: prof.error });
     }
     await logWebhookOutcome({ status: "ok", userId, reason: "subscription_canceled" });
     return json(200, { received: true, result: data });

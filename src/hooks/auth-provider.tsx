@@ -12,6 +12,23 @@ export function AuthProvider({ children }: { children: ReactNode }) {
   const isRecord = (value: unknown): value is Record<string, unknown> =>
     typeof value === "object" && value !== null && !Array.isArray(value);
 
+  const isAbortedError = (value: unknown) => {
+    if (!value) return false;
+    if (value instanceof Error) {
+      const msg = (value.message || "").toLowerCase();
+      return value.name === "AbortError" || msg.includes("aborted") || msg.includes("err_aborted");
+    }
+    if (isRecord(value)) {
+      const name = typeof value.name === "string" ? value.name : "";
+      const msg = typeof value.message === "string" ? value.message : "";
+      const code = typeof value.code === "string" ? value.code : "";
+      const status = typeof value.status === "number" ? value.status : null;
+      const msgLower = msg.toLowerCase();
+      return name === "AbortError" || code === "ABORTED" || status === 499 || msgLower.includes("request aborted") || msgLower.includes("aborted");
+    }
+    return false;
+  };
+
   const fetchProfile = async (userId: string) => {
     try {
       const attemptWithCredits = async () => {
@@ -63,7 +80,7 @@ export function AuthProvider({ children }: { children: ReactNode }) {
             }
           }
         } catch (e) {
-          console.error("Failed to refresh credits status:", e);
+          if (!isAbortedError(e)) console.error("Failed to refresh credits status:", e);
         }
         return;
       }
@@ -72,16 +89,16 @@ export function AuthProvider({ children }: { children: ReactNode }) {
       if (code === "42703") {
         const fallback = await attemptBasic();
         if (fallback.error) {
-          console.error("Error fetching profile:", fallback.error);
+          if (!isAbortedError(fallback.error)) console.error("Error fetching profile:", fallback.error);
           return;
         }
         setProfile(fallback.data);
         return;
       }
 
-      console.error("Error fetching profile:", first.error);
+      if (!isAbortedError(first.error)) console.error("Error fetching profile:", first.error);
     } catch (e) {
-      console.error('Exception fetching profile:', e);
+      if (!isAbortedError(e)) console.error('Exception fetching profile:', e);
     }
   };
 

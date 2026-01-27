@@ -38,6 +38,12 @@ function classifyStripeKeyPrefix(value: string) {
   return "unknown";
 }
 
+function unitAmountCentsForTier(params: { tier: "creator" | "professional"; interval: "month" | "year" }) {
+  const monthlyCents = params.tier === "professional" ? 3999 : 1999;
+  if (params.interval === "month") return monthlyCents;
+  return Math.round(monthlyCents * 12 * 0.8);
+}
+
 export function buildCheckoutReturnUrls(req: Request, preferredBase?: string | null) {
   let origin =
     req.headers.get("origin") ??
@@ -87,10 +93,12 @@ export function buildCheckoutReturnUrls(req: Request, preferredBase?: string | n
 }
 
 export function buildStripeCheckoutForm(params: {
-  priceId: string;
+  priceId: string | null;
+  unitAmountCents: number;
   successUrl: string;
   cancelUrl: string;
   userId: string;
+  productId: string | null;
   tier: "creator" | "professional";
   interval: "month" | "year";
   customerId?: string | null;
@@ -99,7 +107,17 @@ export function buildStripeCheckoutForm(params: {
 }) {
   const form = new URLSearchParams();
   form.set("mode", "subscription");
-  form.set("line_items[0][price]", params.priceId);
+  if (params.priceId) {
+    form.set("line_items[0][price]", params.priceId);
+  } else {
+    form.set("line_items[0][price_data][currency]", "usd");
+    form.set("line_items[0][price_data][unit_amount]", String(params.unitAmountCents));
+    form.set("line_items[0][price_data][recurring][interval]", params.interval);
+    form.set(
+      "line_items[0][price_data][product_data][name]",
+      `SIAI ${params.tier === "professional" ? "Professional" : "Creator"} (${params.interval === "year" ? "Annual" : "Monthly"})`,
+    );
+  }
   form.set("line_items[0][quantity]", "1");
   form.set("success_url", params.successUrl);
   form.set("cancel_url", params.cancelUrl);
@@ -117,13 +135,63 @@ export function buildStripeCheckoutForm(params: {
   form.set("metadata[user_id]", params.userId);
   form.set("metadata[tier]", params.tier);
   form.set("metadata[interval]", params.interval);
-  form.set("metadata[price_id]", params.priceId);
+  form.set("metadata[price_id]", params.priceId ?? "inline");
+  if (params.productId) form.set("metadata[product_id]", params.productId);
   form.set("subscription_data[metadata][user_id]", params.userId);
   form.set("subscription_data[metadata][tier]", params.tier);
   form.set("subscription_data[metadata][interval]", params.interval);
-  form.set("subscription_data[metadata][price_id]", params.priceId);
+  form.set("subscription_data[metadata][price_id]", params.priceId ?? "inline");
+  if (params.productId) form.set("subscription_data[metadata][product_id]", params.productId);
 
   return form;
+}
+
+async function fetchStripePriceIdForSubscription(params: {
+  stripeSecretKey: string;
+  productId: string;
+  interval: "month" | "year";
+}) {
+  const url = new URL("https://api.stripe.com/v1/prices");
+  url.searchParams.set("product", params.productId);
+  url.searchParams.set("active", "true");
+  url.searchParams.set("limit", "20");
+  url.searchParams.set("type", "recurring");
+  url.searchParams.set("recurring[interval]", params.interval);
+
+  const resp = await fetch(url.toString(), {
+    headers: { Authorization: `Bearer ${params.stripeSecretKey}` },
+  });
+  const text = await resp.text();
+  let body: unknown = null;
+  try {
+    body = JSON.parse(text);
+  } catch {
+    body = null;
+  }
+  if (!resp.ok || !body || typeof body !== "object") {
+    return { ok: false as const, status: resp.status, body, raw: text };
+  }
+
+  const data = (body as Record<string, unknown>).data;
+  if (!Array.isArray(data)) return { ok: false as const, status: 502, body, raw: text };
+  const candidates = data.filter((p) => p && typeof p === "object") as Array<Record<string, unknown>>;
+
+  for (const price of candidates) {
+    const id = typeof price.id === "string" ? price.id : null;
+    const currency = typeof price.currency === "string" ? price.currency : null;
+    const recurring = price.recurring && typeof price.recurring === "object" ? (price.recurring as Record<string, unknown>) : null;
+    const interval = recurring && typeof recurring.interval === "string" ? recurring.interval : null;
+    if (id && id.startsWith("price_") && currency === "usd" && interval === params.interval) {
+      return { ok: true as const, priceId: id };
+    }
+  }
+
+  for (const price of candidates) {
+    const id = typeof price.id === "string" ? price.id : null;
+    if (id && id.startsWith("price_")) return { ok: true as const, priceId: id };
+  }
+
+  return { ok: false as const, status: 404, body: { error: "No active Stripe price found for product" } };
 }
 
 async function createStripeCheckoutSession(params: {
@@ -193,40 +261,71 @@ serve(async (req: Request) => {
 
   const supabaseUrl = Deno.env.get("SUPABASE_URL");
   const supabaseServiceKey = Deno.env.get("SUPABASE_SERVICE_ROLE_KEY");
+  const supabaseAnonKey = Deno.env.get("SUPABASE_ANON_KEY");
   const stripeSecretKeyRaw = Deno.env.get("STRIPE_SECRET_KEY");
-  const monthlyPriceId =
-    tier === "professional" ? Deno.env.get("STRIPE_PRICE_PROFESSIONAL_ID") : Deno.env.get("STRIPE_PRICE_CREATOR_ID");
-  const annualPriceId =
-    tier === "professional"
-      ? Deno.env.get("STRIPE_PRICE_PROFESSIONAL_ANNUAL_ID")
-      : Deno.env.get("STRIPE_PRICE_CREATOR_ANNUAL_ID");
-  const priceId = interval === "year" && annualPriceId ? annualPriceId : monthlyPriceId;
+  const monthlyPriceIdRaw =
+    (tier === "professional"
+      ? Deno.env.get("STRIPE_PRICE_PROFESSIONAL_ID") ?? "price_1SkA5XGhz0DaM9DauhtkNecq"
+      : Deno.env.get("STRIPE_PRICE_CREATOR_ID") ?? "price_1SlLG4Ghz0DaM9DammUhNwTH");
+  const annualPriceIdRaw =
+    (tier === "professional"
+      ? Deno.env.get("STRIPE_PRICE_PROFESSIONAL_ANNUAL_ID") ?? "price_1Sli8gGhz0DaM9Dadz4YTMSm"
+      : Deno.env.get("STRIPE_PRICE_CREATOR_ANNUAL_ID") ?? "price_1SlLG4Ghz0DaM9Dal11krHXI");
+  const envPriceId = interval === "year" ? annualPriceIdRaw : monthlyPriceIdRaw;
+  const envPriceIdOk = Boolean(envPriceId && envPriceId.startsWith("price_"));
+
+  const creatorProductId = (Deno.env.get("STRIPE_PRODUCT_CREATOR_ID") ?? "prod_TimpRrgY9Ko9IL").trim();
+  const professionalProductId = (Deno.env.get("STRIPE_PRODUCT_PROFESSIONAL_ID") ?? "prod_ThZDvY85b9kQtx").trim();
+  const productId = tier === "professional" ? professionalProductId : creatorProductId;
+  const productIdOk = productId.startsWith("prod_");
   const missing: string[] = [];
   if (!supabaseUrl) missing.push("SUPABASE_URL");
-  if (!supabaseServiceKey) missing.push("SUPABASE_SERVICE_ROLE_KEY");
+  if (!supabaseServiceKey && !supabaseAnonKey) missing.push("SUPABASE_ANON_KEY");
   if (!stripeSecretKeyRaw) missing.push("STRIPE_SECRET_KEY");
-  if (!monthlyPriceId) missing.push(tier === "professional" ? "STRIPE_PRICE_PROFESSIONAL_ID" : "STRIPE_PRICE_CREATOR_ID");
-  if (interval === "year" && !annualPriceId) {
-    missing.push(tier === "professional" ? "STRIPE_PRICE_PROFESSIONAL_ANNUAL_ID" : "STRIPE_PRICE_CREATOR_ANNUAL_ID");
-  }
   if (missing.length) return json(500, { error: "Configuration error", missing });
   const stripeSecretKey = normalizeStripeSecretKey(stripeSecretKeyRaw);
   if (!stripeSecretKey.startsWith("sk_")) return json(500, { error: "Configuration error", details: "STRIPE_SECRET_KEY must start with sk_", got: classifyStripeKeyPrefix(stripeSecretKey) });
-  if (!priceId.startsWith("price_")) return json(500, { error: "Configuration error", details: `Selected Stripe price must start with price_ (${interval})` });
+
+  let priceId: string | null = envPriceIdOk ? (envPriceId as string) : null;
+  if (!priceId) {
+    const resolved = await fetchStripePriceIdForSubscription({
+      stripeSecretKey,
+      productId,
+      interval,
+    });
+    if (resolved.ok) priceId = resolved.priceId;
+  }
 
   const authHeader = req.headers.get("authorization") ?? req.headers.get("Authorization");
-  if (!authHeader?.startsWith("Bearer ")) return json(401, { error: "Missing Authorization header" });
-  const token = authHeader.slice("Bearer ".length);
+  if (!authHeader) {
+    console.error("Missing Authorization header");
+    return json(401, { error: "Missing Authorization header" });
+  }
 
-  const admin = createClient(supabaseUrl, supabaseServiceKey) as SupabaseClientLike;
-  const { data: userData, error: userErr } = await admin.auth.getUser(token);
-  const user = userData?.user;
-  if (userErr || !user) return json(401, { error: "Invalid or expired session" });
+  const supabaseClient = createClient(
+    supabaseUrl,
+    supabaseAnonKey ?? "",
+    { global: { headers: { Authorization: authHeader } } }
+  );
+
+  const {
+    data: { user },
+    error: userError,
+  } = await supabaseClient.auth.getUser();
+
+  if (userError || !user) {
+    console.error("Authorization failed:", userError);
+    return json(401, { error: "Authorization failed", details: userError?.message });
+  }
 
   const urls = buildCheckoutReturnUrls(req, returnBase);
   if (!urls.ok) return json(400, { error: urls.error });
 
-  const { data: creditsRow } = await admin
+  const db = createClient(supabaseUrl, supabaseServiceKey ?? supabaseAnonKey ?? "", {
+    global: { headers: { Authorization: authHeader } },
+  });
+
+  const { data: creditsRow } = await db
     .from("user_credits")
     .select("stripe_customer_id")
     .eq("user_id", user.id)
@@ -235,11 +334,13 @@ serve(async (req: Request) => {
   const idempotencyKey = crypto.randomUUID();
   const form = buildStripeCheckoutForm({
     priceId,
+    unitAmountCents: unitAmountCentsForTier({ tier, interval }),
     successUrl: urls.successUrl,
     cancelUrl: urls.cancelUrl,
     userId: user.id,
     tier,
     interval,
+    productId: productIdOk ? productId : null,
     customerId: creditsRow?.stripe_customer_id ?? null,
     customerEmail: user.email ?? null,
   });

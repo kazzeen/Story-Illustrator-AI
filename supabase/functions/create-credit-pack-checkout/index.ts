@@ -120,6 +120,7 @@ export function buildStripeCheckoutForm(params: {
   successUrl: string;
   cancelUrl: string;
   userId: string;
+  productId: string | null;
   pack: "small" | "medium" | "large";
   credits: number;
   customerId?: string | null;
@@ -154,12 +155,53 @@ export function buildStripeCheckoutForm(params: {
   form.set("metadata[pack]", params.pack);
   form.set("metadata[credits]", String(params.credits));
   form.set("metadata[price_id]", params.priceId ?? "inline");
+  if (params.productId) form.set("metadata[product_id]", params.productId);
   form.set("payment_intent_data[metadata][user_id]", params.userId);
   form.set("payment_intent_data[metadata][pack]", params.pack);
   form.set("payment_intent_data[metadata][credits]", String(params.credits));
   form.set("payment_intent_data[metadata][price_id]", params.priceId ?? "inline");
+  if (params.productId) form.set("payment_intent_data[metadata][product_id]", params.productId);
 
   return form;
+}
+
+async function fetchStripePriceIdForOneTime(params: { stripeSecretKey: string; productId: string }) {
+  const url = new URL("https://api.stripe.com/v1/prices");
+  url.searchParams.set("product", params.productId);
+  url.searchParams.set("active", "true");
+  url.searchParams.set("limit", "20");
+  url.searchParams.set("type", "one_time");
+
+  const resp = await fetch(url.toString(), {
+    headers: { Authorization: `Bearer ${params.stripeSecretKey}` },
+  });
+  const text = await resp.text();
+  let body: unknown = null;
+  try {
+    body = JSON.parse(text);
+  } catch {
+    body = null;
+  }
+  if (!resp.ok || !body || typeof body !== "object") {
+    return { ok: false as const, status: resp.status, body, raw: text };
+  }
+
+  const data = (body as Record<string, unknown>).data;
+  if (!Array.isArray(data)) return { ok: false as const, status: 502, body, raw: text };
+  const candidates = data.filter((p) => p && typeof p === "object") as Array<Record<string, unknown>>;
+
+  for (const price of candidates) {
+    const id = typeof price.id === "string" ? price.id : null;
+    const currency = typeof price.currency === "string" ? price.currency : null;
+    if (id && id.startsWith("price_") && currency === "usd") return { ok: true as const, priceId: id };
+  }
+
+  for (const price of candidates) {
+    const id = typeof price.id === "string" ? price.id : null;
+    if (id && id.startsWith("price_")) return { ok: true as const, priceId: id };
+  }
+
+  return { ok: false as const, status: 404, body: { error: "No active Stripe price found for product" } };
 }
 
 async function createStripeCheckoutSession(params: {
@@ -213,10 +255,11 @@ serve(async (req: Request) => {
 
   const supabaseUrl = Deno.env.get("SUPABASE_URL");
   const supabaseServiceKey = Deno.env.get("SUPABASE_SERVICE_ROLE_KEY");
+  const supabaseAnonKey = Deno.env.get("SUPABASE_ANON_KEY");
   const stripeSecretKeyRaw = Deno.env.get("STRIPE_SECRET_KEY");
   const missing: string[] = [];
   if (!supabaseUrl) missing.push("SUPABASE_URL");
-  if (!supabaseServiceKey) missing.push("SUPABASE_SERVICE_ROLE_KEY");
+  if (!supabaseServiceKey && !supabaseAnonKey) missing.push("SUPABASE_ANON_KEY");
   if (!stripeSecretKeyRaw) missing.push("STRIPE_SECRET_KEY");
   if (missing.length) return json(500, { error: "Configuration error", missing });
 
@@ -240,22 +283,52 @@ serve(async (req: Request) => {
   if (!pack) return json(400, { error: "Invalid request", details: "Missing or invalid pack" });
 
   const priceEnvKey = priceEnvKeyForPack(pack);
-  const priceIdRaw = Deno.env.get(priceEnvKey) ?? null;
+  let defaultPriceId: string | null = null;
+  if (pack === "small") defaultPriceId = "price_1SlK6pGhz0DaM9Da16ezWBP0";
+  if (pack === "medium") defaultPriceId = "price_1SlK7tGhz0DaM9Da88lwWEOH";
+  if (pack === "large") defaultPriceId = "price_1SoBzBGhz0DaM9DaFeIUw3Eo";
+
+  const priceIdRaw = Deno.env.get(priceEnvKey) ?? defaultPriceId;
   const priceId = priceIdRaw && priceIdRaw.startsWith("price_") ? priceIdRaw : null;
 
-  const authHeader = req.headers.get("authorization") ?? req.headers.get("Authorization");
-  if (!authHeader?.startsWith("Bearer ")) return json(401, { error: "Missing Authorization header" });
-  const token = authHeader.slice("Bearer ".length);
+  const productId =
+    pack === "small"
+      ? (Deno.env.get("STRIPE_PRODUCT_CREDITS_SMALL_ID") ?? "prod_Tile8wkupI73el").trim()
+      : pack === "medium"
+        ? (Deno.env.get("STRIPE_PRODUCT_CREDITS_MEDIUM_ID") ?? "prod_TilfzH9y5Xt4ot").trim()
+        : (Deno.env.get("STRIPE_PRODUCT_CREDITS_LARGE_ID") ?? "prod_TljS29toykp4sN").trim();
+  const productIdOk = productId.startsWith("prod_");
 
-  const admin = createClient(supabaseUrl, supabaseServiceKey) as SupabaseClientLike;
-  const { data: userData, error: userErr } = await admin.auth.getUser(token);
-  const user = userData?.user;
-  if (userErr || !user) return json(401, { error: "Invalid or expired session" });
+  const authHeader = req.headers.get("authorization") ?? req.headers.get("Authorization");
+  if (!authHeader) {
+    console.error("Missing Authorization header");
+    return json(401, { error: "Missing Authorization header" });
+  }
+
+  const supabaseClient = createClient(
+    supabaseUrl,
+    supabaseAnonKey ?? "",
+    { global: { headers: { Authorization: authHeader } } }
+  );
+
+  const {
+    data: { user },
+    error: userError,
+  } = await supabaseClient.auth.getUser();
+
+  if (userError || !user) {
+    console.error("Authorization failed:", userError);
+    return json(401, { error: "Authorization failed", details: userError?.message });
+  }
 
   const urls = buildCheckoutReturnUrls(req, returnBase);
   if (!urls.ok) return json(400, { error: urls.error });
 
-  const { data: creditsRow } = await admin
+  const db = createClient(supabaseUrl, supabaseServiceKey ?? supabaseAnonKey ?? "", {
+    global: { headers: { Authorization: authHeader } },
+  });
+
+  const { data: creditsRow } = await db
     .from("user_credits")
     .select("stripe_customer_id")
     .eq("user_id", user.id)
@@ -263,13 +336,21 @@ serve(async (req: Request) => {
 
   const credits = creditsForPack(pack);
   const idempotencyKey = crypto.randomUUID();
+  let effectivePriceId: string | null = priceId;
+  if (!effectivePriceId && productIdOk) {
+    const resolved = await fetchStripePriceIdForOneTime({ stripeSecretKey, productId });
+    if (resolved.ok) {
+      effectivePriceId = resolved.priceId;
+    }
+  }
   const form = buildStripeCheckoutForm({
-    priceId,
+    priceId: effectivePriceId,
     successUrl: urls.successUrl,
     cancelUrl: urls.cancelUrl,
     userId: user.id,
     pack,
     credits,
+    productId: productIdOk ? productId : null,
     customerId: creditsRow?.stripe_customer_id ?? null,
     customerEmail: user.email ?? null,
   });

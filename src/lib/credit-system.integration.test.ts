@@ -41,6 +41,7 @@ interface CreditTransaction {
     transaction_type: "reservation" | "usage" | "release" | "refund";
     description: string;
     request_id: string;
+    metadata: Record<string, unknown>;
     created_at: Date;
 }
 
@@ -133,6 +134,7 @@ class MockDatabase {
             transaction_type: "reservation",
             description: "Credit reservation",
             request_id: requestId,
+            metadata: {},
             created_at: new Date(),
         });
 
@@ -171,20 +173,57 @@ class MockDatabase {
             transaction_type: "usage",
             description: "Credit usage",
             request_id: requestId,
+            metadata: {},
             created_at: new Date(),
         });
 
         return { ok: true };
     }
 
-    releaseReservedCredits(userId: string, requestId: string, reason: string): { ok: boolean; already_released?: boolean; reason?: string } {
+    releaseReservedCredits(
+        userId: string,
+        requestId: string,
+        reason: string,
+    ): { ok: boolean; already_released?: boolean; missing_reservation?: boolean; reason?: string } {
         const reservation = this.reservations.get(requestId);
         if (!reservation || reservation.user_id !== userId) {
-            return { ok: false, reason: "missing_reservation" };
+            const alreadyLogged = this.transactions.some(
+                t =>
+                    t.user_id === userId &&
+                    t.request_id === requestId &&
+                    (t.transaction_type === "release" || t.transaction_type === "refund"),
+            );
+
+            if (alreadyLogged) {
+                return { ok: true, already_released: true, missing_reservation: true };
+            }
+
+            this.transactions.push({
+                id: crypto.randomUUID(),
+                user_id: userId,
+                amount: 0,
+                transaction_type: "release",
+                description: reason,
+                request_id: requestId,
+                metadata: { missing_reservation: true, release_reason: reason },
+                created_at: new Date(),
+            });
+
+            return { ok: true, missing_reservation: true };
         }
 
         if (reservation.status === "released") {
             return { ok: true, already_released: true };
+        }
+
+        if (reservation.status === "committed") {
+            const refund = this.refundConsumedCredits(userId, requestId, reason);
+            if (!refund.ok) {
+                return { ok: false, reason: refund.reason ?? "refund_failed" };
+            }
+            reservation.status = "released";
+            reservation.metadata = { ...reservation.metadata, release_reason: reason, converted_from: "committed" };
+            return { ok: true };
         }
 
         if (reservation.status !== "reserved") {
@@ -208,6 +247,7 @@ class MockDatabase {
             transaction_type: "release",
             description: reason,
             request_id: requestId,
+            metadata: { release_reason: reason },
             created_at: new Date(),
         });
 
@@ -251,10 +291,22 @@ class MockDatabase {
             transaction_type: "refund",
             description: reason,
             request_id: requestId,
+            metadata: { refund_reason: reason },
             created_at: new Date(),
         });
 
         return { ok: true };
+    }
+
+    forceRefundCredits(userId: string, requestId: string, reason: string): { ok: boolean } {
+        const release = this.releaseReservedCredits(userId, requestId, reason);
+        const refund = this.refundConsumedCredits(userId, requestId, reason);
+
+        if (refund.ok) return { ok: true };
+        if (refund.reason === "no_usage_to_refund") return { ok: true };
+        if (release.ok) return { ok: true };
+
+        return { ok: false };
     }
 
     logMonitoringEvent(eventType: string, details: Record<string, unknown>) {
@@ -298,6 +350,7 @@ describe("Credit System Integration (E2E Simulation)", () => {
         it("should release credits when generation fails", () => {
             const userId = "test-user";
             const requestId = "gen-002";
+            const reason = "Generation failed: API error";
 
             // Reserve credits
             const reserveResult = db.reserveCredits(userId, requestId, 1);
@@ -305,7 +358,7 @@ describe("Credit System Integration (E2E Simulation)", () => {
             expect(db.getAvailableCredits(userId)).toBe(14);
 
             // Simulate generation failure and release
-            const releaseResult = db.releaseReservedCredits(userId, requestId, "Generation failed: API error");
+            const releaseResult = db.releaseReservedCredits(userId, requestId, reason);
             expect(releaseResult.ok).toBe(true);
             expect(releaseResult.already_released).toBeUndefined();
 
@@ -315,6 +368,32 @@ describe("Credit System Integration (E2E Simulation)", () => {
             // Verify transaction history
             expect(db.transactions).toHaveLength(2);
             expect(db.transactions[1].transaction_type).toBe("release");
+            expect(db.transactions[1].description).toBe(reason);
+        });
+
+        it("should refund when failure happens after commit", () => {
+            const userId = "test-user";
+            const requestId = "gen-002b";
+            const reason = "Generated image appears blank (mean=0, std=0)";
+
+            const reserveResult = db.reserveCredits(userId, requestId, 1);
+            expect(reserveResult.ok).toBe(true);
+            expect(db.getAvailableCredits(userId)).toBe(14);
+
+            const commitResult = db.commitReservedCredits(userId, requestId);
+            expect(commitResult.ok).toBe(true);
+            expect(db.getAvailableCredits(userId)).toBe(14);
+
+            const releaseResult = db.releaseReservedCredits(userId, requestId, reason);
+            expect(releaseResult.ok).toBe(true);
+            expect(db.getAvailableCredits(userId)).toBe(15);
+
+            const refundTxs = db.transactions.filter(t => t.request_id === requestId && t.transaction_type === "refund");
+            expect(refundTxs).toHaveLength(1);
+            expect(refundTxs[0].description).toBe(reason);
+
+            const reservation = db.reservations.get(requestId);
+            expect(reservation?.status).toBe("released");
         });
 
         it("should handle double-release attempts gracefully", () => {
@@ -333,12 +412,32 @@ describe("Credit System Integration (E2E Simulation)", () => {
             // Should still have the same credit count
             expect(db.getAvailableCredits(userId)).toBe(15);
         });
+
+        it("should remain correct under concurrent release attempts", async () => {
+            const userId = "test-user";
+            const requestId = "gen-003-concurrent";
+
+            db.reserveCredits(userId, requestId, 1);
+
+            const [r1, r2] = await Promise.all([
+                Promise.resolve().then(() => db.releaseReservedCredits(userId, requestId, "Generation failed")),
+                Promise.resolve().then(() => db.releaseReservedCredits(userId, requestId, "Generation failed")),
+            ]);
+
+            expect(r1.ok).toBe(true);
+            expect(r2.ok).toBe(true);
+            expect(db.getAvailableCredits(userId)).toBe(15);
+
+            const releaseTxs = db.transactions.filter(t => t.request_id === requestId && t.transaction_type === "release");
+            expect(releaseTxs).toHaveLength(1);
+        });
     });
 
     describe("Compensation: Committed Credits for Failed Generation", () => {
         it("should refund credits that were committed for a failed generation", () => {
             const userId = "test-user";
             const requestId = "gen-004";
+            const reason = "Compensation for failed generation";
 
             // Reserve and commit
             db.reserveCredits(userId, requestId, 1);
@@ -356,7 +455,7 @@ describe("Credit System Integration (E2E Simulation)", () => {
             });
 
             // Run compensation
-            const refundResult = db.refundConsumedCredits(userId, requestId, "Compensation for failed generation");
+            const refundResult = db.refundConsumedCredits(userId, requestId, reason);
             expect(refundResult.ok).toBe(true);
 
             // Credits should be restored
@@ -366,6 +465,7 @@ describe("Credit System Integration (E2E Simulation)", () => {
             const refundTx = db.transactions.find(t => t.transaction_type === "refund");
             expect(refundTx).toBeDefined();
             expect(refundTx?.amount).toBe(1);
+            expect(refundTx?.description).toBe(reason);
         });
 
         it("should not double-refund already refunded credits", () => {
@@ -386,6 +486,59 @@ describe("Credit System Integration (E2E Simulation)", () => {
 
             // Should only have one refund transaction
             const refundTxs = db.transactions.filter(t => t.transaction_type === "refund");
+            expect(refundTxs).toHaveLength(1);
+        });
+
+        it("should remain correct under concurrent refund attempts", async () => {
+            const userId = "test-user";
+            const requestId = "gen-005-concurrent";
+
+            db.reserveCredits(userId, requestId, 1);
+            db.commitReservedCredits(userId, requestId);
+
+            const [r1, r2] = await Promise.all([
+                Promise.resolve().then(() => db.refundConsumedCredits(userId, requestId, "Compensation for failed generation")),
+                Promise.resolve().then(() => db.refundConsumedCredits(userId, requestId, "Compensation for failed generation")),
+            ]);
+
+            expect(r1.ok).toBe(true);
+            expect(r2.ok).toBe(true);
+            expect(db.getAvailableCredits(userId)).toBe(15);
+
+            const refundTxs = db.transactions.filter(t => t.request_id === requestId && t.transaction_type === "refund");
+            expect(refundTxs).toHaveLength(1);
+        });
+    });
+
+    describe("Force Refund Behavior", () => {
+        it("should be idempotent for reserved credits", () => {
+            const userId = "test-user";
+            const requestId = "force-001";
+
+            expect(db.reserveCredits(userId, requestId, 1).ok).toBe(true);
+            expect(db.getAvailableCredits(userId)).toBe(14);
+
+            expect(db.forceRefundCredits(userId, requestId, "Failsafe").ok).toBe(true);
+            expect(db.forceRefundCredits(userId, requestId, "Failsafe again").ok).toBe(true);
+            expect(db.getAvailableCredits(userId)).toBe(15);
+
+            const releaseTxs = db.transactions.filter(t => t.request_id === requestId && t.transaction_type === "release");
+            expect(releaseTxs).toHaveLength(1);
+        });
+
+        it("should be idempotent for committed credits and not double-refund", () => {
+            const userId = "test-user";
+            const requestId = "force-002";
+
+            expect(db.reserveCredits(userId, requestId, 1).ok).toBe(true);
+            expect(db.commitReservedCredits(userId, requestId).ok).toBe(true);
+            expect(db.getAvailableCredits(userId)).toBe(14);
+
+            expect(db.forceRefundCredits(userId, requestId, "Failsafe").ok).toBe(true);
+            expect(db.forceRefundCredits(userId, requestId, "Failsafe again").ok).toBe(true);
+            expect(db.getAvailableCredits(userId)).toBe(15);
+
+            const refundTxs = db.transactions.filter(t => t.request_id === requestId && t.transaction_type === "refund");
             expect(refundTxs).toHaveLength(1);
         });
     });
@@ -451,10 +604,20 @@ describe("Credit System Integration (E2E Simulation)", () => {
             expect(result.reason).toBe("missing_reservation");
         });
 
-        it("should handle release for non-existent reservation", () => {
-            const result = db.releaseReservedCredits("test-user", "non-existent-req", "Test");
-            expect(result.ok).toBe(false);
-            expect(result.reason).toBe("missing_reservation");
+        it("should log a release transaction even when reservation is missing", () => {
+            const userId = "test-user";
+            const requestId = "non-existent-req";
+
+            const result = db.releaseReservedCredits(userId, requestId, "Generation failed");
+            expect(result.ok).toBe(true);
+            expect(result.missing_reservation).toBe(true);
+
+            const releaseTxs = db.transactions.filter(t => t.user_id === userId && t.request_id === requestId && t.transaction_type === "release");
+            expect(releaseTxs).toHaveLength(1);
+            expect(releaseTxs[0].amount).toBe(0);
+            expect(releaseTxs[0].metadata).toEqual(expect.objectContaining({ missing_reservation: true }));
+
+            expect(db.getAvailableCredits(userId)).toBe(15);
         });
     });
 

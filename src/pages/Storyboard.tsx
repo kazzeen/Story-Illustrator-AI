@@ -395,8 +395,41 @@ export default function Storyboard() {
       requestId: args.requestId,
       reason: args.reason,
       metadata: args.metadata,
-      userId: user.id,
     });
+
+    if (!result?.success) {
+      const [refund, release] = await Promise.all([
+        refundConsumedCredits({
+          requestId: args.requestId,
+          reason: args.reason,
+          refresh: false,
+          metadata: args.metadata,
+        }),
+        releaseReservedCredits({
+          requestId: args.requestId,
+          reason: args.reason,
+          refresh: false,
+          metadata: args.metadata,
+        }),
+      ]);
+
+      applyCreditsFromResponse(refund);
+      applyCreditsFromResponse(release);
+    }
+
+    const reconcile =
+      result &&
+      typeof result === "object" &&
+      "reconcile" in result &&
+      (result as { reconcile?: unknown }).reconcile &&
+      typeof (result as { reconcile?: unknown }).reconcile === "object" &&
+      !Array.isArray((result as { reconcile?: unknown }).reconcile)
+        ? ((result as { reconcile?: unknown }).reconcile as Record<string, unknown>)
+        : null;
+    const refund = reconcile?.refund;
+    const release = reconcile?.release;
+    applyCreditsFromResponse(refund);
+    applyCreditsFromResponse(release);
     if (args.refresh !== false) await refreshProfile();
     return result;
   };
@@ -848,6 +881,37 @@ export default function Storyboard() {
     setScenes((prev) => prev.map((s) => (s.id === sceneId ? { ...s, generation_status: "generating" } : s)));
 
     let clientRequestId: string | null = null;
+    let reconciled = false;
+
+    const lookupRequestIdFromAttempts = async (): Promise<string | null> => {
+      try {
+        const db = supabase as unknown as {
+          from: (table: string) => {
+            select: (columns: string) => unknown;
+          };
+        };
+        const q = db.from("image_generation_attempts").select("request_id,created_at") as unknown as {
+          eq: (column: string, value: string) => unknown;
+        };
+        const q1 = q.eq("user_id", user.id) as unknown as { eq: (column: string, value: string) => unknown };
+        const q2 = q1.eq("feature", "generate-scene-image") as unknown as { eq: (column: string, value: string) => unknown };
+        const q3 = q2.eq("metadata->>scene_id", sceneId) as unknown as {
+          order: (column: string, opts: { ascending: boolean }) => unknown;
+        };
+        const q4 = q3.order("created_at", { ascending: false }) as unknown as { limit: (n: number) => unknown };
+        const { data } = (await (q4.limit(3) as Promise<{ data: unknown }>)) ?? { data: null };
+
+        if (!Array.isArray(data)) return null;
+        for (const row of data) {
+          const rec = row as unknown as { request_id?: unknown };
+          const id = typeof rec?.request_id === "string" ? rec.request_id : null;
+          if (id && UUID_REGEX.test(id)) return id;
+        }
+        return null;
+      } catch {
+        return null;
+      }
+    };
 
     try {
       const { data: { session } } = await supabase.auth.getSession();
@@ -918,26 +982,31 @@ export default function Storyboard() {
         applyCreditsFromResponse(bodyObj?.credits);
         applyCreditsFromResponse(detailsObj?.credits);
 
-        const requestId = pickFirstUuid(bodyObj?.requestId, responseHeaders["x-request-id"], clientRequestId);
+        let requestId = pickFirstUuid(bodyObj?.requestId, responseHeaders["x-request-id"], clientRequestId);
+        if (!requestId) requestId = (await lookupRequestIdFromAttempts()) ?? undefined;
 
         const errorMsg =
           (typeof bodyObj?.error === "string" ? (bodyObj.error as string) : undefined) ||
           (typeof bodyObj?.message === "string" ? (bodyObj.message as string) : undefined) ||
           `HTTP ${rawResponse.status} ${rawResponse.statusText}`;
 
-        await handleReconcileCredits({
-          requestId,
-          reason: "Scene image generation failed",
-          refresh: false,
-          metadata: {
-            feature: "generate-scene-image",
-            stage: "http_error",
-            scene_id: sceneId,
-            story_id: storyId,
-            http_status: rawResponse.status,
-            error: errorMsg,
-          },
-        });
+        if (requestId) {
+          await handleReconcileCredits({
+            requestId,
+            reason: errorMsg, // Preserve the exact error message from server, including "Blank image generation (mean=0.0, std=0.0)"
+            refresh: false,
+            metadata: {
+              feature: "generate-scene-image",
+              stage: "http_error",
+              scene_id: sceneId,
+              story_id: storyId,
+              http_status: rawResponse.status,
+              error: errorMsg,
+              timestamp: new Date().toISOString(),
+            },
+          });
+          reconciled = true;
+        }
 
         recordSceneDebugInfo(sceneId, {
           timestamp: new Date(),
@@ -956,7 +1025,8 @@ export default function Storyboard() {
 
       const responseObj = responseBody && typeof responseBody === "object" ? (responseBody as Record<string, unknown>) : null;
       const imageUrl = typeof responseObj?.imageUrl === "string" ? (responseObj.imageUrl as string) : null;
-      const requestId = pickFirstUuid(responseObj?.requestId, responseHeaders["x-request-id"], clientRequestId);
+      let requestId = pickFirstUuid(responseObj?.requestId, responseHeaders["x-request-id"], clientRequestId);
+      if (!requestId) requestId = (await lookupRequestIdFromAttempts()) ?? undefined;
 
       applyCreditsFromResponse(responseObj?.credits);
 
@@ -966,18 +1036,21 @@ export default function Storyboard() {
           (typeof responseObj?.message === "string" ? (responseObj.message as string) : undefined) ||
           "No image URL returned";
 
-        await handleReconcileCredits({
-          requestId,
-          reason: "Scene image generation failed",
-          refresh: false,
-          metadata: {
-            feature: "generate-scene-image",
-            stage: "no_image_returned",
-            scene_id: sceneId,
-            story_id: storyId,
-            error: errorMsg,
-          },
-        });
+        if (requestId) {
+          await handleReconcileCredits({
+            requestId,
+            reason: errorMsg, // Preserve the exact error message from server
+            metadata: {
+              feature: "generate-scene-image",
+              stage: "no_image_returned",
+              scene_id: sceneId,
+              story_id: storyId,
+              error: errorMsg,
+              timestamp: new Date().toISOString(),
+            },
+          });
+          reconciled = true;
+        }
 
         recordSceneDebugInfo(sceneId, {
           timestamp: new Date(),
@@ -998,23 +1071,24 @@ export default function Storyboard() {
       const validation = await validateGeneratedImage(imageUrl);
       if (!validation.ok) {
         const reason = validation.reason || "Generated image failed client validation";
-        // Explicitly format for user visibility as requested
-        const logReason = reason.includes("Blank image") ? "Blank image generation" : `Generation failed: ${reason}`;
-        
-        await handleReconcileCredits({
-          requestId,
-          reason: logReason,
-          refresh: false,
-          metadata: {
-            feature: "generate-scene-image",
-            stage: "client_image_validation",
-            scene_id: sceneId,
-            story_id: storyId,
-            size: validation.size,
-            mean: validation.mean,
-            std: validation.std,
-          },
-        });
+
+        if (requestId) {
+          await handleReconcileCredits({
+            requestId,
+            reason: reason, // Preserve the exact validation failure reason
+            metadata: {
+              feature: "generate-scene-image",
+              stage: "client_image_validation",
+              scene_id: sceneId,
+              story_id: storyId,
+              size: validation.size,
+              mean: validation.mean,
+              std: validation.std,
+              timestamp: new Date().toISOString(),
+            },
+          });
+          reconciled = true;
+        }
         recordSceneDebugInfo(sceneId, {
           timestamp: new Date(),
           headers: responseHeaders,
@@ -1056,6 +1130,33 @@ export default function Storyboard() {
       await refreshProfile();
     } catch (e) {
       const message = e instanceof Error ? e.message : "Generation failed";
+      const requestIdToReconcile = !reconciled ? await lookupRequestIdFromAttempts() : null;
+      const fallbackRequestId =
+        requestIdToReconcile && UUID_REGEX.test(requestIdToReconcile)
+          ? requestIdToReconcile
+          : clientRequestId && UUID_REGEX.test(clientRequestId)
+            ? clientRequestId
+            : null;
+      if (!reconciled && fallbackRequestId) {
+        try {
+          await handleReconcileCredits({
+            requestId: fallbackRequestId,
+            reason: message, // Preserve the exact error message
+            refresh: false,
+            metadata: {
+              feature: "generate-scene-image",
+              stage: "client_exception",
+              scene_id: sceneId,
+              story_id: storyId,
+              error: message,
+              timestamp: new Date().toISOString(),
+            },
+          });
+          reconciled = true;
+        } catch {
+          void 0;
+        }
+      }
       recordSceneDebugInfo(sceneId, { timestamp: new Date(), error: message, requestParams });
       setScenes((prev) => prev.map((s) => (s.id === sceneId ? { ...s, generation_status: "error" } : s)));
       toast({ title: "Generation failed", description: message, variant: "destructive" });

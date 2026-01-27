@@ -2,8 +2,8 @@ import { createClient } from "@supabase/supabase-js";
 import { describe, expect, test } from "vitest";
 import crypto from "node:crypto";
 
-const supabaseUrl = process.env.SUPABASE_TEST_URL ?? process.env.SUPABASE_URL ?? process.env.VITE_SUPABASE_URL ?? "";
-const serviceRoleKey = process.env.SUPABASE_TEST_SERVICE_ROLE_KEY ?? process.env.SUPABASE_SERVICE_ROLE_KEY ?? "";
+const supabaseUrl = process.env.SUPABASE_TEST_URL ?? "";
+const serviceRoleKey = process.env.SUPABASE_TEST_SERVICE_ROLE_KEY ?? "";
 const enabled = Boolean(supabaseUrl && serviceRoleKey);
 
 type SupabaseClient = ReturnType<typeof createClient>;
@@ -47,6 +47,20 @@ async function deleteTestUser(supabase: SupabaseClient, userId: string) {
   if (error) throw error;
 }
 
+async function waitForProfile(supabase: SupabaseClient, userId: string, timeoutMs = 10000) {
+  const start = Date.now();
+  while (Date.now() - start < timeoutMs) {
+    const { data, error } = await supabase
+      .from("profiles")
+      .select("user_id,subscription_status,subscription_tier,credits_balance,next_billing_date")
+      .eq("user_id", userId)
+      .maybeSingle();
+    if (!error && data) return data as Record<string, unknown>;
+    await sleep(250);
+  }
+  throw new Error("Timed out waiting for profile");
+}
+
 describe("purchase flow (integration)", () => {
   const supabase: SupabaseClient | null = enabled
     ? createClient(supabaseUrl, serviceRoleKey, { auth: { persistSession: false, autoRefreshToken: false } })
@@ -78,6 +92,11 @@ describe("purchase flow (integration)", () => {
       expect(credits.monthly_credits_per_cycle).toBe(100);
       expect(credits.bonus_credits_total).toBe(20);
       expect(credits.bonus_granted).toBe(true);
+
+      const profile = await waitForProfile(supabase, userId);
+      expect(profile.subscription_tier).toBe("starter");
+      expect(profile.credits_balance).toBe(120);
+      expect(profile.next_billing_date).toBeTruthy();
     } finally {
       await deleteTestUser(supabase, userId);
     }
@@ -106,9 +125,14 @@ describe("purchase flow (integration)", () => {
 
       const credits = await waitForUserCredits(supabase, userId);
       expect(credits.tier).toBe("creator");
-      expect(credits.monthly_credits_per_cycle).toBe(300);
+      expect(credits.monthly_credits_per_cycle).toBe(200);
       expect(credits.bonus_credits_total).toBe(100);
       expect(credits.bonus_granted).toBe(true);
+
+      const profile = await waitForProfile(supabase, userId);
+      expect(profile.subscription_tier).toBe("creator");
+      expect(profile.credits_balance).toBe(300);
+      expect(profile.next_billing_date).toBeTruthy();
     } finally {
       await deleteTestUser(supabase, userId);
     }
@@ -140,6 +164,11 @@ describe("purchase flow (integration)", () => {
       expect(credits.monthly_credits_per_cycle).toBe(1000);
       expect(credits.bonus_credits_total).toBe(0);
       expect(credits.bonus_granted).toBe(false);
+
+      const profile = await waitForProfile(supabase, userId);
+      expect(profile.subscription_tier).toBe("professional");
+      expect(profile.credits_balance).toBe(1000);
+      expect(profile.next_billing_date).toBeTruthy();
     } finally {
       await deleteTestUser(supabase, userId);
     }
@@ -188,6 +217,34 @@ describe("purchase flow (integration)", () => {
 
       const afterSecond = await waitForUserCredits(supabase, userId);
       expect(afterSecond.bonus_credits_total).toBe(50);
+    } finally {
+      await deleteTestUser(supabase, userId);
+    }
+  });
+
+  test.skipIf(!enabled)("records Stripe webhook event ids uniquely", async () => {
+    if (!supabase) throw new Error("Test client not initialized");
+    const eventId = `evt_test_${crypto.randomUUID().replace(/-/g, "")}`;
+    try {
+      const { error: firstErr } = await supabase.from("stripe_webhook_events").insert({ event_id: eventId });
+      if (firstErr) throw firstErr;
+
+      const { error: secondErr } = await supabase.from("stripe_webhook_events").insert({ event_id: eventId });
+      expect(secondErr).toBeTruthy();
+    } finally {
+      await supabase.from("stripe_webhook_events").delete().eq("event_id", eventId);
+    }
+  });
+
+  test.skipIf(!enabled)("allows service role to update profile subscription_status", async () => {
+    if (!supabase) throw new Error("Test client not initialized");
+    const { userId } = await createTestUser(supabase);
+    try {
+      await waitForProfile(supabase, userId);
+      const { error: updErr } = await supabase.from("profiles").update({ subscription_status: "past_due" }).eq("user_id", userId);
+      if (updErr) throw updErr;
+      const profile = await waitForProfile(supabase, userId);
+      expect(profile.subscription_status).toBe("past_due");
     } finally {
       await deleteTestUser(supabase, userId);
     }

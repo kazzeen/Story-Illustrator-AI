@@ -1,5 +1,5 @@
 import { useState, useEffect } from 'react';
-import { useNavigate } from 'react-router-dom';
+import { useLocation, useNavigate } from 'react-router-dom';
 import { useAuth } from '@/hooks/useAuth';
 import { Card, CardContent, CardHeader, CardTitle, CardDescription } from '@/components/ui/card';
 import { Button } from '@/components/ui/button';
@@ -22,13 +22,44 @@ export default function Auth() {
 
   const { user, signUp, signIn } = useAuth();
   const navigate = useNavigate();
+  const location = useLocation();
   const { toast } = useToast();
 
   useEffect(() => {
     if (user) {
-      navigate('/');
+      const params = new URLSearchParams(location.search);
+      const redirectRaw = params.get("redirect");
+      const redirect = redirectRaw && redirectRaw.startsWith("/") ? redirectRaw : "/";
+      const forwardKeys = ["purchase_kind", "purchase_tier", "purchase_interval", "purchase_pack"];
+      let target = redirect;
+      try {
+        const url = new URL(redirect, window.location.origin);
+        for (const key of forwardKeys) {
+          const value = params.get(key);
+          if (value) url.searchParams.set(key, value);
+        }
+        const search = url.searchParams.toString();
+        target = `${url.pathname}${search ? `?${search}` : ""}${url.hash ?? ""}`;
+      } catch {
+        const forwarded = new URLSearchParams();
+        for (const key of forwardKeys) {
+          const value = params.get(key);
+          if (value) forwarded.set(key, value);
+        }
+        if (forwarded.toString()) {
+          target = redirect.includes("?") ? `${redirect}&${forwarded.toString()}` : `${redirect}?${forwarded.toString()}`;
+        }
+      }
+      navigate(target, { replace: true });
     }
-  }, [user, navigate]);
+  }, [location.search, navigate, user]);
+
+  useEffect(() => {
+    const params = new URLSearchParams(location.search);
+    const mode = params.get("mode");
+    if (mode === "signup") setIsSignUp(true);
+    if (mode === "signin") setIsSignUp(false);
+  }, [location.search]);
 
   const validateForm = () => {
     const newErrors: { email?: string; password?: string } = {};

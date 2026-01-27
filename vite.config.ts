@@ -9,6 +9,15 @@ export default defineConfig(({ mode }) => ({
     host: "0.0.0.0",
     port: 5173,
     strictPort: true,
+    allowedHosts: ["host.docker.internal"],
+    watch: {
+      ignored: [
+        "**/*.test.*",
+        "**/*.spec.*",
+        "**/*.e2e.*",
+        "**/__tests__/**",
+      ],
+    },
   },
   optimizeDeps: {
     include: ["@radix-ui/react-select", "@radix-ui/react-switch"],
