@@ -121,7 +121,7 @@ export function Navbar() {
                       <DropdownMenuItem asChild>
                         <Link to="/admin/users">
                           <Shield className="w-4 h-4 mr-2" />
-                          Admin Dashboard
+                          Admin Panel
                         </Link>
                       </DropdownMenuItem>
                     )}
