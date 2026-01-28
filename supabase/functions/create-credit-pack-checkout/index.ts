@@ -119,8 +119,7 @@ export function buildStripeCheckoutForm(params: {
   priceId: string | null;
   successUrl: string;
   cancelUrl: string;
-  userId: string;
-  productId: string | null;
+  userId: string;  productId: string | null;
   pack: "small" | "medium" | "large";
   credits: number;
   customerId?: string | null;

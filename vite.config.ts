@@ -8,6 +8,10 @@ export default defineConfig(({ mode }) => {
   const env = loadEnv(mode, process.cwd(), "");
   
   return {
+    define: {
+      // Inject build timestamp for debugging stale builds
+      "__BUILD_TIME__": JSON.stringify(new Date().toISOString()),
+    },
     server: {
       host: "0.0.0.0",
       port: 5173,
