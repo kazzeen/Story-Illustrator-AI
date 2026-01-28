@@ -57,7 +57,7 @@ export function Navbar() {
               <Sparkles className="w-3 h-3 text-primary absolute -top-1 -right-1 animate-pulse" />
             </div>
             <span className="font-display text-xl font-semibold text-foreground flex items-center gap-2">
-              SIAI <span className="text-xs font-mono text-muted-foreground bg-secondary px-1.5 py-0.5 rounded-md">v2.3</span>
+              SIAI <span className="text-xs font-mono text-muted-foreground bg-secondary px-1.5 py-0.5 rounded-md">v2.4</span>
             </span>
           </Link>
 
