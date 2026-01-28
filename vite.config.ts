@@ -12,6 +12,17 @@ export default defineConfig(({ mode }) => {
       // Inject build timestamp for debugging stale builds
       "__BUILD_TIME__": JSON.stringify(new Date().toISOString()),
     },
+    build: {
+      outDir: "dist",
+      emptyOutDir: true,
+      rollupOptions: {
+        output: {
+          entryFileNames: "assets/[name].[hash].js",
+          chunkFileNames: "assets/[name].[hash].js",
+          assetFileNames: "assets/[name].[hash].[ext]",
+        },
+      },
+    },
     server: {
       host: "0.0.0.0",
       port: 5173,
