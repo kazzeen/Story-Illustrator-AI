@@ -12,25 +12,7 @@ verify_jwt = false
 [functions.upload-reference-image]
 verify_jwt = true
 
-[functions.credits]
-verify_jwt = false
-
-[functions.create-credit-pack-checkout]
-verify_jwt = false
-
-[functions.create-starter-membership-checkout]
-verify_jwt = false
-
-[functions.create-creator-membership-checkout]
-verify_jwt = false
-
 [functions.stripe-webhook]
-verify_jwt = false
-
-[functions.reconcile-stripe-checkout]
-verify_jwt = false
-
-[functions.reconcile-stripe-credit-pack]
 verify_jwt = false
 
 [functions.api-admin]

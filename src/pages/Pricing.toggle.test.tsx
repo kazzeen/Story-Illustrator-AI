@@ -54,8 +54,6 @@ const supabaseMocks = vi.hoisted(() => ({
   auth: {
     getSession: vi.fn(async () => ({ data: { session: { access_token: "token" } } })),
     refreshSession: vi.fn(async () => ({ data: { session: { access_token: "token" } }, error: null })),
-    getUser: vi.fn(async () => ({ data: { user: null }, error: null })),
-    signOut: vi.fn(async () => ({ error: null })),
   },
   functions: {
     invoke: vi.fn(async () => ({ data: { url: "https://example.com/checkout" }, error: null })),
@@ -67,14 +65,12 @@ vi.mock("@/integrations/supabase/client", () => ({
 }));
 
 beforeEach(() => {
-  vi.useRealTimers();
   vi.resetModules();
   mocks.authState.user = null;
   mocks.authState.session = null;
 });
 
 afterEach(() => {
-  vi.useRealTimers();
   vi.unstubAllGlobals();
   cleanup();
 });
@@ -291,15 +287,10 @@ describe("Pricing checkout buttons", () => {
     const { default: Pricing } = await import("./Pricing");
     const assign = stubLocationAssign();
 
-    supabaseMocks.functions.invoke
-      .mockImplementationOnce(async () => ({
-        data: null,
-        error: { status: 401 } as never,
-      }))
-      .mockImplementationOnce(async () => ({
-        data: null,
-        error: { status: 401 } as never,
-      }));
+    supabaseMocks.functions.invoke.mockImplementationOnce(async () => ({
+      data: null,
+      error: { status: 401 } as never,
+    }));
 
     render(
       <MemoryRouter>
@@ -316,213 +307,5 @@ describe("Pricing checkout buttons", () => {
       expect.objectContaining({ title: "Authorization error", variant: "destructive" }),
     );
     expect(navigationMocks.navigate).not.toHaveBeenCalled();
-  });
-
-  test("shows actionable reconcile error details on checkout return", async () => {
-    vi.useFakeTimers();
-    try {
-      const { default: Pricing } = await import("./Pricing");
-      toastMocks.toast.mockClear();
-      navigationMocks.navigate.mockClear();
-      supabaseMocks.functions.invoke.mockClear();
-      mocks.authState.user = { id: "user-id" } as never;
-      supabaseMocks.auth.getSession.mockImplementation(async () => ({ data: { session: { access_token: "header.payload.signature" } } }));
-      supabaseMocks.auth.refreshSession.mockImplementation(async () => ({ data: { session: { access_token: "header.payload.signature" } }, error: null }));
-
-      supabaseMocks.functions.invoke
-        .mockImplementationOnce(async () => ({
-          data: null,
-          error: {
-            message: "Edge Function returned a non-2xx status code",
-            context: {
-              status: 500,
-              body: { error: "Configuration error", missing: { stripeSecretKey: true, supabaseServiceKey: true } },
-            },
-          } as never,
-        }))
-        .mockImplementation(async () => ({
-          data: { success: false },
-          error: null,
-        }));
-
-      render(
-        <MemoryRouter initialEntries={["/pricing?checkout=success&session_id=cs_test_123"]}>
-          <TooltipProvider>
-            <Pricing />
-          </TooltipProvider>
-        </MemoryRouter>,
-      );
-
-      await vi.advanceTimersByTimeAsync(9000);
-      await vi.runAllTicks();
-
-      const calls = toastMocks.toast.mock.calls.map((c) => c[0]) as Array<Record<string, unknown>>;
-      const has = calls.some(
-        (call) =>
-          call.title === "Checkout complete" &&
-          call.variant === "destructive" &&
-          typeof call.description === "string" &&
-          call.description.includes("Missing configuration"),
-      );
-      expect(has).toBe(true);
-    } finally {
-      vi.useRealTimers();
-    }
-  }, 15000);
-
-  test("redirects to sign in and preserves checkout params when reconcile returns Invalid JWT", async () => {
-    vi.useFakeTimers();
-    try {
-      const { default: Pricing } = await import("./Pricing");
-      toastMocks.toast.mockClear();
-      navigationMocks.navigate.mockClear();
-      supabaseMocks.functions.invoke.mockClear();
-      mocks.authState.user = { id: "user-id" } as never;
-      supabaseMocks.auth.getSession.mockImplementation(async () => ({ data: { session: { access_token: "header.payload.signature" } } }));
-      supabaseMocks.auth.refreshSession.mockImplementation(async () => ({ data: { session: { access_token: "header.payload.signature" } }, error: null }));
-      vi.stubGlobal(
-        "fetch",
-        vi.fn(async () => new Response(JSON.stringify({ code: 401, message: "Invalid JWT" }), { status: 401, headers: { "Content-Type": "application/json" } })),
-      );
-
-      supabaseMocks.functions.invoke.mockImplementationOnce(async () => ({
-        data: null,
-        error: {
-          message: "Edge Function returned a non-2xx status code",
-          context: { status: 401, body: { code: 401, message: "Invalid JWT" } },
-        } as never,
-      }));
-
-      render(
-        <MemoryRouter initialEntries={["/pricing?checkout=success&session_id=cs_test_123"]}>
-          <TooltipProvider>
-            <Pricing />
-          </TooltipProvider>
-        </MemoryRouter>,
-      );
-
-      await vi.advanceTimersByTimeAsync(2500);
-      await vi.runAllTicks();
-
-      expect(navigationMocks.navigate).toHaveBeenCalled();
-      const [url, opts] = navigationMocks.navigate.mock.calls[0] as [string, unknown];
-      expect(opts).toEqual(expect.objectContaining({ replace: true }));
-      expect(url).toContain("/auth?");
-      expect(url).toContain("checkout=success");
-      expect(url).toContain("session_id=cs_test_123");
-    } finally {
-      vi.useRealTimers();
-    }
-  }, 15000);
-
-  test("reconciles credit pack and shows updated credits on credits checkout return", async () => {
-    vi.useFakeTimers();
-    try {
-      const { default: Pricing } = await import("./Pricing");
-      toastMocks.toast.mockClear();
-      navigationMocks.navigate.mockClear();
-      supabaseMocks.functions.invoke.mockClear();
-      mocks.authState.user = { id: "user-id" } as never;
-      supabaseMocks.auth.getSession.mockImplementation(async () => ({ data: { session: { access_token: "header.payload.signature" } } }));
-      supabaseMocks.auth.refreshSession.mockImplementation(async () => ({ data: { session: { access_token: "header.payload.signature" } }, error: null }));
-
-      supabaseMocks.functions.invoke
-        .mockImplementationOnce(async () => ({ data: { ok: true, credits: 50 }, error: null }))
-        .mockImplementationOnce(async () => ({
-          data: { success: true, credits: { tier: "starter", remaining_monthly: 0, remaining_bonus: 50 } },
-          error: null,
-        }));
-
-      render(
-        <MemoryRouter initialEntries={["/pricing?credits_checkout=success&session_id=cs_test_123"]}>
-          <TooltipProvider>
-            <Pricing />
-          </TooltipProvider>
-        </MemoryRouter>,
-      );
-
-      await vi.advanceTimersByTimeAsync(9000);
-      await vi.runAllTicks();
-
-      expect(supabaseMocks.functions.invoke).toHaveBeenCalled();
-      expect(supabaseMocks.functions.invoke.mock.calls[0][0]).toBe("reconcile-stripe-credit-pack");
-      expect(supabaseMocks.functions.invoke.mock.calls[1][0]).toBe("credits");
-
-      const calls = toastMocks.toast.mock.calls.map((c) => c[0]) as Array<Record<string, unknown>>;
-      const has = calls.some((call) => call.title === "Checkout complete" && typeof call.description === "string" && call.description.includes("50 credits"));
-      expect(has).toBe(true);
-      expect(navigationMocks.navigate).toHaveBeenCalledWith(expect.anything(), expect.objectContaining({ replace: true }));
-    } finally {
-      vi.useRealTimers();
-    }
-  }, 15000);
-
-  test("redirects to sign in and preserves credits checkout params when credit pack reconcile returns Invalid JWT", async () => {
-    vi.useFakeTimers();
-    try {
-      const { default: Pricing } = await import("./Pricing");
-      toastMocks.toast.mockClear();
-      navigationMocks.navigate.mockClear();
-      supabaseMocks.functions.invoke.mockClear();
-      mocks.authState.user = { id: "user-id" } as never;
-      supabaseMocks.auth.getSession.mockImplementation(async () => ({ data: { session: { access_token: "header.payload.signature" } } }));
-      supabaseMocks.auth.refreshSession.mockImplementation(async () => ({ data: { session: { access_token: "header.payload.signature" } }, error: null }));
-      vi.stubGlobal(
-        "fetch",
-        vi.fn(async () => new Response(JSON.stringify({ code: 401, message: "Invalid JWT" }), { status: 401, headers: { "Content-Type": "application/json" } })),
-      );
-
-      supabaseMocks.functions.invoke.mockImplementationOnce(async () => ({
-        data: null,
-        error: {
-          message: "Edge Function returned a non-2xx status code",
-          context: { status: 401, body: { code: 401, message: "Invalid JWT" } },
-        } as never,
-      }));
-
-      render(
-        <MemoryRouter initialEntries={["/pricing?credits_checkout=success&session_id=cs_test_123"]}>
-          <TooltipProvider>
-            <Pricing />
-          </TooltipProvider>
-        </MemoryRouter>,
-      );
-
-      await vi.advanceTimersByTimeAsync(2500);
-      await vi.runAllTicks();
-
-      expect(navigationMocks.navigate).toHaveBeenCalled();
-      const [url, opts] = navigationMocks.navigate.mock.calls[0] as [string, unknown];
-      expect(opts).toEqual(expect.objectContaining({ replace: true }));
-      expect(url).toContain("/auth?");
-      expect(url).toContain("credits_checkout=success");
-      expect(url).toContain("session_id=cs_test_123");
-    } finally {
-      vi.useRealTimers();
-    }
-  }, 15000);
-
-  test("redirects to sign in without clearing checkout params", async () => {
-    const { default: Pricing } = await import("./Pricing");
-    toastMocks.toast.mockClear();
-    navigationMocks.navigate.mockClear();
-    supabaseMocks.functions.invoke.mockClear();
-    mocks.authState.user = null;
-
-    render(
-      <MemoryRouter initialEntries={["/pricing?checkout=success&session_id=cs_test_123"]}>
-        <TooltipProvider>
-          <Pricing />
-        </TooltipProvider>
-      </MemoryRouter>,
-    );
-
-    expect(supabaseMocks.functions.invoke).not.toHaveBeenCalled();
-    await waitFor(() =>
-      expect(navigationMocks.navigate).toHaveBeenCalledWith(
-        expect.stringContaining("/auth?"),
-        expect.objectContaining({ replace: true }),
-      ),
-    );
   });
 });

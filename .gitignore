@@ -24,18 +24,3 @@ dist-ssr
 *.njsproj
 *.sln
 *.sw?
-
-# Local secrets and temp files
-Stripe info.txt
-data.json
-temp_query.sql
-test-*.js
-validate-*.js
-test/
-
-
-.vercel
-.env*.local
-
-# Trae IDE artifacts
-.trae/

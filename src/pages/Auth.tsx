@@ -5,10 +5,8 @@ import { Card, CardContent, CardHeader, CardTitle, CardDescription } from '@/com
 import { Button } from '@/components/ui/button';
 import { Input } from '@/components/ui/input';
 import { Label } from '@/components/ui/label';
-import { ToastAction } from "@/components/ui/toast";
 import { BookOpen, Sparkles, Loader2, Mail, Lock, User } from 'lucide-react';
 import { useToast } from '@/hooks/use-toast';
-import { supabase } from "@/integrations/supabase/client";
 import { z } from 'zod';
 
 const emailSchema = z.string().email('Please enter a valid email address');
@@ -29,33 +27,19 @@ export default function Auth() {
 
   useEffect(() => {
     if (user) {
-      if (isSignUp) return;
       const params = new URLSearchParams(location.search);
       const redirectRaw = params.get("redirect");
       const redirect = redirectRaw && redirectRaw.startsWith("/") ? redirectRaw : "/";
       const forwardKeys = ["purchase_kind", "purchase_tier", "purchase_interval", "purchase_pack"];
-      let target = redirect;
-      try {
-        const url = new URL(redirect, window.location.origin);
-        for (const key of forwardKeys) {
-          const value = params.get(key);
-          if (value) url.searchParams.set(key, value);
-        }
-        const search = url.searchParams.toString();
-        target = `${url.pathname}${search ? `?${search}` : ""}${url.hash ?? ""}`;
-      } catch {
-        const forwarded = new URLSearchParams();
-        for (const key of forwardKeys) {
-          const value = params.get(key);
-          if (value) forwarded.set(key, value);
-        }
-        if (forwarded.toString()) {
-          target = redirect.includes("?") ? `${redirect}&${forwarded.toString()}` : `${redirect}?${forwarded.toString()}`;
-        }
+      const forwarded = new URLSearchParams();
+      for (const key of forwardKeys) {
+        const value = params.get(key);
+        if (value) forwarded.set(key, value);
       }
+      const target = forwarded.toString() ? `${redirect}?${forwarded.toString()}` : redirect;
       navigate(target, { replace: true });
     }
-  }, [isSignUp, location.search, navigate, user]);
+  }, [location.search, navigate, user]);
 
   useEffect(() => {
     const params = new URLSearchParams(location.search);
@@ -90,21 +74,7 @@ export default function Auth() {
 
     try {
       if (isSignUp) {
-        const emailRedirectTo = `${window.location.origin}/auth?mode=signin`;
-        const resend = async () => {
-          const { error: resendErr } = await supabase.auth.resend({
-            type: "signup",
-            email,
-            options: { emailRedirectTo },
-          });
-          if (resendErr) {
-            toast({ title: "Could not resend email", description: resendErr.message, variant: "destructive" });
-            return;
-          }
-          toast({ title: "Email resent", description: "Check your inbox (and spam) for the activation link." });
-        };
-
-        const { error, sessionCreated, resendError } = await signUp(email, password, displayName);
+        const { error } = await signUp(email, password, displayName);
         if (error) {
           if (error.message.includes('already registered')) {
             toast({
@@ -120,77 +90,19 @@ export default function Auth() {
             });
           }
         } else {
-          if (sessionCreated) {
-            const details = resendError ? ` Also: ${resendError.message}` : "";
-            toast({
-              title: "Email verification is not enabled",
-              description:
-                `Supabase is signing users in immediately on signup. Turn on Confirm Email in Supabase Auth settings to require activation.${details}`,
-              variant: "destructive",
-            });
-          } else {
-            if (resendError) {
-              toast({
-                title: "Account created, but email failed to send",
-                description: resendError.message,
-                variant: "destructive",
-                action: (
-                  <ToastAction altText="Resend activation email" onClick={() => void resend()}>
-                    Resend
-                  </ToastAction>
-                ),
-              });
-            } else {
-              toast({
-                title: "Check your email",
-                description: "Click the activation link we sent you, then come back and sign in.",
-                action: (
-                  <ToastAction altText="Resend activation email" onClick={() => void resend()}>
-                    Resend
-                  </ToastAction>
-                ),
-              });
-            }
-          }
+          toast({
+            title: 'Welcome to SIAI!',
+            description: 'Your account has been created successfully.',
+          });
         }
       } else {
         const { error } = await signIn(email, password);
         if (error) {
-          if (error.message.includes("Email not confirmed")) {
-            const emailRedirectTo = `${window.location.origin}/auth?mode=signin`;
-            toast({
-              title: 'Email not confirmed',
-              description: 'Please check your email and click the activation link to sign in.',
-              variant: 'destructive',
-              action: (
-                <ToastAction
-                  altText="Resend verification email"
-                  onClick={() => {
-                    void (async () => {
-                      const { error: resendErr } = await supabase.auth.resend({
-                        type: "signup",
-                        email,
-                        options: { emailRedirectTo },
-                      });
-                      if (resendErr) {
-                        toast({ title: "Could not resend email", description: resendErr.message, variant: "destructive" });
-                        return;
-                      }
-                      toast({ title: "Email resent", description: "Check your inbox (and spam) for the activation link." });
-                    })();
-                  }}
-                >
-                  Resend
-                </ToastAction>
-              ),
-            });
-          } else {
-            toast({
-              title: 'Sign in failed',
-              description: 'Invalid email or password. Please try again.',
-              variant: 'destructive',
-            });
-          }
+          toast({
+            title: 'Sign in failed',
+            description: 'Invalid email or password. Please try again.',
+            variant: 'destructive',
+          });
         }
       }
     } finally {

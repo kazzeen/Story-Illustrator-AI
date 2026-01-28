@@ -1,0 +1,16 @@
+{
+  "projectId": "prj_sTUXpqqe802VHuvuFEWlAd4uTGFD",
+  "orgId": "team_vhGrAAHz3QfWdT1GnNOEog7F",
+  "projectName": "story-illustrator-ai",
+  "settings": {
+    "createdAt": 1767204037441,
+    "framework": "vite",
+    "devCommand": null,
+    "installCommand": null,
+    "buildCommand": null,
+    "outputDirectory": null,
+    "rootDirectory": null,
+    "directoryListing": false,
+    "nodeVersion": "24.x"
+  }
+}

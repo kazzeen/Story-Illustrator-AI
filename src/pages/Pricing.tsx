@@ -105,8 +105,7 @@ const plans = [
     price: 39.99,
     description: "Power users and studios",
     features: [
-      "1000 images/credits per month",
-      "Unlimited stories",
+      "Unlimited images & stories",
       "All Models & Art Styles",
       "Dedicated support",
       "Custom feature requests",
@@ -127,7 +126,7 @@ const featuresComparison = [
   {
     category: "Generation",
     features: [
-      { name: "Monthly Credits", free: "5 (one-time)", starter: "100", creator: "200", pro: "1000" },
+      { name: "Monthly Credits", free: "5 (one-time)", starter: "100", creator: "200", pro: "Unlimited" },
       { name: "Story Generations", free: "1", starter: "5", creator: "25", pro: "Unlimited" },
       { name: "Bonus Credits", free: "-", starter: "20", creator: "100", pro: "-" },
     ]
@@ -225,56 +224,15 @@ export default function Pricing() {
   }, []);
 
   const invokeEdgeFunction = useCallback(async (fn: string, body: Record<string, unknown>, accessToken: string) => {
-    const apikey = String(import.meta.env.VITE_SUPABASE_PUBLISHABLE_KEY ?? import.meta.env.VITE_SUPABASE_ANON_KEY ?? "").trim();
+    // Supabase client automatically attaches the current session token
+    // We don't need to manually pass it unless we want to override it.
+    // However, if we just refreshed the token, the client might not have picked it up if we didn't await the session set?
+    // refreshSession() updates the session.
     const { data, error } = await supabase.functions.invoke(fn, {
       body,
-      headers: apikey ? { Authorization: `Bearer ${accessToken}`, apikey } : { Authorization: `Bearer ${accessToken}` },
+      // headers: { Authorization: `Bearer ${accessToken}` }, // Removed to rely on auto-auth
     });
-    if (error) {
-      const status =
-        typeof (error as unknown as { context?: unknown }).context === "object" &&
-        (error as unknown as { context?: { status?: unknown } }).context?.status &&
-        typeof (error as unknown as { context?: { status?: unknown } }).context?.status === "number"
-          ? Number((error as unknown as { context?: { status?: number } }).context?.status)
-          : typeof (error as unknown as { status?: unknown }).status === "number"
-            ? Number((error as unknown as { status?: number }).status)
-            : null;
-
-      if (status === 401) {
-        const looksLikeJwt = accessToken.split(".").length === 3;
-        const supabaseUrl = String(import.meta.env.VITE_SUPABASE_URL ?? "").trim().replace(/\/$/, "");
-        if (looksLikeJwt && supabaseUrl && apikey) {
-          const resp = await fetch(`${supabaseUrl}/functions/v1/${fn}`, {
-            method: "POST",
-            headers: {
-              Authorization: `Bearer ${accessToken}`,
-              apikey,
-              "Content-Type": "application/json",
-            },
-            body: JSON.stringify(body),
-          });
-          const text = await resp.text();
-          let parsed: unknown = text;
-          try {
-            parsed = JSON.parse(text);
-          } catch {
-            parsed = text;
-          }
-
-          if (!resp.ok) {
-            throw {
-              message: "Edge Function returned a non-2xx status code",
-              status: resp.status,
-              context: { status: resp.status, body: parsed },
-            };
-          }
-
-          return parsed;
-        }
-      }
-
-      throw error;
-    }
+    if (error) throw error;
     return data;
   }, []);
 
@@ -295,55 +253,10 @@ export default function Pricing() {
     const token = session?.access_token ?? null;
     const expiresAt = typeof session?.expires_at === "number" ? session.expires_at * 1000 : null;
     const shouldRefresh = expiresAt !== null ? expiresAt - Date.now() < 60_000 : false;
-    if (token && !shouldRefresh) {
-      const { error: userError } = await supabase.auth.getUser();
-      const msg = userError && typeof (userError as { message?: unknown }).message === "string" ? String((userError as { message?: string }).message) : "";
-      const invalid = msg.toLowerCase().includes("invalid jwt") || msg.toLowerCase().includes("unable to parse or verify signature");
-      if (invalid) {
-        try {
-          await supabase.auth.signOut();
-        } catch {
-          void 0;
-        }
-        try {
-          const supabaseUrl = String(import.meta.env.VITE_SUPABASE_URL ?? "").trim();
-          if (supabaseUrl && typeof localStorage !== "undefined") {
-            const host = new URL(supabaseUrl).hostname;
-            const ref = host.split(".")[0];
-            if (ref) localStorage.removeItem(`sb-${ref}-auth-token`);
-          }
-        } catch {
-          void 0;
-        }
-        return null;
-      }
-      return token;
-    }
+    if (token && !shouldRefresh) return token;
 
     const { data: refreshed, error } = await supabase.auth.refreshSession();
-    if (error) {
-      const msg = typeof (error as { message?: unknown }).message === "string" ? String((error as { message?: string }).message) : "";
-      const invalid = msg.toLowerCase().includes("invalid jwt") || msg.toLowerCase().includes("unable to parse or verify signature");
-      if (invalid) {
-        try {
-          await supabase.auth.signOut();
-        } catch {
-          void 0;
-        }
-        try {
-          const supabaseUrl = String(import.meta.env.VITE_SUPABASE_URL ?? "").trim();
-          if (supabaseUrl && typeof localStorage !== "undefined") {
-            const host = new URL(supabaseUrl).hostname;
-            const ref = host.split(".")[0];
-            if (ref) localStorage.removeItem(`sb-${ref}-auth-token`);
-          }
-        } catch {
-          void 0;
-        }
-        return null;
-      }
-      return token;
-    }
+    if (error) return token;
     return refreshed.session?.access_token ?? token;
   }, []);
 
@@ -365,28 +278,12 @@ export default function Pricing() {
         const missing = (body as Record<string, unknown>).missing;
         if (Array.isArray(missing) && missing.every((item) => typeof item === "string")) {
           details = `Missing configuration: ${missing.join(", ")}`;
-        } else if (isRecord(missing)) {
-          const map: Record<string, string> = {
-            supabaseUrl: "SUPABASE_URL",
-            supabaseServiceKey: "SUPABASE_SERVICE_ROLE_KEY",
-            supabaseAnonKey: "SUPABASE_ANON_KEY",
-            stripeSecretKey: "STRIPE_SECRET_KEY",
-          };
-          const keys = Object.keys(missing).filter((k) => (missing as Record<string, unknown>)[k] === true);
-          const names = keys.map((k) => map[k] ?? k).filter(Boolean);
-          if (names.length) details = `Missing configuration: ${names.join(", ")}`;
         } else {
           const errorText = typeof (body as Record<string, unknown>).error === "string" ? String((body as Record<string, unknown>).error) : null;
-          const messageText = typeof (body as Record<string, unknown>).message === "string" ? String((body as Record<string, unknown>).message) : null;
           const detailsText =
             typeof (body as Record<string, unknown>).details === "string" ? String((body as Record<string, unknown>).details) : null;
-          const detailsObj =
-            (body as Record<string, unknown>).details && typeof (body as Record<string, unknown>).details === "object"
-              ? (body as Record<string, unknown>).details
-              : null;
-          const detailsObjText = detailsObj ? JSON.stringify(detailsObj) : null;
           if (errorText && detailsText) details = `${errorText}: ${detailsText}`;
-          else details = errorText ?? detailsText ?? messageText ?? detailsObjText;
+          else details = errorText ?? detailsText;
         }
       } else if (typeof body === "string" && body.trim()) {
         details = body.trim();
@@ -463,9 +360,6 @@ export default function Pricing() {
           data = await invokeEdgeFunction(fn, body, accessToken);
         } catch (e) {
           console.error("Checkout error:", e);
-          if (typeof e === 'object' && e !== null && 'context' in e) {
-             console.error("Checkout error context:", (e as any).context);
-          }
           const status = (e as any).status || getErrorStatus(e);
           if (status === 401) {
             const refreshed = await refreshAccessToken();
@@ -487,7 +381,7 @@ export default function Pricing() {
               : null;
 
         if (url) {
-          redirectToUrl(url);
+          window.location.href = url;
         } else {
           const details =
             isRecord(data) && typeof data.error === "string"
@@ -514,215 +408,31 @@ export default function Pricing() {
   );
 
   useEffect(() => {
-    const checkoutKey = searchParams.get("checkout") ? "checkout" : searchParams.get("credits_checkout") ? "credits_checkout" : null;
-    const checkout = checkoutKey ? searchParams.get(checkoutKey) : null;
+    const checkout = searchParams.get("checkout") ?? searchParams.get("credits_checkout");
     const sessionId = searchParams.get("session_id");
-    if (checkout === "success" && sessionId && !handledCheckoutReturn.current) {
-      if (!user) {
-        const redirect = `${location.pathname}${location.search || ""}`;
-        const next = new URLSearchParams();
-        next.set("mode", "signin");
-        next.set("redirect", redirect);
-        navigate(`/auth?${next.toString()}`, { replace: true });
-        return;
-      }
-
+    if (checkout === "success" && sessionId && user && !handledCheckoutReturn.current) {
       handledCheckoutReturn.current = true;
       (async () => {
-        let shouldClearCheckoutParams = true;
-
-        const redirectToReauth = async () => {
-          shouldClearCheckoutParams = false;
-          try {
-            await supabase.auth.signOut();
-          } catch {
-            void 0;
-          }
-          try {
-            const supabaseUrl = String(import.meta.env.VITE_SUPABASE_URL ?? "").trim();
-            if (supabaseUrl && typeof localStorage !== "undefined") {
-              const host = new URL(supabaseUrl).hostname;
-              const ref = host.split(".")[0];
-              if (ref) localStorage.removeItem(`sb-${ref}-auth-token`);
-            }
-          } catch {
-            void 0;
-          }
-          navigate(buildAuthRedirectToPricing(searchParams), { replace: true });
-        };
-
         try {
-          await new Promise((resolve) => setTimeout(resolve, 2000));
-          const { data: refreshedSession, error: refreshError } = await supabase.auth.refreshSession();
-          console.info("Checkout return: refreshSession", {
-            ok: !refreshError,
-            error: refreshError ? String((refreshError as { message?: unknown }).message ?? "unknown") : null,
-          });
-          let accessToken = refreshedSession.session?.access_token;
-          
+          let accessToken = await refreshAccessToken();
           if (!accessToken) {
-            const { data: currentSession } = await supabase.auth.getSession();
-            accessToken = currentSession.session?.access_token;
-          }
-
-          if (!accessToken) {
-            console.info("Checkout return: missing access token", { hasUser: Boolean(user), hasSession: Boolean(session) });
             toast({ title: "Checkout complete", description: "Please sign in again to refresh your account.", variant: "destructive" });
-            await redirectToReauth();
-            return;
-          }
-          if (accessToken.split(".").length !== 3) {
-            console.info("Checkout return: token not JWT-like", { hasUser: Boolean(user) });
-            toast({ title: "Checkout complete", description: "Please sign in again to refresh your account.", variant: "destructive" });
-            await redirectToReauth();
+            navigate(buildAuthRedirectToPricing());
             return;
           }
 
-          if (checkoutKey === "checkout" && checkout === "success") {
-            try {
-              console.info("Checkout return: reconcile start", { sessionId });
-              await invokeEdgeFunction("reconcile-stripe-checkout", { session_id: sessionId }, accessToken);
-              console.info("Checkout return: reconcile ok", { sessionId });
-            } catch (e) {
-              const context = isRecord(e) && isRecord(e.context) ? e.context : null;
-              const status = context && typeof context.status === "number" ? Number(context.status) : getErrorStatus(e);
-              const rawBody = context && "body" in context ? (context as Record<string, unknown>).body : null;
-
-              let errorForSummary: unknown = e;
-              let decodedBody: unknown = rawBody;
-              if (typeof ReadableStream !== "undefined" && rawBody instanceof ReadableStream) {
-                try {
-                  const text = await new Response(rawBody).text();
-                  try {
-                    decodedBody = JSON.parse(text);
-                  } catch {
-                    decodedBody = text;
-                  }
-                  errorForSummary =
-                    isRecord(e) && context
-                      ? { ...e, context: { ...(context as Record<string, unknown>), body: decodedBody } }
-                      : e;
-                } catch {
-                  decodedBody = rawBody;
-                }
-              }
-
-              console.error("Checkout reconcile failed:", { error: e, status, body: decodedBody });
-              try {
-                console.error(
-                  "Checkout reconcile failed (details):",
-                  JSON.stringify({ status, body: decodedBody }, null, 2),
-                );
-              } catch {
-                void 0;
-              }
-
-              const isInvalidJwt =
-                status === 401 &&
-                ((isRecord(decodedBody) && (decodedBody.message === "Invalid JWT" || decodedBody.code === 401)) ||
-                  (isRecord(decodedBody) &&
-                    decodedBody.error === "Authorization failed" &&
-                    typeof decodedBody.details === "string" &&
-                    decodedBody.details.toLowerCase().includes("invalid jwt")));
-              if (isInvalidJwt) {
-                toast({
-                  title: "Checkout complete",
-                  description: "Your session expired. Please sign in again to finish syncing your purchase.",
-                  variant: "destructive",
-                });
-                await redirectToReauth();
-                return;
-              }
-
-              toast({
-                title: "Checkout complete",
-                description: `Sync failed: ${summarizeFunctionError(errorForSummary)}`,
-                variant: "destructive",
-              });
+          let data: unknown;
+          try {
+            data = await invokeEdgeFunction("credits", { action: "status", limit: 0 }, accessToken);
+          } catch (e) {
+            if (getErrorStatus(e) === 401) {
+              const refreshed = await refreshAccessToken();
+              if (!refreshed || refreshed === accessToken) throw e;
+              accessToken = refreshed;
+              data = await invokeEdgeFunction("credits", { action: "status", limit: 0 }, accessToken);
+            } else {
+              throw e;
             }
-          }
-
-          if (checkoutKey === "credits_checkout" && checkout === "success") {
-            try {
-              console.info("Checkout return: credit pack reconcile start", { sessionId });
-              await invokeEdgeFunction("reconcile-stripe-credit-pack", { session_id: sessionId }, accessToken);
-              console.info("Checkout return: credit pack reconcile ok", { sessionId });
-            } catch (e) {
-              const context = isRecord(e) && isRecord(e.context) ? e.context : null;
-              const status = context && typeof context.status === "number" ? Number(context.status) : getErrorStatus(e);
-              const rawBody = context && "body" in context ? (context as Record<string, unknown>).body : null;
-
-              console.error("Checkout credit pack reconcile failed:", { error: e, status, body: rawBody });
-              try {
-                console.error(
-                  "Checkout credit pack reconcile failed (details):",
-                  JSON.stringify({ status, body: rawBody }, null, 2),
-                );
-              } catch {
-                void 0;
-              }
-
-              const isInvalidJwt =
-                status === 401 &&
-                ((isRecord(rawBody) && (rawBody.message === "Invalid JWT" || rawBody.code === 401)) ||
-                  (isRecord(rawBody) &&
-                    rawBody.error === "Authorization failed" &&
-                    typeof rawBody.details === "string" &&
-                    rawBody.details.toLowerCase().includes("invalid jwt")));
-              if (isInvalidJwt) {
-                toast({
-                  title: "Checkout complete",
-                  description: "Your session expired. Please sign in again to finish syncing your purchase.",
-                  variant: "destructive",
-                });
-                await redirectToReauth();
-                return;
-              }
-
-              toast({
-                title: "Checkout complete",
-                description: `Sync failed: ${summarizeFunctionError(e)}`,
-                variant: "destructive",
-              });
-            }
-          }
-
-          const statusBody = { action: "status", limit: 0 };
-          let data: unknown = null;
-          for (let attempt = 0; attempt < 5; attempt++) {
-            try {
-              data = await invokeEdgeFunction("credits", statusBody, accessToken);
-            } catch (e) {
-              if (getErrorStatus(e) === 401) {
-                const context = isRecord(e) && isRecord(e.context) ? e.context : null;
-                const body =
-                  context && "body" in context
-                    ? (context as Record<string, unknown>).body
-                    : isRecord(e) && "body" in e
-                      ? (e as Record<string, unknown>).body
-                      : null;
-                const isInvalidJwt =
-                  isRecord(body) && (body.message === "Invalid JWT" || body.code === 401 || body.error === "Invalid JWT");
-                if (isInvalidJwt) {
-                  toast({
-                    title: "Checkout complete",
-                    description: "Your session expired. Please sign in again to finish syncing your purchase.",
-                    variant: "destructive",
-                  });
-                  await redirectToReauth();
-                  return;
-                }
-                const retryRefreshed = await refreshAccessToken();
-                if (!retryRefreshed || retryRefreshed === accessToken) throw e;
-                accessToken = retryRefreshed;
-                data = await invokeEdgeFunction("credits", statusBody, accessToken);
-              } else {
-                throw e;
-              }
-            }
-
-            if (isRecord(data) && data.success === true) break;
-            if (attempt < 4) await new Promise((resolve) => setTimeout(resolve, 1200));
           }
 
           if (isRecord(data) && data.success === true) {
@@ -741,18 +451,16 @@ export default function Pricing() {
               description: total !== null && tier ? `${total} credits (${tier})` : "Your account has been updated.",
             });
           } else {
-            toast({ title: "Checkout complete", description: "Your purchase is processing. Refresh in a moment." });
+            toast({ title: "Checkout complete", description: "Your purchase is processing. Refresh in a moment.", variant: "destructive" });
           }
         } catch (e) {
           toast({ title: "Checkout complete", description: summarizeFunctionError(e), variant: "destructive" });
         } finally {
-          if (shouldClearCheckoutParams) {
-            const next = new URLSearchParams(searchParams);
-            next.delete("checkout");
-            next.delete("credits_checkout");
-            next.delete("session_id");
-            navigate({ pathname: "/pricing", search: next.toString() ? `?${next.toString()}` : "" }, { replace: true });
-          }
+          const next = new URLSearchParams(searchParams);
+          next.delete("checkout");
+          next.delete("credits_checkout");
+          next.delete("session_id");
+          navigate({ pathname: "/pricing", search: next.toString() ? `?${next.toString()}` : "" }, { replace: true });
         }
       })();
     }
@@ -771,8 +479,6 @@ export default function Pricing() {
     getErrorStatus,
     invokeEdgeFunction,
     isRecord,
-    location.pathname,
-    location.search,
     navigate,
     refreshAccessToken,
     refreshProfile,

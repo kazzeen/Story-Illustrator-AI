@@ -139,11 +139,10 @@ serve(async (req: Request) => {
     if (req.method === "OPTIONS") return new Response(null, { headers: corsHeaders });
     if (req.method !== "POST") return json(405, { error: "Method not allowed" });
 
-    const supabaseUrl = deriveSupabaseUrl(req) ?? Deno.env.get("SB_SUPABASE_URL") ?? Deno.env.get("SUPABASE_URL") ?? null;
-    const supabaseServiceKey = Deno.env.get("SB_SERVICE_ROLE_KEY") ?? Deno.env.get("SUPABASE_SERVICE_ROLE_KEY") ?? null;
+    const supabaseUrl = deriveSupabaseUrl(req);
+    const supabaseServiceKey = Deno.env.get("SUPABASE_SERVICE_ROLE_KEY") ?? null;
     const headerApiKey = req.headers.get("apikey") ?? req.headers.get("Apikey") ?? null;
     const supabaseAnonKey =
-      Deno.env.get("SB_ANON_KEY") ??
       Deno.env.get("SUPABASE_ANON_KEY") ??
       Deno.env.get("SUPABASE_ANON_PUBLIC_KEY") ??
       Deno.env.get("SUPABASE_PUBLIC_ANON_KEY") ??
@@ -172,12 +171,16 @@ serve(async (req: Request) => {
     }
 
     const admin = supabaseServiceKey ? (createClient(supabaseUrl, supabaseServiceKey) as SupabaseClientLike) : null;
-    const authClient = supabaseAnonKey ? (createClient(supabaseUrl, supabaseAnonKey) as SupabaseClientLike) : null;
+    const authClient = supabaseAnonKey
+      ? (createClient(supabaseUrl, supabaseAnonKey, {
+          global: { headers: { Authorization: `Bearer ${token}` } },
+        }) as SupabaseClientLike)
+      : null;
 
     const authResp = admin
       ? await admin.auth.getUser(token)
       : authClient
-        ? await authClient.auth.getUser(token)
+        ? await authClient.auth.getUser()
         : { data: null, error: { message: "Missing SUPABASE_SERVICE_ROLE_KEY and SUPABASE_ANON_KEY" } };
 
     const { data: userData, error: userErr } = authResp as {

@@ -10,19 +10,13 @@ export type UserProfile = {
   is_admin?: boolean | null;
 } | null;
 
-export type SignUpResult = {
-  error: Error | null;
-  sessionCreated: boolean;
-  resendError: Error | null;
-};
-
 export interface AuthContextType {
   user: User | null;
   session: Session | null;
   loading: boolean;
   profile: UserProfile;
   refreshProfile: () => Promise<void>;
-  signUp: (email: string, password: string, displayName?: string) => Promise<SignUpResult>;
+  signUp: (email: string, password: string, displayName?: string) => Promise<{ error: Error | null }>;
   signIn: (email: string, password: string) => Promise<{ error: Error | null }>;
   signOut: () => Promise<void>;
 }

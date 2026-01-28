@@ -137,7 +137,6 @@ export function AuthProvider({ children }: { children: ReactNode }) {
   };
 
   const signUp = async (email: string, password: string, displayName?: string) => {
-    const emailRedirectTo = `${window.location.origin}/auth?mode=signin`;
     const { data, error } = await supabase.auth.signUp({
       email,
       password,
@@ -145,31 +144,9 @@ export function AuthProvider({ children }: { children: ReactNode }) {
         data: {
           display_name: displayName,
         },
-        emailRedirectTo,
       },
     });
-
-    const sessionCreated = Boolean(data?.session);
-    let resendError: Error | null = null;
-
-    if (!error) {
-      if (sessionCreated) {
-        try {
-          await supabase.auth.signOut();
-        } catch {
-          void 0;
-        }
-      }
-
-      try {
-        const { error: reErr } = await supabase.auth.resend({ type: "signup", email, options: { emailRedirectTo } });
-        if (reErr) resendError = reErr;
-      } catch (e) {
-        resendError = e instanceof Error ? e : new Error("Could not resend verification email");
-      }
-    }
-
-    return { error, sessionCreated, resendError };
+    return { error };
   };
 
   const signIn = async (email: string, password: string) => {

@@ -393,7 +393,6 @@ export type Database = {
           subscription_tier: string
           subscription_status: string | null
           next_billing_date: string | null
-          is_admin: boolean | null
         }
         Insert: {
           avatar_url?: string | null
@@ -407,7 +406,6 @@ export type Database = {
           subscription_tier?: string
           subscription_status?: string | null
           next_billing_date?: string | null
-          is_admin?: boolean | null
         }
         Update: {
           avatar_url?: string | null
@@ -421,7 +419,6 @@ export type Database = {
           subscription_tier?: string
           subscription_status?: string | null
           next_billing_date?: string | null
-          is_admin?: boolean | null
         }
         Relationships: []
       }
