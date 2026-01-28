@@ -1,5 +1,5 @@
 import { Link, useLocation, useNavigate } from "react-router-dom";
-import { BookOpen, Home, Upload, Grid3X3, LogIn, LogOut, Sparkles, User, CreditCard } from "lucide-react";
+import { BookOpen, Home, Upload, Grid3X3, LogIn, LogOut, Sparkles, User, CreditCard, Shield } from "lucide-react";
 import { Button } from "@/components/ui/button";
 import { cn } from "@/lib/utils";
 import { useAuth } from "@/hooks/useAuth";
