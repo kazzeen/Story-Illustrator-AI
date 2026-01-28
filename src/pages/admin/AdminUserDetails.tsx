@@ -10,7 +10,7 @@ import { Button } from "@/components/ui/button";
 import { Input } from "@/components/ui/input";
 import { Select, SelectContent, SelectItem, SelectTrigger, SelectValue } from "@/components/ui/select";
 import { Label } from "@/components/ui/label";
-import { ArrowLeft, Save, RefreshCw } from "lucide-react";
+import { ArrowLeft, Save, RefreshCw, User, CreditCard, History, Shield, Mail } from "lucide-react";
 import { toast } from "sonner";
 
 export default function AdminUserDetails() {
@@ -44,6 +44,7 @@ export default function AdminUserDetails() {
     } catch (err: any) {
       console.error("Failed to load user details", err);
       setError(err.message || "Failed to load user details");
+      toast.error("Failed to fetch user details");
     } finally {
       setLoading(false);
     }
@@ -73,8 +74,9 @@ export default function AdminUserDetails() {
     return (
       <div className="min-h-screen bg-background">
         <Navbar />
-        <div className="container mx-auto px-6 pt-24 flex justify-center">
-          <RefreshCw className="w-6 h-6 animate-spin text-muted-foreground" />
+        <div className="container mx-auto px-6 pt-24 flex flex-col items-center justify-center">
+          <RefreshCw className="w-8 h-8 animate-spin text-primary mb-4" />
+          <p className="text-muted-foreground">Loading profile...</p>
         </div>
       </div>
     );
@@ -85,7 +87,8 @@ export default function AdminUserDetails() {
       <div className="min-h-screen bg-background">
         <Navbar />
         <div className="container mx-auto px-6 pt-24">
-          <div className="bg-destructive/15 text-destructive p-4 rounded-md mb-4">
+          <div className="bg-destructive/15 text-destructive p-4 rounded-xl mb-4 flex items-center gap-3 border border-destructive/20">
+             <Shield className="w-5 h-5" />
             {error || "User not found"}
           </div>
           <Button variant="outline" onClick={() => navigate("/admin/users")}>
@@ -101,15 +104,17 @@ export default function AdminUserDetails() {
     <div className="min-h-screen bg-background">
       <Navbar />
       <div className="container mx-auto px-6 pt-24 pb-12">
-        <div className="mb-6 flex items-center justify-between">
+        <div className="mb-8 flex items-center justify-between">
           <div className="flex items-center gap-4">
-            <Button variant="ghost" onClick={() => navigate("/admin/users")}>
-              <ArrowLeft className="w-4 h-4 mr-2" />
-              Back
+            <Button variant="ghost" size="icon" onClick={() => navigate("/admin/users")} className="rounded-full">
+              <ArrowLeft className="w-5 h-5" />
             </Button>
-            <h1 className="text-2xl font-bold">User Details</h1>
+            <div>
+              <h1 className="text-3xl font-display font-bold text-foreground">User Details</h1>
+              <p className="text-muted-foreground text-sm">Manage profile and credits for {data.email}</p>
+            </div>
           </div>
-          <Button onClick={handleSave} disabled={saving}>
+          <Button onClick={handleSave} disabled={saving} size="lg" className="shadow-lg hover:shadow-primary/25 transition-all">
             {saving ? (
               <RefreshCw className="w-4 h-4 mr-2 animate-spin" />
             ) : (
@@ -119,54 +124,69 @@ export default function AdminUserDetails() {
           </Button>
         </div>
 
-        <div className="grid gap-6 md:grid-cols-3">
+        <div className="grid gap-8 md:grid-cols-3">
           {/* Main Info */}
-          <Card className="md:col-span-2">
-            <CardHeader>
-              <CardTitle>Profile Information</CardTitle>
+          <Card className="md:col-span-2 border-border/50 shadow-md">
+            <CardHeader className="border-b border-border/50 bg-secondary/20">
+              <CardTitle className="flex items-center gap-2">
+                <User className="w-5 h-5 text-primary" />
+                Profile Information
+              </CardTitle>
             </CardHeader>
-            <CardContent className="space-y-4">
-              <div className="grid grid-cols-2 gap-4">
-                <div>
-                  <Label>Email</Label>
-                  <div className="text-sm font-medium mt-1">{data.email}</div>
+            <CardContent className="space-y-6 pt-6">
+              <div className="grid grid-cols-2 gap-6">
+                <div className="space-y-1.5">
+                  <Label className="text-muted-foreground flex items-center gap-2">
+                    <Mail className="w-3.5 h-3.5" /> Email Address
+                  </Label>
+                  <div className="font-medium text-lg">{data.email}</div>
                 </div>
-                <div>
-                  <Label>User ID</Label>
-                  <div className="text-xs font-mono text-muted-foreground mt-1">{data.id}</div>
+                <div className="space-y-1.5">
+                  <Label className="text-muted-foreground">User ID</Label>
+                  <div className="text-xs font-mono bg-secondary/50 p-2 rounded border">{data.id}</div>
                 </div>
-                <div>
-                  <Label>Joined</Label>
-                  <div className="text-sm text-muted-foreground mt-1">
-                    {new Date(data.created_at).toLocaleDateString()} {new Date(data.created_at).toLocaleTimeString()}
+                <div className="space-y-1.5">
+                  <Label className="text-muted-foreground">Joined Date</Label>
+                  <div className="font-medium">
+                    {new Date(data.created_at).toLocaleDateString()}
+                    <span className="text-muted-foreground text-sm ml-2">
+                      {new Date(data.created_at).toLocaleTimeString()}
+                    </span>
                   </div>
                 </div>
-                <div>
-                  <Label>Last Sign In</Label>
-                  <div className="text-sm text-muted-foreground mt-1">
+                <div className="space-y-1.5">
+                  <Label className="text-muted-foreground">Last Sign In</Label>
+                  <div className="font-medium">
                     {data.last_sign_in_at ? new Date(data.last_sign_in_at).toLocaleDateString() : "Never"}
                   </div>
                 </div>
               </div>
 
-              <div className="pt-4 border-t space-y-4">
-                <div className="grid grid-cols-2 gap-4">
-                  <div className="space-y-2">
-                    <Label htmlFor="credits">Credits Balance</Label>
-                    <Input
-                      id="credits"
-                      type="number"
-                      value={credits}
-                      onChange={(e) => setCredits(parseInt(e.target.value) || 0)}
-                    />
+              <div className="pt-6 border-t border-border/50">
+                <h3 className="text-lg font-semibold mb-4 flex items-center gap-2">
+                  <CreditCard className="w-4 h-4 text-primary" />
+                  Subscription & Credits
+                </h3>
+                <div className="grid grid-cols-2 gap-6 p-4 bg-secondary/10 rounded-xl border border-border/50">
+                  <div className="space-y-3">
+                    <Label htmlFor="credits" className="text-base">Credits Balance</Label>
+                    <div className="flex items-center gap-3">
+                      <Input
+                        id="credits"
+                        type="number"
+                        value={credits}
+                        onChange={(e) => setCredits(parseInt(e.target.value) || 0)}
+                        className="text-lg font-mono"
+                      />
+                    </div>
                     <p className="text-xs text-muted-foreground">
-                      Manually adjust available credits.
+                      Current available credits.
                     </p>
                   </div>
-                  <div className="space-y-2">
-                    <Label htmlFor="tier">Subscription Tier</Label>
+                  <div className="space-y-3">
+                    <Label htmlFor="tier" className="text-base">Subscription Tier</Label>
                     <Select value={tier} onValueChange={setTier}>
-                      <SelectTrigger>
+                      <SelectTrigger className="h-10">
                         <SelectValue placeholder="Select tier" />
                       </SelectTrigger>
                       <SelectContent>
@@ -183,59 +203,71 @@ export default function AdminUserDetails() {
           </Card>
 
           {/* Quick Stats / Side Panel */}
-          <Card>
-            <CardHeader>
-              <CardTitle>Status</CardTitle>
-            </CardHeader>
-            <CardContent className="space-y-4">
-              <div className="flex justify-between items-center">
-                <span className="text-sm text-muted-foreground">Role</span>
-                <Badge variant={data.profile?.is_admin ? "default" : "secondary"}>
-                  {data.profile?.is_admin ? "Admin" : "User"}
-                </Badge>
-              </div>
-              <div className="flex justify-between items-center">
-                <span className="text-sm text-muted-foreground">Confirmed</span>
-                <Badge variant={data.email_confirmed_at ? "outline" : "destructive"}>
-                  {data.email_confirmed_at ? "Yes" : "No"}
-                </Badge>
-              </div>
-            </CardContent>
-          </Card>
+          <div className="space-y-6">
+            <Card className="border-border/50 shadow-md">
+              <CardHeader className="border-b border-border/50 bg-secondary/20">
+                <CardTitle className="flex items-center gap-2">
+                  <Shield className="w-5 h-5 text-primary" />
+                  Account Status
+                </CardTitle>
+              </CardHeader>
+              <CardContent className="space-y-4 pt-6">
+                <div className="flex justify-between items-center p-3 rounded-lg bg-secondary/30">
+                  <span className="text-sm font-medium">Role</span>
+                  <Badge variant={data.profile?.is_admin ? "default" : "secondary"} className="uppercase tracking-wide">
+                    {data.profile?.is_admin ? "Admin" : "User"}
+                  </Badge>
+                </div>
+                <div className="flex justify-between items-center p-3 rounded-lg bg-secondary/30">
+                  <span className="text-sm font-medium">Email Confirmed</span>
+                  <Badge variant={data.email_confirmed_at ? "outline" : "destructive"} className="bg-background">
+                    {data.email_confirmed_at ? "Yes" : "No"}
+                  </Badge>
+                </div>
+              </CardContent>
+            </Card>
+          </div>
 
           {/* Activity Log */}
-          <Card className="md:col-span-3">
-            <CardHeader>
-              <CardTitle>Credit Activity Log</CardTitle>
-              <CardDescription>Recent credit usage and purchases.</CardDescription>
+          <Card className="md:col-span-3 border-border/50 shadow-md mt-4">
+            <CardHeader className="border-b border-border/50 bg-secondary/20">
+              <CardTitle className="flex items-center gap-2">
+                <History className="w-5 h-5 text-primary" />
+                Credit Activity Log
+              </CardTitle>
+              <CardDescription>Recent transactions and usage history.</CardDescription>
             </CardHeader>
-            <CardContent>
+            <CardContent className="p-0">
               <Table>
                 <TableHeader>
-                  <TableRow>
-                    <TableHead>Date</TableHead>
+                  <TableRow className="bg-secondary/50 hover:bg-secondary/50">
+                    <TableHead className="pl-6">Date</TableHead>
                     <TableHead>Type</TableHead>
                     <TableHead>Feature</TableHead>
-                    <TableHead className="text-right">Amount</TableHead>
+                    <TableHead className="text-right pr-6">Amount</TableHead>
                   </TableRow>
                 </TableHeader>
                 <TableBody>
                   {data.transactions?.length > 0 ? (
                     data.transactions.map((tx: any) => (
-                      <TableRow key={tx.id}>
-                        <TableCell>
-                          {new Date(tx.created_at).toLocaleDateString()} {new Date(tx.created_at).toLocaleTimeString()}
+                      <TableRow key={tx.id} className="hover:bg-secondary/30">
+                        <TableCell className="pl-6 font-mono text-sm">
+                          {new Date(tx.created_at).toLocaleDateString()} <span className="text-muted-foreground">{new Date(tx.created_at).toLocaleTimeString()}</span>
                         </TableCell>
-                        <TableCell className="capitalize">{tx.transaction_type}</TableCell>
-                        <TableCell className="capitalize">{tx.feature_type || "-"}</TableCell>
-                        <TableCell className={`text-right font-mono ${tx.amount > 0 ? "text-green-500" : "text-red-500"}`}>
+                        <TableCell>
+                          <Badge variant="outline" className="capitalize font-normal">
+                            {tx.transaction_type}
+                          </Badge>
+                        </TableCell>
+                        <TableCell className="capitalize text-muted-foreground">{tx.feature_type || "-"}</TableCell>
+                        <TableCell className={`text-right pr-6 font-mono font-bold ${tx.amount > 0 ? "text-green-500" : "text-red-500"}`}>
                           {tx.amount > 0 ? "+" : ""}{tx.amount}
                         </TableCell>
                       </TableRow>
                     ))
                   ) : (
                     <TableRow>
-                      <TableCell colSpan={4} className="text-center text-muted-foreground py-4">
+                      <TableCell colSpan={4} className="text-center text-muted-foreground py-12">
                         No activity found.
                       </TableCell>
                     </TableRow>
