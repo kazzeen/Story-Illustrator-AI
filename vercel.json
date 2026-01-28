@@ -1,5 +1,6 @@
 {
   "rewrites": [
+    { "source": "/api/admin/:match*", "destination": "https://gaxmjxiqjirjeyemjcyc.supabase.co/functions/v1/api-admin/:match*" },
     { "source": "/(.*)", "destination": "/index.html" }
   ]
 }

@@ -35,8 +35,13 @@ export function Navbar() {
   const planLabel = formatPlanLabel(profile?.subscription_tier);
 
   const handleSignOut = async () => {
-    await signOut();
-    navigate('/auth');
+    try {
+      await signOut();
+    } catch (error) {
+      console.error("Error during sign out:", error);
+    } finally {
+      navigate('/auth');
+    }
   };
 
   return (

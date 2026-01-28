@@ -14,31 +14,14 @@ export class AdminApiError extends Error {
 
 /**
  * Determines the correct base URL for admin API calls.
- * On production (non-localhost), it bypasses Vercel rewrites by targeting
- * the Supabase Edge Function directly.
+ * We use a relative path /api/admin/... for both development and production.
+ * - In Development: Vite Proxy handles the rewrite to Supabase Functions.
+ * - In Production: Vercel Rewrites (vercel.json) handles the rewrite to Supabase Functions.
  */
 export function getAdminGatewayUrl(path: string): string {
   // Remove leading slash for consistency in joining
   const cleanPath = path.startsWith("/") ? path.slice(1) : path;
-  const pathPrefix = path.startsWith("/") ? path : `/${path}`;
-  
-  // In development, use the local proxy/API route
-  if (import.meta.env.DEV) {
-    return `/api/admin/${cleanPath}`;
-  }
-
-  // In production, try to construct the direct Supabase Functions URL
-  const supabaseUrl = import.meta.env.VITE_SUPABASE_URL;
-  if (!supabaseUrl) {
-    console.warn("VITE_SUPABASE_URL not found, falling back to relative path");
-    return `/api/admin/${cleanPath}`;
-  }
-
-  // Construct: https://[ref].supabase.co/functions/v1/api-admin/[path]
-  const baseUrl = supabaseUrl.replace(/\/$/, "");
-  
-  // The direct function URL bypasses Vercel's rewrites
-  return `${baseUrl}/functions/v1/api-admin/${cleanPath}`;
+  return `/api/admin/${cleanPath}`;
 }
 
 /**

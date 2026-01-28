@@ -158,7 +158,16 @@ export function AuthProvider({ children }: { children: ReactNode }) {
   };
 
   const signOut = async () => {
-    await supabase.auth.signOut();
+    try {
+      await supabase.auth.signOut();
+    } catch (error) {
+      console.error("Error signing out:", error);
+    } finally {
+      // Force clear local state
+      setSession(null);
+      setUser(null);
+      setProfile(null);
+    }
   };
 
   const value: AuthContextType = { user, session, loading, profile, refreshProfile, signUp, signIn, signOut };
