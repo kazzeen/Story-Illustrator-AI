@@ -4,7 +4,7 @@ import { createClient } from "https://esm.sh/@supabase/supabase-js@2.49.2";
 const corsHeaders = {
   "Access-Control-Allow-Origin": "*",
   "Access-Control-Allow-Headers": "authorization, x-client-info, apikey, content-type",
-  "Access-Control-Allow-Methods": "POST, GET, OPTIONS",
+  "Access-Control-Allow-Methods": "POST, GET, PATCH, OPTIONS",
 };
 
 serve(async (req) => {
@@ -15,13 +15,11 @@ serve(async (req) => {
   try {
     const url = new URL(req.url);
     // path handling: /functions/v1/api-admin/users -> users
-    // url.pathname is /functions/v1/api-admin/users
-    // We want the part after /api-admin/
+    // /functions/v1/api-admin/users/123 -> users/123
     let path = "";
     if (url.pathname.includes("/api-admin/")) {
       path = url.pathname.split("/api-admin/")[1];
     } else {
-      // Fallback if accessed directly or differently
       const parts = url.pathname.split("/");
       path = parts[parts.length - 1];
     }
@@ -68,14 +66,14 @@ serve(async (req) => {
     }
 
     // Router
-    if (path === "users") {
+    
+    // LIST USERS
+    if (path === "users" && req.method === "GET") {
       const { data: { users }, error } = await supabase.auth.admin.listUsers();
       if (error) throw error;
       
-      // Fetch profiles to join
       const { data: profiles } = await supabase.from("profiles").select("*");
       
-      // Combine data
       const enrichedUsers = users.map(u => {
         const p = profiles?.find(p => p.user_id === u.id);
         return {
@@ -85,6 +83,63 @@ serve(async (req) => {
       });
 
       return new Response(JSON.stringify({ users: enrichedUsers }), {
+        headers: { ...corsHeaders, "Content-Type": "application/json" },
+      });
+    }
+    
+    // GET USER DETAILS (path: users/:id)
+    if (path.startsWith("users/") && req.method === "GET") {
+      const userId = path.split("/")[1];
+      
+      const { data: { user: targetUser }, error: targetUserError } = await supabase.auth.admin.getUserById(userId);
+      if (targetUserError) throw targetUserError;
+      
+      const { data: targetProfile, error: targetProfileError } = await supabase
+        .from("profiles")
+        .select("*")
+        .eq("user_id", userId)
+        .single();
+        
+      if (targetProfileError) throw targetProfileError;
+      
+      // Fetch credit transactions
+      const { data: transactions } = await supabase
+        .from("credit_transactions")
+        .select("*")
+        .eq("user_id", userId)
+        .order("created_at", { ascending: false })
+        .limit(50);
+        
+      return new Response(JSON.stringify({
+        user: {
+          ...targetUser,
+          profile: targetProfile,
+          transactions: transactions || []
+        }
+      }), {
+        headers: { ...corsHeaders, "Content-Type": "application/json" },
+      });
+    }
+
+    // UPDATE USER PROFILE (path: users/:id)
+    if (path.startsWith("users/") && req.method === "PATCH") {
+      const userId = path.split("/")[1];
+      const body = await req.json();
+      
+      // Update profile
+      const { data: updatedProfile, error: updateError } = await supabase
+        .from("profiles")
+        .update({
+          credits_balance: body.credits_balance,
+          subscription_tier: body.subscription_tier
+        })
+        .eq("user_id", userId)
+        .select()
+        .single();
+        
+      if (updateError) throw updateError;
+      
+      return new Response(JSON.stringify({ profile: updatedProfile }), {
         headers: { ...corsHeaders, "Content-Type": "application/json" },
       });
     }

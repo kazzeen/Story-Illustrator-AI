@@ -13,6 +13,7 @@ import Pricing from "./pages/Pricing";
 import Profile from "./pages/Profile";
 import NotFound from "./pages/NotFound";
 import AdminUsers from "./pages/admin/AdminUsers";
+import AdminUserDetails from "./pages/admin/AdminUserDetails";
 
 const queryClient = new QueryClient();
 
@@ -33,6 +34,7 @@ const App = () => (
               <Route path="/storyboard" element={<Storyboard />} />
               <Route path="/storyboard/:storyId" element={<Storyboard />} />
               <Route path="/admin/users" element={<AdminUsers />} />
+              <Route path="/admin/users/:userId" element={<AdminUserDetails />} />
               <Route path="*" element={<NotFound />} />
             </Routes>
           </BrowserRouter>
