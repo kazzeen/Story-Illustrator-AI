@@ -33,3 +33,9 @@ test-*.js
 validate-*.js
 test/
 
+
+.vercel
+.env*.local
+
+# Trae IDE artifacts
+.trae/

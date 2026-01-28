@@ -18,6 +18,10 @@ vi.mock("@/hooks/useAuth", () => ({
   useAuth: () => mocks.authState,
 }));
 
+vi.mock("@/hooks/useAdmin", () => ({
+  useAdmin: () => ({ session: null }),
+}));
+
 vi.mock("@/components/ui/dropdown-menu", () => ({
   DropdownMenu: ({ children }: { children: ReactNode }) => <div>{children}</div>,
   DropdownMenuTrigger: ({ children }: { children: ReactNode }) => <div>{children}</div>,

@@ -1,8 +1,9 @@
 import { Link, useLocation, useNavigate } from "react-router-dom";
-import { BookOpen, Home, Upload, Grid3X3, LogIn, LogOut, Sparkles, User, CreditCard } from "lucide-react";
+import { BookOpen, Home, Upload, Grid3X3, LogIn, LogOut, Sparkles, User, CreditCard, Shield } from "lucide-react";
 import { Button } from "@/components/ui/button";
 import { cn } from "@/lib/utils";
 import { useAuth } from "@/hooks/useAuth";
+import { useAdmin } from "@/hooks/useAdmin";
 import {
   DropdownMenu,
   DropdownMenuContent,
@@ -32,7 +33,9 @@ export function Navbar() {
   const location = useLocation();
   const navigate = useNavigate();
   const { user, signOut, profile } = useAuth();
+  const { session: adminSession } = useAdmin();
   const planLabel = formatPlanLabel(profile?.subscription_tier);
+  const adminEnabled = String(import.meta.env.VITE_ADMIN_UI_ENABLED ?? "true").toLowerCase() !== "false";
 
   const handleSignOut = async () => {
     await signOut();
@@ -75,6 +78,22 @@ export function Navbar() {
                 </Link>
               );
             })}
+            {adminEnabled &&
+              (adminSession || user?.email === "kasseen@gmail.com") && (
+                <Link to="/admin">
+                  <Button
+                    variant="ghost"
+                    className={cn(
+                      "gap-2 px-4",
+                      location.pathname.startsWith("/admin") &&
+                        "bg-secondary text-primary"
+                    )}
+                  >
+                    <Shield className="w-4 h-4" />
+                    Admin
+                  </Button>
+                </Link>
+              )}
           </nav>
 
           {/* Actions */}

@@ -32,3 +32,6 @@ verify_jwt = false
 
 [functions.reconcile-stripe-credit-pack]
 verify_jwt = false
+
+[functions.api-admin]
+verify_jwt = false

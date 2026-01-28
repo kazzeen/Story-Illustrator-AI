@@ -7,7 +7,14 @@ export type UserProfile = {
   preferred_style: string | null;
   credits_balance?: number | null;
   subscription_tier?: string | null;
+  is_admin?: boolean | null;
 } | null;
+
+export type SignUpResult = {
+  error: Error | null;
+  sessionCreated: boolean;
+  resendError: Error | null;
+};
 
 export interface AuthContextType {
   user: User | null;
@@ -15,7 +22,7 @@ export interface AuthContextType {
   loading: boolean;
   profile: UserProfile;
   refreshProfile: () => Promise<void>;
-  signUp: (email: string, password: string, displayName?: string) => Promise<{ error: Error | null }>;
+  signUp: (email: string, password: string, displayName?: string) => Promise<SignUpResult>;
   signIn: (email: string, password: string) => Promise<{ error: Error | null }>;
   signOut: () => Promise<void>;
 }
