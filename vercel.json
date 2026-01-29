@@ -1,6 +1,4 @@
 {
-  "buildCommand": "npm run build",
-  "outputDirectory": "build",
   "framework": "vite",
   "rewrites": [
     { "source": "/api/admin/(.*)", "destination": "https://gaxmjxiqjirjeyemjcyc.supabase.co/functions/v1/api-admin/$1" },
