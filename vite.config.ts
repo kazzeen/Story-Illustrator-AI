@@ -25,13 +25,6 @@ export default defineConfig(({ mode }) => {
     build: {
       outDir: "dist",
       emptyOutDir: true,
-      rollupOptions: {
-        output: {
-          entryFileNames: "assets/v5.3-[name].[hash].js",
-          chunkFileNames: "assets/v5.3-[name].[hash].js",
-          assetFileNames: "assets/v5.3-[name].[hash].[ext]",
-        },
-      },
     },
     server: {
       host: "0.0.0.0",
