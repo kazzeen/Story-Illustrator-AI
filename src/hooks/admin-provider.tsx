@@ -26,12 +26,10 @@ export function getAdminGatewayUrl(path: string): string {
     return `/api/admin/${cleanPath}`;
   }
 
-  // In production, use the direct Supabase URL
-  // Fallback to hardcoded URL if env var is missing to ensure it works
-  const supabaseUrl = import.meta.env.VITE_SUPABASE_URL || "https://gaxmjxiqjirjeyemjcyc.supabase.co";
-  const baseUrl = supabaseUrl.replace(/\/$/, "");
-  
-  return `${baseUrl}/functions/v1/api-admin/${cleanPath}`;
+  // Use the Vercel rewrite path as the primary production URL
+  // This is safer because it avoids CORS preflight issues by proxying through Vercel
+  // The vercel.json rewrite rule handles the forwarding to Supabase
+  return `/api/admin/${cleanPath}`;
 }
 
 /**
