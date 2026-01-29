@@ -23,7 +23,7 @@ export default defineConfig(({ mode }) => {
       "__COMMIT_HASH__": JSON.stringify(commitHash),
     },
     build: {
-      outDir: "dist",
+      outDir: "build",
       emptyOutDir: true,
     },
     server: {

@@ -1,0 +1,4 @@
+Deployment Connectivity Probe
+Timestamp: 2026-01-29T20:10:00Z
+Version: v5.8-FRESH
+If you can read this, Vercel is correctly serving the latest build.
