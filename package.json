@@ -5,8 +5,9 @@
   "type": "module",
   "scripts": {
     "dev": "vite",
-    "prebuild": "rm -rf dist",
+    "prebuild": "rm -rf dist dist_v5",
     "build": "tsc -b && vite build --emptyOutDir",
+    "build:v5": "vite build",
     "build:clean": "rm -rf node_modules/.vite && vite build",
     "build:dev": "vite build --mode development",
     "lint": "eslint .",
