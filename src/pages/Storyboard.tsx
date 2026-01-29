@@ -925,9 +925,9 @@ export default function Storyboard() {
         throw new Error("Missing VITE_SUPABASE_URL; cannot call Supabase Functions endpoint");
       }
 
-      const apikey = (import.meta.env.VITE_SUPABASE_PUBLISHABLE_KEY ?? "").trim();
+      const apikey = (import.meta.env.VITE_SUPABASE_ANON_KEY ?? "").trim();
       if (!apikey) {
-        throw new Error("Missing VITE_SUPABASE_PUBLISHABLE_KEY; cannot call Supabase Functions endpoint");
+        throw new Error("Missing VITE_SUPABASE_ANON_KEY; cannot call Supabase Functions endpoint");
       }
 
       clientRequestId = typeof crypto !== "undefined" && typeof crypto.randomUUID === "function" ? crypto.randomUUID() : null;
@@ -1472,9 +1472,9 @@ export default function Storyboard() {
       throw new Error("Missing VITE_SUPABASE_URL; cannot call Supabase Functions endpoint");
     }
 
-    const apikey = String(import.meta.env.VITE_SUPABASE_PUBLISHABLE_KEY ?? import.meta.env.VITE_SUPABASE_ANON_KEY ?? "").trim();
+    const apikey = String(import.meta.env.VITE_SUPABASE_ANON_KEY ?? "").trim();
     if (!apikey) {
-      throw new Error("Missing VITE_SUPABASE_PUBLISHABLE_KEY; cannot call Supabase Functions endpoint");
+      throw new Error("Missing VITE_SUPABASE_ANON_KEY; cannot call Supabase Functions endpoint");
     }
 
     const artStyle = selectedStyleRef.current;

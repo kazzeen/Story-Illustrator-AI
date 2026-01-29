@@ -40,7 +40,7 @@ Create a `.env` file in the repository root:
 
 ```sh
 VITE_SUPABASE_URL=https://<YOUR_PROJECT_REF>.supabase.co
-VITE_SUPABASE_PUBLISHABLE_KEY=<YOUR_SUPABASE_ANON_KEY>
+VITE_SUPABASE_ANON_KEY=<YOUR_SUPABASE_ANON_KEY>
 ```
 
 Start the dev server:
