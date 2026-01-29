@@ -6,6 +6,7 @@ import { BrowserRouter, Routes, Route } from "react-router-dom";
 import { AuthProvider } from "@/hooks/auth-provider";
 import { ThemeProvider } from "next-themes";
 import Index from "./pages/Index";
+import Debug from "./pages/Debug";
 import Import from "./pages/Import";
 import Storyboard from "./pages/Storyboard";
 import Auth from "./pages/Auth";
@@ -28,6 +29,7 @@ const App = () => (
           <BrowserRouter future={{ v7_startTransition: true, v7_relativeSplatPath: true }}>
             <Routes>
               <Route path="/" element={<Index />} />
+              <Route path="/debug" element={<Debug />} />
               <Route path="/auth" element={<Auth />} />
               <Route path="/pricing" element={<Pricing />} />
               <Route path="/profile" element={<Profile />} />

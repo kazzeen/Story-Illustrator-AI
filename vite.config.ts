@@ -2,6 +2,15 @@ import { defineConfig, loadEnv } from "vite";
 import react from "@vitejs/plugin-react-swc";
 import path from "path";
 import { componentTagger } from "lovable-tagger";
+import { execSync } from "child_process";
+
+// Get git commit hash
+let commitHash = '';
+try {
+  commitHash = execSync('git rev-parse --short HEAD').toString().trim();
+} catch (e) {
+  commitHash = 'unknown';
+}
 
 // https://vitejs.dev/config/
 export default defineConfig(({ mode }) => {
@@ -11,6 +20,7 @@ export default defineConfig(({ mode }) => {
     define: {
       // Inject build timestamp for debugging stale builds
       "__BUILD_TIME__": JSON.stringify(new Date().toISOString()),
+      "__COMMIT_HASH__": JSON.stringify(commitHash),
     },
     build: {
       outDir: "dist",
