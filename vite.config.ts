@@ -13,13 +13,13 @@ export default defineConfig(({ mode }) => {
       "__BUILD_TIME__": JSON.stringify(new Date().toISOString()),
     },
     build: {
-      outDir: "dist_v5",
+      outDir: "dist",
       emptyOutDir: true,
       rollupOptions: {
         output: {
-          entryFileNames: "assets/v5.2-[name].[hash].js",
-          chunkFileNames: "assets/v5.2-[name].[hash].js",
-          assetFileNames: "assets/v5.2-[name].[hash].[ext]",
+          entryFileNames: "assets/v5.3-[name].[hash].js",
+          chunkFileNames: "assets/v5.3-[name].[hash].js",
+          assetFileNames: "assets/v5.3-[name].[hash].[ext]",
         },
       },
     },

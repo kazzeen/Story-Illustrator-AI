@@ -1,6 +1,6 @@
 {
-  "buildCommand": "npm run build:v5",
-  "outputDirectory": "dist_v5",
+  "buildCommand": "npm run build",
+  "outputDirectory": "dist",
   "installCommand": "npm install",
   "framework": "vite",
   "rewrites": [

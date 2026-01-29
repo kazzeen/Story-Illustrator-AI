@@ -1,11 +1,11 @@
 {
   "name": "vite_react_shadcn_ts",
   "private": true,
-  "version": "5.2.0",
+  "version": "5.3.0",
   "type": "module",
   "scripts": {
     "dev": "vite",
-    "prebuild": "rm -rf dist dist_v5",
+    "prebuild": "node ./update-version.js",
     "build": "tsc -b && vite build --emptyOutDir",
     "build:v5": "vite build",
     "build:clean": "rm -rf node_modules/.vite && vite build",
