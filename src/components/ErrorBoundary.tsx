@@ -26,9 +26,25 @@ class ErrorBoundary extends Component<Props, State> {
 
   public render() {
     if (this.state.hasError) {
+      const isSupabaseConfigured = 
+        import.meta.env.VITE_SUPABASE_URL && 
+        import.meta.env.VITE_SUPABASE_URL.length > 0;
+      
+      const isAnonKeyConfigured = 
+        import.meta.env.VITE_SUPABASE_ANON_KEY && 
+        import.meta.env.VITE_SUPABASE_ANON_KEY.length > 0;
+
       return (
         <div className="p-4 m-4 border border-red-500 rounded bg-red-50 text-red-900">
-          <h1 className="text-xl font-bold mb-2">Something went wrong.</h1>
+          <h1 className="text-xl font-bold mb-2">Something went wrong (v3.0-RESET)</h1>
+          <div className="mb-4 p-2 bg-white rounded border border-red-200 text-sm">
+             <strong>Environment Diagnostics:</strong>
+             <ul className="list-disc pl-5 mt-1">
+               <li>Supabase URL: {isSupabaseConfigured ? "✅ Configured" : "❌ MISSING"}</li>
+               <li>Anon Key: {isAnonKeyConfigured ? "✅ Configured" : "❌ MISSING"}</li>
+               <li>Build Time: {new Date().toISOString()}</li>
+             </ul>
+          </div>
           <pre className="text-sm overflow-auto max-w-full">
             {this.state.error?.toString()}
           </pre>
