@@ -1,10 +1,7 @@
 import { serve } from "https://deno.land/std@0.168.0/http/server.ts";
 import { createClient } from "https://esm.sh/@supabase/supabase-js@2.49.2";
 import { Image } from "https://deno.land/x/imagescript@1.3.0/mod.ts";
-
-type JsonObject = Record<string, unknown>;
-
-const UUID_REGEX = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
+import { type JsonObject, isRecord, asString, UUID_REGEX } from "../_shared/helpers.ts";
 const MAX_BYTES = 10 * 1024 * 1024;
 const ALLOWED_MIME = new Set(["image/jpeg", "image/png", "image/gif", "image/webp"]);
 const ALLOWED_BUCKETS = new Set(["reference-images", "scene-images"]);
@@ -18,13 +15,6 @@ function json(status: number, body: unknown, headers?: HeadersInit) {
   });
 }
 
-function asString(value: unknown): string | null {
-  return typeof value === "string" ? value : null;
-}
-
-function isRecord(value: unknown): value is Record<string, unknown> {
-  return typeof value === "object" && value !== null && !Array.isArray(value);
-}
 
 function parseAllowedOrigins() {
   const raw = Deno.env.get("ALLOWED_ORIGINS") ?? "";

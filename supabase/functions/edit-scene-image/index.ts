@@ -1,5 +1,6 @@
 import { serve } from "https://deno.land/std@0.168.0/http/server.ts";
 import { createClient } from "https://esm.sh/@supabase/supabase-js@2.49.2";
+import { type JsonObject, isRecord, asString, UUID_REGEX, jsonResponse } from "../_shared/helpers.ts";
 
 export const corsHeaders = {
   "Access-Control-Allow-Origin": "*",
@@ -7,24 +8,10 @@ export const corsHeaders = {
   "Access-Control-Allow-Methods": "POST, OPTIONS",
 };
 
-const UUID_REGEX = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
 const ALLOWED_MIME = new Set(["image/png", "image/jpeg", "image/webp"]);
 
-type JsonObject = Record<string, unknown>;
-
-function isRecord(value: unknown): value is Record<string, unknown> {
-  return typeof value === "object" && value !== null && !Array.isArray(value);
-}
-
 function json(status: number, body: unknown) {
-  return new Response(JSON.stringify(body), {
-    status,
-    headers: { ...corsHeaders, "Content-Type": "application/json" },
-  });
-}
-
-function asString(value: unknown): string | null {
-  return typeof value === "string" ? value : null;
+  return jsonResponse(status, body, corsHeaders);
 }
 
 function normalizeMime(value: string | undefined): string | null {

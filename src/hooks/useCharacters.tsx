@@ -62,41 +62,14 @@ export function useCharacters(storyId: string | null) {
     };
   };
 
-  useEffect(() => {
-    if (!storyId || !user) return;
-
-    setLoading(true);
-
-    (async () => {
-      try {
-        const { data, error } = await supabase
-          .from("characters")
-          .select("*")
-          .eq("story_id", storyId)
-          .order("name");
-
-        if (error) throw error;
-        setCharacters((data || []).map(coerceCharacter));
-      } catch (error) {
-        console.error("Error fetching characters:", error);
-        toast({
-          title: "Error",
-          description: "Failed to load characters",
-          variant: "destructive",
-        });
-      } finally {
-        setLoading(false);
-      }
-    })();
-  }, [storyId, user, toast, setCharacters, setLoading]);
-
   const fetchCharacters = useCallback(async () => {
-    if (!storyId) {
+    if (!storyId || !user) {
       setCharacters([]);
       setLoading(false);
       return;
     }
 
+    setLoading(true);
     try {
       const { data, error } = await supabase
         .from("characters")
@@ -116,11 +89,11 @@ export function useCharacters(storyId: string | null) {
     } finally {
       setLoading(false);
     }
-  }, [storyId, toast]);
+  }, [storyId, user, toast]);
 
   useEffect(() => {
     fetchCharacters();
-  }, [storyId, fetchCharacters]);
+  }, [fetchCharacters]);
 
   const addCharacter = async (character: CreateCharacterInput) => {
     if (!storyId || !user) return;

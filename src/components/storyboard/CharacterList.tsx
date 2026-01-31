@@ -21,6 +21,7 @@ import { useToast } from "@/hooks/use-toast";
 import { useAuth } from "@/hooks/useAuth";
 import { supabase } from "@/integrations/supabase/client";
 import { extractDetailedError } from "@/lib/error-reporting";
+import { isRecord } from "@/lib/type-guards";
 
 interface CharacterListProps {
   storyId: string;
@@ -87,9 +88,6 @@ export function CharacterList({ storyId, selectedArtStyle, selectedModel, styleI
     }
     setIsDialogOpen(false);
   };
-
-  const isRecord = (value: unknown): value is Record<string, unknown> =>
-    typeof value === "object" && value !== null && !Array.isArray(value);
 
   const handleRegenerateCharacterImage = async (char: Character) => {
     if (isGenerating) return;

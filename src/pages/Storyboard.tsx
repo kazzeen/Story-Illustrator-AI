@@ -59,6 +59,7 @@ import { Tabs, TabsContent, TabsList, TabsTrigger } from "@/components/ui/tabs";
 import { CharacterList } from "@/components/storyboard/CharacterList";
 import { Tooltip, TooltipContent, TooltipTrigger } from "@/components/ui/tooltip";
 import { Select, SelectContent, SelectItem, SelectTrigger, SelectValue } from "@/components/ui/select";
+import { UUID_REGEX, parseJsonIfString } from "@/lib/type-guards";
 
 export default function Storyboard() {
   const { storyId } = useParams();
@@ -315,8 +316,6 @@ export default function Storyboard() {
     return parts.join(" • ") || "Request failed";
   };
 
-  const UUID_REGEX = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
-
   const applyCreditsFromResponse = useCallback(
     (credits: unknown) => {
       const rec = credits && typeof credits === "object" && !Array.isArray(credits) ? (credits as Record<string, unknown>) : null;
@@ -567,16 +566,6 @@ export default function Storyboard() {
       const patch = data as unknown as Partial<Scene>;
       setScenes((prev) => prev.map((s) => (s.id === sceneId ? { ...s, ...patch } : s)));
       setSelectedScene((prev) => (prev?.id === sceneId ? { ...prev, ...patch } : prev));
-
-      const parseJsonIfString = (value: unknown) => {
-        if (typeof value !== "string") return value;
-        try {
-          const parsed = JSON.parse(value);
-          return typeof parsed === "object" && parsed !== null ? parsed : value;
-        } catch {
-          return value;
-        }
-      };
 
       const rawDetails = parseJsonIfString(data.consistency_details);
       const details =

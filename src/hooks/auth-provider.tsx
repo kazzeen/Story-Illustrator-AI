@@ -2,32 +2,13 @@ import { useState, useEffect, type ReactNode } from 'react';
 import type { User, Session } from '@supabase/supabase-js';
 import { supabase } from '@/integrations/supabase/client';
 import { AuthContext, type AuthContextType, type UserProfile } from './auth-context';
+import { isRecord, isAbortedError } from '@/lib/type-guards';
 
 export function AuthProvider({ children }: { children: ReactNode }) {
   const [user, setUser] = useState<User | null>(null);
   const [session, setSession] = useState<Session | null>(null);
   const [loading, setLoading] = useState(true);
   const [profile, setProfile] = useState<UserProfile>(null);
-
-  const isRecord = (value: unknown): value is Record<string, unknown> =>
-    typeof value === "object" && value !== null && !Array.isArray(value);
-
-  const isAbortedError = (value: unknown) => {
-    if (!value) return false;
-    if (value instanceof Error) {
-      const msg = (value.message || "").toLowerCase();
-      return value.name === "AbortError" || msg.includes("aborted") || msg.includes("err_aborted");
-    }
-    if (isRecord(value)) {
-      const name = typeof value.name === "string" ? value.name : "";
-      const msg = typeof value.message === "string" ? value.message : "";
-      const code = typeof value.code === "string" ? value.code : "";
-      const status = typeof value.status === "number" ? value.status : null;
-      const msgLower = msg.toLowerCase();
-      return name === "AbortError" || code === "ABORTED" || status === 499 || msgLower.includes("request aborted") || msgLower.includes("aborted");
-    }
-    return false;
-  };
 
   const fetchProfile = async (userId: string) => {
     try {

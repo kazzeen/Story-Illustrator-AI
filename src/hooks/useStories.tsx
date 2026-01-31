@@ -4,6 +4,7 @@ import type { Json } from '@/integrations/supabase/types';
 import { useAuth } from './useAuth';
 import { useToast } from './use-toast';
 import { updateImagePromptWithAttributes } from '@/lib/scene-character-appearance';
+import { isRecord, parseJsonIfString } from '@/lib/type-guards';
 
 export interface Story {
   id: string;
@@ -476,15 +477,6 @@ export function useScenes(storyId: string | null) {
             return;
           }
 
-          const parseJsonIfString = (value: unknown) => {
-            if (typeof value !== "string") return value;
-            try {
-              return JSON.parse(value) as unknown;
-            } catch {
-              return value;
-            }
-          };
-
           const nextScene = typed.new as Scene;
           if (!nextScene?.id) return;
 
@@ -570,17 +562,6 @@ export function useScenes(storyId: string | null) {
 
   const updateScene = async (id: string, updates: Partial<Scene>) => {
     try {
-      const parseJsonIfString = (value: unknown) => {
-        if (typeof value !== "string") return value;
-        try {
-          return JSON.parse(value) as unknown;
-        } catch {
-          return value;
-        }
-      };
-      const isRecord = (value: unknown): value is Record<string, unknown> =>
-        typeof value === "object" && value !== null && !Array.isArray(value);
-
       const existingScene = scenes.find((s) => s.id === id) ?? null;
       const existingDetails = parseJsonIfString(existingScene?.consistency_details);
       const nextDetails = parseJsonIfString(updates.consistency_details);

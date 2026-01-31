@@ -1,8 +1,6 @@
-type AnyRecord = Record<string, unknown>;
+import { isRecord } from "./helpers.ts";
 
-function isRecord(value: unknown): value is AnyRecord {
-  return typeof value === "object" && value !== null && !Array.isArray(value);
-}
+type AnyRecord = Record<string, unknown>;
 
 export type ConsumeCreditsOk = {
   ok: true;

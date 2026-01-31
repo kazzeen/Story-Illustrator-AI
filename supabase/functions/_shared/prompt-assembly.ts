@@ -1,4 +1,5 @@
 import { getStyleCategory, stripKnownStylePhrases, STYLE_CONFLICTS } from "./style-prompts.ts";
+import { escapeRegExp } from "./helpers.ts";
 
 export const MAX_PROMPT_LENGTH_DEFAULT = 1400;
 
@@ -22,10 +23,6 @@ export function sanitizePrompt(text: string): string {
     })
     .join("");
   return cleaned.replace(/\s+/g, " ").trim();
-}
-
-function escapeRegExp(text: string) {
-  return text.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
 }
 
 function splitStyleParts(text: string): string[] {

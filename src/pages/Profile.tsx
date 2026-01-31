@@ -9,6 +9,7 @@ import { useAuth } from "@/hooks/useAuth";
 import { useToast } from "@/hooks/use-toast";
 import { supabase } from "@/integrations/supabase/client";
 import { Link } from "react-router-dom";
+import { isRecord, asString, isAbortedError } from "@/lib/type-guards";
 
 type CreditsStatus = {
   tier: string | null;
@@ -49,30 +50,6 @@ function toNumber(value: unknown, fallback = 0) {
   return Number.isFinite(n) ? n : fallback;
 }
 
-function asString(value: unknown): string | null {
-  return typeof value === "string" ? value : null;
-}
-
-function isRecord(value: unknown): value is Record<string, unknown> {
-  return typeof value === "object" && value !== null && !Array.isArray(value);
-}
-
-function isAbortedError(value: unknown) {
-  if (!value) return false;
-  if (value instanceof Error) {
-    const msg = (value.message || "").toLowerCase();
-    return value.name === "AbortError" || msg.includes("aborted") || msg.includes("err_aborted");
-  }
-  if (isRecord(value)) {
-    const name = typeof value.name === "string" ? value.name : "";
-    const msg = typeof value.message === "string" ? value.message : "";
-    const code = typeof value.code === "string" ? value.code : "";
-    const status = typeof value.status === "number" ? value.status : null;
-    const msgLower = msg.toLowerCase();
-    return name === "AbortError" || code === "ABORTED" || status === 499 || msgLower.includes("request aborted") || msgLower.includes("aborted");
-  }
-  return false;
-}
 
 function parseCreditsStatus(raw: unknown): CreditsStatus | null {
   if (!isRecord(raw)) return null;

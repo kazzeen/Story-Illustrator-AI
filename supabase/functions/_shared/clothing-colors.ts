@@ -1,3 +1,5 @@
+import { escapeRegExp } from "./helpers.ts";
+
 export type ClothingColorCategory = "feminine" | "masculine" | "neutral";
 
 export type ClothingColorOptions = {
@@ -171,10 +173,6 @@ const CLOTHING_KEYWORDS = [
 ];
 
 const CLOTHING_KEYWORD_RE = new RegExp(`\\b(${CLOTHING_KEYWORDS.map(escapeRegExp).join("|")})\\b`, "i");
-
-function escapeRegExp(s: string) {
-  return s.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
-}
 
 function fnv1a32(input: string) {
   let hash = 0x811c9dc5;

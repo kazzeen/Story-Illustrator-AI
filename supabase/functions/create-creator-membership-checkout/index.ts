@@ -1,5 +1,13 @@
 import { serve } from "https://deno.land/std@0.168.0/http/server.ts";
-import { createClient, type SupabaseClientLike } from "https://esm.sh/@supabase/supabase-js@2.49.2";
+import { createClient } from "https://esm.sh/@supabase/supabase-js@2.49.2";
+import { jsonResponse } from "../_shared/helpers.ts";
+import {
+  normalizeStripeSecretKey,
+  classifyStripeKeyPrefix,
+  buildCheckoutReturnUrls,
+  fetchStripePriceId,
+  createStripeCheckoutSession,
+} from "../_shared/stripe-helpers.ts";
 
 export const corsHeaders = {
   "Access-Control-Allow-Origin": "*",
@@ -8,88 +16,13 @@ export const corsHeaders = {
 };
 
 function json(status: number, body: unknown, extraHeaders?: Record<string, string>) {
-  return new Response(JSON.stringify(body), {
-    status,
-    headers: { ...corsHeaders, "Content-Type": "application/json", ...(extraHeaders ?? {}) },
-  });
-}
-
-function normalizeStripeSecretKey(input: string) {
-  const trimmed = input.trim();
-  const unquoted =
-    (trimmed.startsWith("\"") && trimmed.endsWith("\"")) || (trimmed.startsWith("'") && trimmed.endsWith("'"))
-      ? trimmed.slice(1, -1).trim()
-      : trimmed;
-  const compact = unquoted.replace(/\s+/g, "");
-  const match = compact.match(/sk_(?:test|live)_[0-9a-zA-Z]+/);
-  return match?.[0] ?? compact;
-}
-
-function classifyStripeKeyPrefix(value: string) {
-  if (!value) return "empty";
-  if (value.startsWith("sk_test_")) return "sk_test_";
-  if (value.startsWith("sk_live_")) return "sk_live_";
-  if (value.startsWith("pk_test_")) return "pk_test_";
-  if (value.startsWith("pk_live_")) return "pk_live_";
-  if (value.startsWith("rk_test_")) return "rk_test_";
-  if (value.startsWith("rk_live_")) return "rk_live_";
-  if (value.startsWith("whsec_")) return "whsec_";
-  if (value.startsWith("eyJ")) return "jwt_like";
-  return "unknown";
+  return jsonResponse(status, body, corsHeaders, extraHeaders);
 }
 
 function unitAmountCentsForTier(params: { tier: "creator" | "professional"; interval: "month" | "year" }) {
   const monthlyCents = params.tier === "professional" ? 3999 : 1999;
   if (params.interval === "month") return monthlyCents;
   return Math.round(monthlyCents * 12 * 0.8);
-}
-
-export function buildCheckoutReturnUrls(req: Request, preferredBase?: string | null) {
-  let origin =
-    req.headers.get("origin") ??
-    req.headers.get("Origin") ??
-    null;
-
-  if (!origin) {
-    const ref = req.headers.get("referer") ?? req.headers.get("referrer") ?? null;
-    if (ref) {
-      try {
-        origin = new URL(ref).origin;
-      } catch {
-        origin = null;
-      }
-    }
-  }
-
-  origin =
-    origin ??
-    Deno.env.get("PUBLIC_SITE_URL") ??
-    Deno.env.get("SITE_URL") ??
-    Deno.env.get("APP_URL") ??
-    null;
-
-  if (!origin) return { ok: false as const, error: "Missing request origin" };
-
-  const requestOrigin = origin.replace(/\/$/, "");
-  let base = requestOrigin;
-  if (preferredBase && typeof preferredBase === "string") {
-    const trimmed = preferredBase.trim();
-    if (trimmed) {
-      try {
-        const preferredUrl = new URL(trimmed);
-        const requestUrl = new URL(requestOrigin);
-        if (preferredUrl.origin === requestUrl.origin) {
-          base = trimmed.replace(/\/$/, "");
-        }
-      } catch {
-        base = requestOrigin;
-      }
-    }
-  }
-
-  const successUrl = `${base}/pricing?checkout=success&session_id={CHECKOUT_SESSION_ID}`;
-  const cancelUrl = `${base}/pricing?checkout=cancel`;
-  return { ok: true as const, successUrl, cancelUrl };
 }
 
 export function buildStripeCheckoutForm(params: {
@@ -146,99 +79,6 @@ export function buildStripeCheckoutForm(params: {
   return form;
 }
 
-async function fetchStripePriceIdForSubscription(params: {
-  stripeSecretKey: string;
-  productId: string;
-  interval: "month" | "year";
-}) {
-  const url = new URL("https://api.stripe.com/v1/prices");
-  url.searchParams.set("product", params.productId);
-  url.searchParams.set("active", "true");
-  url.searchParams.set("limit", "20");
-  url.searchParams.set("type", "recurring");
-  url.searchParams.set("recurring[interval]", params.interval);
-
-  const resp = await fetch(url.toString(), {
-    headers: { Authorization: `Bearer ${params.stripeSecretKey}` },
-  });
-  const text = await resp.text();
-  let body: unknown = null;
-  try {
-    body = JSON.parse(text);
-  } catch {
-    body = null;
-  }
-  if (!resp.ok || !body || typeof body !== "object") {
-    return { ok: false as const, status: resp.status, body, raw: text };
-  }
-
-  const data = (body as Record<string, unknown>).data;
-  if (!Array.isArray(data)) return { ok: false as const, status: 502, body, raw: text };
-  const candidates = data.filter((p) => p && typeof p === "object") as Array<Record<string, unknown>>;
-
-  for (const price of candidates) {
-    const id = typeof price.id === "string" ? price.id : null;
-    const currency = typeof price.currency === "string" ? price.currency : null;
-    const recurring = price.recurring && typeof price.recurring === "object" ? (price.recurring as Record<string, unknown>) : null;
-    const interval = recurring && typeof recurring.interval === "string" ? recurring.interval : null;
-    if (id && id.startsWith("price_") && currency === "usd" && interval === params.interval) {
-      return { ok: true as const, priceId: id };
-    }
-  }
-
-  for (const price of candidates) {
-    const id = typeof price.id === "string" ? price.id : null;
-    if (id && id.startsWith("price_")) return { ok: true as const, priceId: id };
-  }
-
-  return { ok: false as const, status: 404, body: { error: "No active Stripe price found for product" } };
-}
-
-async function createStripeCheckoutSession(params: {
-  stripeSecretKey: string;
-  idempotencyKey: string;
-  form: URLSearchParams;
-}) {
-  const resp = await fetch("https://api.stripe.com/v1/checkout/sessions", {
-    method: "POST",
-    headers: {
-      Authorization: `Bearer ${params.stripeSecretKey}`,
-      "Content-Type": "application/x-www-form-urlencoded",
-      "Idempotency-Key": params.idempotencyKey,
-    },
-    body: params.form.toString(),
-  });
-
-  const text = await resp.text();
-  let body: unknown = null;
-  try {
-    body = JSON.parse(text);
-  } catch {
-    body = null;
-  }
-
-  if (!resp.ok) {
-    const stripeError =
-      body && typeof body === "object" && "error" in (body as Record<string, unknown>) && typeof (body as Record<string, unknown>).error === "object"
-        ? (body as { error?: unknown }).error
-        : null;
-    return { ok: false as const, status: resp.status, body, raw: text, stripeError };
-  }
-
-  const url =
-    body && typeof body === "object" && "url" in (body as Record<string, unknown>) && typeof (body as Record<string, unknown>).url === "string"
-      ? String((body as Record<string, unknown>).url)
-      : null;
-
-  const id =
-    body && typeof body === "object" && "id" in (body as Record<string, unknown>) && typeof (body as Record<string, unknown>).id === "string"
-      ? String((body as Record<string, unknown>).id)
-      : null;
-
-  if (!url || !id) return { ok: false as const, status: 502, body, raw: text };
-  return { ok: true as const, id, url };
-}
-
 serve(async (req: Request) => {
   if (req.method === "OPTIONS") return new Response(null, { headers: corsHeaders });
   if (req.method !== "POST") return json(405, { error: "Method not allowed" });
@@ -288,9 +128,10 @@ serve(async (req: Request) => {
 
   let priceId: string | null = envPriceIdOk ? (envPriceId as string) : null;
   if (!priceId) {
-    const resolved = await fetchStripePriceIdForSubscription({
+    const resolved = await fetchStripePriceId({
       stripeSecretKey,
       productId,
+      type: "recurring",
       interval,
     });
     if (resolved.ok) priceId = resolved.priceId;
@@ -318,7 +159,7 @@ serve(async (req: Request) => {
     return json(401, { error: "Authorization failed", details: userError?.message });
   }
 
-  const urls = buildCheckoutReturnUrls(req, returnBase);
+  const urls = buildCheckoutReturnUrls(req, { preferredBase: returnBase });
   if (!urls.ok) return json(400, { error: urls.error });
 
   const db = createClient(supabaseUrl, supabaseServiceKey ?? supabaseAnonKey ?? "", {

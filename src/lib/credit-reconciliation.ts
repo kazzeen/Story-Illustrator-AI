@@ -1,5 +1,6 @@
 
 import { SupabaseClient } from "@supabase/supabase-js";
+import { isRecord, UUID_REGEX } from "@/lib/type-guards";
 
 export type ReconcileCreditsArgs = {
   requestId: string;
@@ -9,16 +10,11 @@ export type ReconcileCreditsArgs = {
 
 const inFlightReconciles = new Map<string, Promise<{ success: boolean; error?: string; reconcile?: unknown }>>();
 
-function isRecord(value: unknown): value is Record<string, unknown> {
-  return typeof value === "object" && value !== null && !Array.isArray(value);
-}
-
 export const reconcileFailedGenerationCredits = async (
   supabase: SupabaseClient,
   args: ReconcileCreditsArgs
 ) => {
   const { requestId, reason, metadata } = args;
-  const UUID_REGEX = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
 
   if (!requestId || !UUID_REGEX.test(requestId)) {
     return { success: false, error: "Invalid parameters" };

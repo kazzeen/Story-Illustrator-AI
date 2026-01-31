@@ -24,15 +24,12 @@ const GOOGLE_MODELS: Record<string, string> = {
   "gemini-3-pro": "imagen-4.0-generate-001",
 };
 
+import { type JsonObject, isRecord, asString, UUID_REGEX } from "../_shared/helpers.ts";
+
 const corsHeaders = {
   "Access-Control-Allow-Origin": "*",
   "Access-Control-Allow-Headers": "authorization, x-client-info, apikey, content-type",
 };
-
-// UUID validation regex
-const UUID_REGEX = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
-
-type JsonObject = Record<string, unknown>;
 
 type ConsistencySettings = {
   mode?: string;
@@ -113,9 +110,6 @@ type CharacterValidationInput = {
   expected_state: string;
 };
 
-function isRecord(value: unknown): value is Record<string, unknown> {
-  return typeof value === "object" && value !== null && !Array.isArray(value);
-}
 
 export function shouldLogFailureTransactionForBypassedCredits(value: unknown): boolean {
   if (!isRecord(value)) return false;
@@ -141,9 +135,6 @@ function asJsonObject(val: unknown): JsonObject | null {
   return isRecord(val) ? val : null;
 }
 
-function asString(val: unknown): string | null {
-  return typeof val === "string" ? val : null;
-}
 
 export function shouldTryReserveAfterCommitFailure(reason: string | null, commitErr: unknown): boolean {
   if (commitErr) return true;

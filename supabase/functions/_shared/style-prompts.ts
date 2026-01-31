@@ -1,3 +1,5 @@
+import { escapeRegExp } from "./helpers.ts";
+
 export type StyleCategory = "anime" | "realistic" | "artistic" | "3d" | "pixel";
 
 export type ArtStyleDefinition = {
@@ -413,10 +415,6 @@ export function getStyleCategory(styleId: string): StyleCategory | null {
   const mapped = STYLE_CATEGORIES[canonical];
   if (mapped === "anime" || mapped === "realistic" || mapped === "artistic" || mapped === "3d" || mapped === "pixel") return mapped;
   return inferStyleCategory(canonical);
-}
-
-function escapeRegExp(text: string) {
-  return text.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
 }
 
 const KNOWN_STYLE_PHRASES: Array<{ styleId: string; variants: string[]; prefixes: string[] }> = (() => {

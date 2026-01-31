@@ -1,16 +1,12 @@
 import { serve } from "https://deno.land/std@0.168.0/http/server.ts";
 import { createClient } from "https://esm.sh/@supabase/supabase-js@2.49.2";
 import { ensureHairEyeColorAttributes, type HairEyeAutogenConfig } from "../_shared/clothing-colors.ts";
+import { type JsonObject, isRecord, asString, UUID_REGEX } from "../_shared/helpers.ts";
 
 const corsHeaders = {
   "Access-Control-Allow-Origin": "*",
   "Access-Control-Allow-Headers": "authorization, x-client-info, apikey, content-type",
 };
-
-// UUID validation regex
-const UUID_REGEX = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
-
-type JsonObject = Record<string, unknown>;
 
 type CharacterReferenceSheet = {
   base_facial_features?: string;
@@ -53,13 +49,6 @@ type DbCharacterRow = { id: string; name: string | null };
 type ExistingSheetRow = { character_id: string; version: number };
 type InsertedSheetRow = { id: string; character_id: string };
 
-function isRecord(value: unknown): value is Record<string, unknown> {
-  return typeof value === "object" && value !== null && !Array.isArray(value);
-}
-
-function asString(value: unknown): string | null {
-  return typeof value === "string" ? value : null;
-}
 
 function asBoolean(value: unknown): boolean | null {
   return typeof value === "boolean" ? value : null;

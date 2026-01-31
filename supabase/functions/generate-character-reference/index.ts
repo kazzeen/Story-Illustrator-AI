@@ -12,16 +12,13 @@ import {
 } from "../_shared/style-prompts.ts";
 import { assemblePrompt, sanitizePrompt } from "../_shared/prompt-assembly.ts";
 
+import { type JsonObject, isRecord, asString, UUID_REGEX, jsonResponse } from "../_shared/helpers.ts";
+
 const corsHeaders = {
   "Access-Control-Allow-Origin": "*",
   "Access-Control-Allow-Headers": "authorization, x-client-info, apikey, content-type",
   "Access-Control-Allow-Methods": "POST, OPTIONS",
 };
-
-// UUID validation regex
-const UUID_REGEX = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
-
-type JsonObject = Record<string, unknown>;
 type CharacterWithStoryRow = {
   id: string;
   story_id: string;
@@ -49,14 +46,7 @@ type StoryStyleGuideRow = {
 };
 
 function json(status: number, data: JsonObject, headers?: Record<string, string>) {
-  return new Response(JSON.stringify(data), {
-    status,
-    headers: { ...corsHeaders, "Content-Type": "application/json", ...(headers || {}) },
-  });
-}
-
-function asString(val: unknown): string | null {
-  return typeof val === "string" ? val : null;
+  return jsonResponse(status, data, corsHeaders, headers);
 }
 
 function asNumber(val: unknown): number | null {
