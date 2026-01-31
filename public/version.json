@@ -1,6 +1,12 @@
 {
+<<<<<<< HEAD
   "version": "v6.0.0",
   "buildTime": "2026-01-29T22:56:08.922Z",
   "timestamp": 1769727368923,
+=======
+  "version": "v5.8.0",
+  "buildTime": "2026-01-31T04:13:25.379Z",
+  "timestamp": 1769832805380,
+>>>>>>> a6e5692f05d8327c407ab2196d9f19bf4590bc98
   "env": "production"
 }
