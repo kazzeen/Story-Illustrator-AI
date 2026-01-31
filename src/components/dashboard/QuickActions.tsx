@@ -1,8 +1,16 @@
 import { Card, CardContent } from "@/components/ui/card";
-import { Upload, FileText, Wand2, Download } from "lucide-react";
+import { Upload, FileText, Wand2, Download, PenTool } from "lucide-react";
 import { Link } from "react-router-dom";
 
 const actions = [
+  {
+    icon: PenTool,
+    title: "Create Story",
+    description: "AI-generated stories",
+    href: "/create-story",
+    color: "text-violet-400",
+    bgColor: "bg-violet-400/10",
+  },
   {
     icon: Upload,
     title: "Import Story",
@@ -39,7 +47,7 @@ const actions = [
 
 export function QuickActions() {
   return (
-    <div className="grid grid-cols-2 md:grid-cols-4 gap-4">
+    <div className="grid grid-cols-2 md:grid-cols-5 gap-4">
       {actions.map((action) => (
         <Link key={action.title} to={action.href}>
           <Card
