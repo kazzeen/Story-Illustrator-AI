@@ -378,7 +378,6 @@ async function describeCharactersFromReferenceImages(args: {
       },
       body: JSON.stringify({
         model: "mistral-31-24b",
-        safe_mode: false,
         messages: [{ role: "user", content }],
       }),
       signal: controller.signal,

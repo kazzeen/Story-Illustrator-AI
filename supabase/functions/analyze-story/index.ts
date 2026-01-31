@@ -321,7 +321,6 @@ Aim for 8-15 scenes depending on story length. Focus on visually interesting and
       },
       body: JSON.stringify({
         model: "llama-3.3-70b",
-        safe_mode: false,
         messages: [{ role: "user", content: analysisPrompt }],
       }),
     });

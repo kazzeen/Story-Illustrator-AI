@@ -155,6 +155,10 @@ export function FileUpload() {
           },
         });
 
+        if (error) {
+          throw new Error(data?.error || error.message || "Failed to analyze story");
+        }
+
         toast({
           title: "Story analyzed!",
           description: `"${title}" has been broken into ${data.sceneCount} scenes`,
