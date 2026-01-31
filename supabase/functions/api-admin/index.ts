@@ -125,20 +125,84 @@ serve(async (req) => {
     if (path.startsWith("users/") && req.method === "PATCH") {
       const userId = path.split("/")[1];
       const body = await req.json();
-      
-      // Update profile
-      const { data: updatedProfile, error: updateError } = await supabase
+
+      // Update subscription_tier on profiles table
+      if (body.subscription_tier !== undefined) {
+        const { error: tierError } = await supabase
+          .from("profiles")
+          .update({ subscription_tier: body.subscription_tier })
+          .eq("user_id", userId);
+        if (tierError) throw tierError;
+      }
+
+      // Adjust credits via the proper credit system (user_credits table + transaction log)
+      if (typeof body.credits_balance === "number") {
+        // Ensure user has a credits row
+        try {
+          await supabase.rpc("ensure_user_credits", { p_user_id: userId });
+        } catch (_e) { /* RPC may not exist yet, continue */ }
+
+        // Read current balance from user_credits
+        const { data: currentCredits } = await supabase
+          .from("user_credits")
+          .select("monthly_credits_per_cycle, monthly_credits_used, bonus_credits_total, bonus_credits_used, reserved_monthly, reserved_bonus")
+          .eq("user_id", userId)
+          .maybeSingle();
+
+        if (currentCredits) {
+          const reservedMonthly = typeof currentCredits.reserved_monthly === "number" ? currentCredits.reserved_monthly : 0;
+          const reservedBonus = typeof currentCredits.reserved_bonus === "number" ? currentCredits.reserved_bonus : 0;
+          const remainingMonthly = Math.max(currentCredits.monthly_credits_per_cycle - currentCredits.monthly_credits_used - reservedMonthly, 0);
+          const remainingBonus = Math.max(currentCredits.bonus_credits_total - currentCredits.bonus_credits_used - reservedBonus, 0);
+          const currentBalance = remainingMonthly + remainingBonus;
+          const delta = body.credits_balance - currentBalance;
+
+          if (delta !== 0) {
+            const { error: adjErr } = await supabase.rpc("admin_adjust_bonus_credits", {
+              p_user_id: userId,
+              p_amount: delta,
+              p_reason: `Admin adjustment: set balance to ${body.credits_balance}`,
+              p_metadata: { adjusted_by: user.id, previous_balance: currentBalance, new_balance: body.credits_balance },
+              p_created_by: user.id,
+            });
+            if (adjErr) throw adjErr;
+          }
+        } else {
+          // No user_credits row — fall back to updating profiles directly
+          const { error: fallbackErr } = await supabase
+            .from("profiles")
+            .update({ credits_balance: body.credits_balance })
+            .eq("user_id", userId);
+          if (fallbackErr) throw fallbackErr;
+        }
+
+        // Sync profiles.credits_balance for display consistency
+        const { data: updatedCredits } = await supabase
+          .from("user_credits")
+          .select("monthly_credits_per_cycle, monthly_credits_used, bonus_credits_total, bonus_credits_used, reserved_monthly, reserved_bonus")
+          .eq("user_id", userId)
+          .maybeSingle();
+
+        if (updatedCredits) {
+          const rm = typeof updatedCredits.reserved_monthly === "number" ? updatedCredits.reserved_monthly : 0;
+          const rb = typeof updatedCredits.reserved_bonus === "number" ? updatedCredits.reserved_bonus : 0;
+          const newBalance = Math.max(updatedCredits.monthly_credits_per_cycle - updatedCredits.monthly_credits_used - rm, 0)
+            + Math.max(updatedCredits.bonus_credits_total - updatedCredits.bonus_credits_used - rb, 0);
+          await supabase
+            .from("profiles")
+            .update({ credits_balance: newBalance })
+            .eq("user_id", userId);
+        }
+      }
+
+      // Return updated profile
+      const { data: updatedProfile, error: fetchError } = await supabase
         .from("profiles")
-        .update({
-          credits_balance: body.credits_balance,
-          subscription_tier: body.subscription_tier
-        })
+        .select("*")
         .eq("user_id", userId)
-        .select()
         .single();
-        
-      if (updateError) throw updateError;
-      
+      if (fetchError) throw fetchError;
+
       return new Response(JSON.stringify({ profile: updatedProfile }), {
         headers: { ...corsHeaders, "Content-Type": "application/json" },
       });
