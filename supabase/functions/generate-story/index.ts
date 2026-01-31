@@ -45,17 +45,21 @@ serve(async (req: Request) => {
       return json(400, { error: "Story description is required (at least 20 characters)" });
     }
 
-    const supabaseUrl = Deno.env.get("SUPABASE_URL")!;
-    const supabaseServiceKey = Deno.env.get("SUPABASE_SERVICE_ROLE_KEY")!;
-    const supabaseAnonKey = Deno.env.get("SUPABASE_ANON_KEY")!;
-    const veniceApiKey = Deno.env.get("VENICE_API_KEY")!;
+    const supabaseUrl = Deno.env.get("SUPABASE_URL");
+    const supabaseServiceKey = Deno.env.get("SUPABASE_SERVICE_ROLE_KEY");
+    const veniceApiKey = Deno.env.get("VENICE_API_KEY");
 
-    // Validate user
-    const authClient = createClient(supabaseUrl, supabaseAnonKey, {
-      global: { headers: { Authorization: authHeader } },
-    });
+    if (!supabaseUrl || !supabaseServiceKey) {
+      return json(500, { error: "Server configuration error" });
+    }
+    if (!veniceApiKey) {
+      return json(500, { error: "AI service not configured" });
+    }
 
-    const { data: userData, error: userErr } = await authClient.auth.getUser();
+    // Validate user via service role (always available in edge functions)
+    const admin = createClient(supabaseUrl, supabaseServiceKey);
+    const token = authHeader.replace(/^Bearer\s+/i, "");
+    const { data: userData, error: userErr } = await admin.auth.getUser(token);
     const user = userData?.user;
     if (userErr || !user) {
       console.error("Auth validation failed:", userErr);
@@ -145,8 +149,6 @@ STORY:
     const wordCount = storyText.split(/\s+/).filter(Boolean).length;
 
     // Create the story in the database
-    const admin = createClient(supabaseUrl, supabaseServiceKey);
-
     const { data: story, error: storyError } = await admin
       .from("stories")
       .insert({

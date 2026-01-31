@@ -58,7 +58,7 @@ export function GeneratedStory({
           />
         ) : (
           <div className="prose prose-sm dark:prose-invert max-w-none">
-            {(isEditing ? editedContent : content).split("\n").map((paragraph, i) =>
+            {editedContent.split("\n").map((paragraph, i) =>
               paragraph.trim() ? <p key={i}>{paragraph}</p> : <br key={i} />,
             )}
           </div>
