@@ -105,7 +105,6 @@ STORY:
       },
       body: JSON.stringify({
         model: selectedModel,
-        safe_mode: false,
         messages: [
           {
             role: "system",
