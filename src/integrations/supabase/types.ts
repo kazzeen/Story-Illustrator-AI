@@ -390,6 +390,7 @@ export type Database = {
           updated_at: string
           user_id: string
           credits_balance: number
+          is_admin: boolean
           subscription_tier: string
           subscription_status: string | null
           next_billing_date: string | null
@@ -399,6 +400,7 @@ export type Database = {
           created_at?: string
           display_name?: string | null
           id?: string
+          is_admin?: boolean
           preferred_style?: string | null
           updated_at?: string
           user_id: string
@@ -412,6 +414,7 @@ export type Database = {
           created_at?: string
           display_name?: string | null
           id?: string
+          is_admin?: boolean
           preferred_style?: string | null
           updated_at?: string
           user_id?: string
