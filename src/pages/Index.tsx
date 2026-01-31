@@ -3,7 +3,7 @@ import { StoryCard } from "@/components/dashboard/StoryCard";
 import { QuickActions } from "@/components/dashboard/QuickActions";
 import { Stats } from "@/components/dashboard/Stats";
 import { Button } from "@/components/ui/button";
-import { Plus, ArrowRight, Sparkles, LogIn } from "lucide-react";
+import { Plus, ArrowRight, Sparkles, LogIn, PenTool } from "lucide-react";
 import type { KeyboardEvent, MouseEvent } from "react";
 import { Link, useNavigate } from "react-router-dom";
 import { useAuth } from "@/hooks/useAuth";
@@ -66,12 +66,20 @@ export default function Index() {
             </p>
             <div className="flex flex-wrap gap-4">
               {user ? (
-                <Link to="/import">
-                  <Button variant="hero" size="xl" className="gap-2">
-                    <Plus className="w-5 h-5" />
-                    Start New Story
-                  </Button>
-                </Link>
+                <>
+                  <Link to="/import">
+                    <Button variant="hero" size="xl" className="gap-2">
+                      <Plus className="w-5 h-5" />
+                      Start New Story
+                    </Button>
+                  </Link>
+                  <Link to="/create-story">
+                    <Button variant="outline" size="xl" className="gap-2">
+                      <PenTool className="w-5 h-5" />
+                      Create with AI
+                    </Button>
+                  </Link>
+                </>
               ) : (
                 <Link to="/auth">
                   <Button variant="hero" size="xl" className="gap-2">

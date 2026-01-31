@@ -16,6 +16,7 @@ import Profile from "./pages/Profile";
 import NotFound from "./pages/NotFound";
 import AdminUsers from "./pages/admin/AdminUsers";
 import AdminUserDetails from "./pages/admin/AdminUserDetails";
+import CreateStory from "./pages/CreateStory";
 
 const queryClient = new QueryClient();
 
@@ -35,6 +36,7 @@ const App = () => (
               <Route path="/pricing" element={<Pricing />} />
               <Route path="/profile" element={<Profile />} />
               <Route path="/import" element={<Import />} />
+              <Route path="/create-story" element={<CreateStory />} />
               <Route path="/storyboard" element={<Storyboard />} />
               <Route path="/storyboard/:storyId" element={<Storyboard />} />
               <Route path="/admin/users" element={<AdminUsers />} />

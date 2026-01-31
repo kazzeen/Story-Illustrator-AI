@@ -1,5 +1,5 @@
 import { Link, useLocation, useNavigate } from "react-router-dom";
-import { BookOpen, Home, Upload, Grid3X3, LogIn, LogOut, Sparkles, User, CreditCard, Shield } from "lucide-react";
+import { BookOpen, Home, Upload, Grid3X3, LogIn, LogOut, Sparkles, User, CreditCard, Shield, PenTool } from "lucide-react";
 import { Button } from "@/components/ui/button";
 import { cn } from "@/lib/utils";
 import { useAuth } from "@/hooks/useAuth";
@@ -13,6 +13,7 @@ import {
 
 const navItems = [
   { path: "/", icon: Home, label: "Dashboard" },
+  { path: "/create-story", icon: PenTool, label: "Create" },
   { path: "/import", icon: Upload, label: "Import" },
   { path: "/storyboard", icon: Grid3X3, label: "Storyboard" },
   { path: "/pricing", icon: CreditCard, label: "Pricing" },
