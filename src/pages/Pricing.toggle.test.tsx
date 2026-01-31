@@ -287,10 +287,15 @@ describe("Pricing checkout buttons", () => {
     const { default: Pricing } = await import("./Pricing");
     const assign = stubLocationAssign();
 
-    supabaseMocks.functions.invoke.mockImplementationOnce(async () => ({
-      data: null,
-      error: { status: 401 } as never,
-    }));
+    supabaseMocks.functions.invoke
+      .mockImplementationOnce(async () => ({
+        data: null,
+        error: { status: 401 } as never,
+      }))
+      .mockImplementationOnce(async () => ({
+        data: null,
+        error: { status: 401 } as never,
+      }));
 
     render(
       <MemoryRouter>

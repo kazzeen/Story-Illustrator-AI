@@ -381,7 +381,7 @@ export default function Pricing() {
               : null;
 
         if (url) {
-          window.location.href = url;
+          redirectToUrl(url);
         } else {
           const details =
             isRecord(data) && typeof data.error === "string"
