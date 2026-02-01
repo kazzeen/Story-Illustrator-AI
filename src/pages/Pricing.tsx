@@ -224,13 +224,9 @@ export default function Pricing() {
   }, []);
 
   const invokeEdgeFunction = useCallback(async (fn: string, body: Record<string, unknown>, accessToken: string) => {
-    // Supabase client automatically attaches the current session token
-    // We don't need to manually pass it unless we want to override it.
-    // However, if we just refreshed the token, the client might not have picked it up if we didn't await the session set?
-    // refreshSession() updates the session.
     const { data, error } = await supabase.functions.invoke(fn, {
       body,
-      // headers: { Authorization: `Bearer ${accessToken}` }, // Removed to rely on auto-auth
+      headers: { Authorization: `Bearer ${accessToken}` },
     });
     if (error) throw error;
     return data;
