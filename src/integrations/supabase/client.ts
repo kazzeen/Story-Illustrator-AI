@@ -3,33 +3,37 @@ import { createClient } from '@supabase/supabase-js';
 import type { Database } from './types';
 
 const SUPABASE_URL = import.meta.env.VITE_SUPABASE_URL;
-// Fallback to PUBLISHABLE_KEY if ANON_KEY is missing, ensuring compatibility with different env configs
-const SUPABASE_PUBLISHABLE_KEY = import.meta.env.VITE_SUPABASE_ANON_KEY || import.meta.env.VITE_SUPABASE_PUBLISHABLE_KEY;
+
+// Prioritize ANON_KEY explicitly, and ensure we never use a non-JWT key
+const rawAnonKey = import.meta.env.VITE_SUPABASE_ANON_KEY;
+const rawPubKey = import.meta.env.VITE_SUPABASE_PUBLISHABLE_KEY;
+
+// Helper to validate JWT format (starts with eyJ)
+const isValidJWT = (key: string | undefined): boolean => !!key && key.startsWith('eyJ');
+
+// Select the best available key
+const SUPABASE_PUBLISHABLE_KEY = isValidJWT(rawAnonKey) ? rawAnonKey : (isValidJWT(rawPubKey) ? rawPubKey : '');
+
+// Validation
+if (!SUPABASE_PUBLISHABLE_KEY) {
+  console.error(
+    "CRITICAL ERROR: No valid Supabase JWT found!", 
+    "VITE_SUPABASE_ANON_KEY:", rawAnonKey ? (isValidJWT(rawAnonKey) ? 'Valid JWT' : 'Invalid Format') : 'Missing',
+    "VITE_SUPABASE_PUBLISHABLE_KEY:", rawPubKey ? (isValidJWT(rawPubKey) ? 'Valid JWT' : 'Invalid Format') : 'Missing'
+  );
+}
+
+// FORCE LOG THE KEY FOR DEBUGGING
+console.log('--- SUPABASE CLIENT DEBUG ---');
+console.log('VITE_SUPABASE_URL:', SUPABASE_URL);
+console.log('USING KEY:', SUPABASE_PUBLISHABLE_KEY ? (SUPABASE_PUBLISHABLE_KEY.slice(0, 10) + '... (Valid JWT)') : 'FAILED TO RESOLVE KEY');
+console.log('--- END DEBUG ---');
 
 // Import the supabase client like this:
 // import { supabase } from "@/integrations/supabase/client";
 
-try {
-  if (typeof localStorage !== "undefined" && SUPABASE_URL && SUPABASE_PUBLISHABLE_KEY) {
-    const fingerprintKey = "siai:supabase-fingerprint:v1";
-    const fingerprint = `${SUPABASE_URL}|${SUPABASE_PUBLISHABLE_KEY.slice(0, 16)}`;
-    const previous = localStorage.getItem(fingerprintKey);
-
-    if (previous && previous !== fingerprint) {
-      try {
-        const host = new URL(SUPABASE_URL).hostname;
-        const ref = host.split(".")[0];
-        if (ref) localStorage.removeItem(`sb-${ref}-auth-token`);
-      } catch (e) {
-        void e;
-      }
-    }
-
-    localStorage.setItem(fingerprintKey, fingerprint);
-  }
-} catch (e) {
-  void e;
-}
+// NOTE: Fingerprinting logic removed to prevent aggressive token deletion during dev/prod switching
+// This ensures that valid tokens are not cleared just because env vars might jitter.
 
 const wrappedFetch: typeof fetch = async (input, init) => {
   try {

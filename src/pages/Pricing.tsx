@@ -105,12 +105,12 @@ const plans = [
     price: 39.99,
     description: "Power users and studios",
     features: [
-      "Unlimited images & stories",
+      "1000 images/credits per month",
+      "Unlimited stories",
       "All Models & Art Styles",
       "Dedicated support",
       "Custom feature requests",
-      "Early access to new features",
-      "API Access (beta)"
+      "Early access to new features"
     ],
     cta: "Go Professional",
     ctaVariant: "default" as const,
@@ -126,7 +126,7 @@ const featuresComparison = [
   {
     category: "Generation",
     features: [
-      { name: "Monthly Credits", free: "5 (one-time)", starter: "100", creator: "200", pro: "Unlimited" },
+      { name: "Monthly Credits", free: "5 (one-time)", starter: "100", creator: "200", pro: "1000" },
       { name: "Story Generations", free: "1", starter: "5", creator: "25", pro: "Unlimited" },
       { name: "Bonus Credits", free: "-", starter: "20", creator: "100", pro: "-" },
     ]
@@ -773,7 +773,7 @@ export default function Pricing() {
         <div className="grid md:grid-cols-3 gap-8 max-w-5xl mx-auto">
           {[
             {
-              quote: "The character consistency is mind-blowing. It saved me weeks of work on my graphic novel.",
+              quote: "The speed it takes to make characters is mind blowing. It saved me weeks of work on my graphic novel.",
               author: "Sarah J.",
               role: "Indie Author"
             },

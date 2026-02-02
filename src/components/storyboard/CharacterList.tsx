@@ -342,7 +342,7 @@ export function CharacterList({ storyId, selectedArtStyle, selectedModel, styleI
       };
 
       const functionUrl = `${import.meta.env.VITE_SUPABASE_URL ?? "https://placeholder.supabase.co"}/functions/v1/generate-character-reference`;
-      const apikey = String(import.meta.env.VITE_SUPABASE_PUBLISHABLE_KEY ?? "");
+      const apikey = String(import.meta.env.VITE_SUPABASE_ANON_KEY || import.meta.env.VITE_SUPABASE_PUBLISHABLE_KEY || "");
       const expectedStyleId = selectedArtStyle || "digital_illustration";
 
       const invokeGenerate = async (char: Character, attempt: number) => {

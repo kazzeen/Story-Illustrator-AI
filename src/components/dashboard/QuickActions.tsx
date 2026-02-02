@@ -1,5 +1,5 @@
 import { Card, CardContent } from "@/components/ui/card";
-import { Upload, FileText, Wand2, Download, PenTool } from "lucide-react";
+import { Upload, PenTool } from "lucide-react";
 import { Link } from "react-router-dom";
 
 const actions = [
@@ -18,30 +18,6 @@ const actions = [
     href: "/import",
     color: "text-primary",
     bgColor: "bg-primary/10",
-  },
-  {
-    icon: FileText,
-    title: "Analyze Text",
-    description: "AI scene detection",
-    href: "/analyze",
-    color: "text-accent",
-    bgColor: "bg-accent/10",
-  },
-  {
-    icon: Wand2,
-    title: "Generate Art",
-    description: "Create illustrations",
-    href: "/generate",
-    color: "text-green-400",
-    bgColor: "bg-green-400/10",
-  },
-  {
-    icon: Download,
-    title: "Export",
-    description: "PDF or image pack",
-    href: "/export",
-    color: "text-blue-400",
-    bgColor: "bg-blue-400/10",
   },
 ];
 

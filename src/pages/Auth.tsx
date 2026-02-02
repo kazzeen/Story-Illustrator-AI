@@ -100,7 +100,7 @@ export default function Auth() {
         if (error) {
           toast({
             title: 'Sign in failed',
-            description: 'Invalid email or password. Please try again.',
+            description: error.message || 'Invalid email or password. Please try again.',
             variant: 'destructive',
           });
         }
