@@ -149,22 +149,45 @@ export async function createStripeCheckoutSession(params: {
   idempotencyKey: string;
   form: URLSearchParams;
 }) {
-  const resp = await fetch("https://api.stripe.com/v1/checkout/sessions", {
-    method: "POST",
-    headers: {
-      Authorization: `Bearer ${params.stripeSecretKey}`,
-      "Content-Type": "application/x-www-form-urlencoded",
-      "Idempotency-Key": params.idempotencyKey,
-    },
-    body: params.form.toString(),
-  });
+  const makeRequest = async (formData: URLSearchParams, idempotencyKey: string) => {
+    const resp = await fetch("https://api.stripe.com/v1/checkout/sessions", {
+      method: "POST",
+      headers: {
+        Authorization: `Bearer ${params.stripeSecretKey}`,
+        "Content-Type": "application/x-www-form-urlencoded",
+        "Idempotency-Key": idempotencyKey,
+      },
+      body: formData.toString(),
+    });
 
-  const text = await resp.text();
-  let body: unknown = null;
-  try {
-    body = JSON.parse(text);
-  } catch {
-    body = null;
+    const text = await resp.text();
+    let body: unknown = null;
+    try {
+      body = JSON.parse(text);
+    } catch {
+      body = null;
+    }
+
+    return { resp, text, body };
+  };
+
+  let { resp, text, body } = await makeRequest(params.form, params.idempotencyKey);
+
+  // If the customer doesn't exist (test mode customer used with live mode key), retry without customer
+  if (!resp.ok && body && typeof body === "object") {
+    const error = (body as Record<string, unknown>).error;
+    if (error && typeof error === "object") {
+      const errorObj = error as Record<string, unknown>;
+      if (errorObj.code === "resource_missing" && errorObj.param === "customer") {
+        console.log("Customer not found in Stripe, retrying without customer ID...");
+        const retryForm = new URLSearchParams(params.form.toString());
+        retryForm.delete("customer");
+        const retryResult = await makeRequest(retryForm, params.idempotencyKey + "-retry");
+        resp = retryResult.resp;
+        text = retryResult.text;
+        body = retryResult.body;
+      }
+    }
   }
 
   if (!resp.ok) {

@@ -224,12 +224,29 @@ export default function Pricing() {
   }, []);
 
   const invokeEdgeFunction = useCallback(async (fn: string, body: Record<string, unknown>, accessToken: string) => {
-    const { data, error } = await supabase.functions.invoke(fn, {
-      body,
-      headers: { Authorization: `Bearer ${accessToken}` },
+    const supabaseUrl = import.meta.env.VITE_SUPABASE_URL;
+    const supabaseAnonKey = import.meta.env.VITE_SUPABASE_ANON_KEY;
+    const url = `${supabaseUrl}/functions/v1/${fn}`;
+
+    const response = await fetch(url, {
+      method: "POST",
+      headers: {
+        "Content-Type": "application/json",
+        "Authorization": `Bearer ${accessToken}`,
+        "apikey": supabaseAnonKey,
+      },
+      body: JSON.stringify(body),
     });
-    if (error) throw error;
-    return data;
+
+    if (!response.ok) {
+      const errorData = await response.json().catch(() => ({}));
+      const error = new Error(errorData.error || `HTTP ${response.status}`) as any;
+      error.status = response.status;
+      error.details = errorData.details;
+      throw error;
+    }
+
+    return response.json();
   }, []);
 
   const getErrorStatus = useCallback(
@@ -390,11 +407,13 @@ export default function Pricing() {
         }
       } catch (e: any) {
         console.error("Checkout exception:", e);
-        const detailMsg = e.details || e.message || (e instanceof Error ? e.message : "Unknown error");
-        toast({ 
-            title: "Authorization error", 
-            description: detailMsg.includes("401") ? `Checkout authorization failed: ${detailMsg}` : detailMsg, 
-            variant: "destructive" 
+        console.error("Checkout exception details:", e.details);
+        const rawDetails = e.details || e.message || (e instanceof Error ? e.message : "Unknown error");
+        const detailMsg = typeof rawDetails === "string" ? rawDetails : JSON.stringify(rawDetails);
+        toast({
+            title: "Checkout error",
+            description: detailMsg.includes("401") ? `Checkout authorization failed: ${detailMsg}` : detailMsg,
+            variant: "destructive"
         });
       } finally {
         setCheckoutKey(null);

@@ -15,5 +15,17 @@ verify_jwt = true
 [functions.stripe-webhook]
 verify_jwt = false
 
+[functions.credits]
+verify_jwt = false
+
+[functions.create-credit-pack-checkout]
+verify_jwt = false
+
+[functions.create-starter-membership-checkout]
+verify_jwt = false
+
+[functions.create-creator-membership-checkout]
+verify_jwt = false
+
 [functions.api-admin]
 verify_jwt = false

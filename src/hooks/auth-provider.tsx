@@ -35,11 +35,19 @@ export function AuthProvider({ children }: { children: ReactNode }) {
           const { data: sessionData } = await supabase.auth.getSession();
           const token = sessionData.session?.access_token ?? null;
           if (token) {
-            const { data: creditsData, error: creditsErr } = await supabase.functions.invoke("credits", {
-              body: { action: "status", limit: 0 },
-              headers: { Authorization: `Bearer ${token}` },
+            const supabaseUrl = import.meta.env.VITE_SUPABASE_URL;
+            const supabaseAnonKey = import.meta.env.VITE_SUPABASE_ANON_KEY;
+            const creditsResponse = await fetch(`${supabaseUrl}/functions/v1/credits`, {
+              method: "POST",
+              headers: {
+                "Content-Type": "application/json",
+                "Authorization": `Bearer ${token}`,
+                "apikey": supabaseAnonKey,
+              },
+              body: JSON.stringify({ action: "status", limit: 0 }),
             });
-            if (!creditsErr && isRecord(creditsData) && creditsData.success === true && isRecord(creditsData.credits)) {
+            const creditsData = creditsResponse.ok ? await creditsResponse.json() : null;
+            if (creditsData && isRecord(creditsData) && creditsData.success === true && isRecord(creditsData.credits)) {
               const tier = typeof creditsData.credits.tier === "string" ? creditsData.credits.tier : null;
               const remainingMonthly =
                 typeof creditsData.credits.remaining_monthly === "number" ? creditsData.credits.remaining_monthly : null;
@@ -66,18 +74,16 @@ export function AuthProvider({ children }: { children: ReactNode }) {
         return;
       }
 
-      const code = typeof first.error.code === "string" ? first.error.code : "";
-      if (code === "42703") {
-        const fallback = await attemptBasic();
-        if (fallback.error) {
-          if (!isAbortedError(fallback.error)) console.error("Error fetching profile:", fallback.error);
-          return;
-        }
-        setProfile(fallback.data);
+      // Fallback: If extended fetch fails for ANY reason (e.g. column missing, network, permissions),
+      // try the basic fetch to at least get the admin status and display name.
+      console.warn("Extended profile fetch failed, falling back to basic profile fetch:", first.error);
+      const fallback = await attemptBasic();
+      if (fallback.error) {
+        if (!isAbortedError(fallback.error)) console.error("Critical: Basic profile fetch also failed:", fallback.error);
         return;
       }
-
-      if (!isAbortedError(first.error)) console.error("Error fetching profile:", first.error);
+      setProfile(fallback.data);
+      return;
     } catch (e) {
       if (!isAbortedError(e)) console.error('Exception fetching profile:', e);
     }

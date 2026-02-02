@@ -105,17 +105,17 @@ serve(async (req: Request) => {
   const stripeSecretKeyRaw = Deno.env.get("STRIPE_SECRET_KEY");
   const monthlyPriceIdRaw =
     (tier === "professional"
-      ? Deno.env.get("STRIPE_PRICE_PROFESSIONAL_ID") ?? "price_1SkA5XGhz0DaM9DauhtkNecq"
-      : Deno.env.get("STRIPE_PRICE_CREATOR_ID") ?? "price_1SlLG4Ghz0DaM9DammUhNwTH");
+      ? Deno.env.get("STRIPE_PRICE_PROFESSIONAL_ID") ?? "price_1Sw5ABK6nfDI8t5u0zY0OHxA"
+      : Deno.env.get("STRIPE_PRICE_CREATOR_ID") ?? "price_1Sw59xK6nfDI8t5uVsfwQ1Im");
   const annualPriceIdRaw =
     (tier === "professional"
-      ? Deno.env.get("STRIPE_PRICE_PROFESSIONAL_ANNUAL_ID") ?? "price_1Sli8gGhz0DaM9Dadz4YTMSm"
-      : Deno.env.get("STRIPE_PRICE_CREATOR_ANNUAL_ID") ?? "price_1SlLG4Ghz0DaM9Dal11krHXI");
+      ? Deno.env.get("STRIPE_PRICE_PROFESSIONAL_ANNUAL_ID") ?? "price_1Sw5AAK6nfDI8t5usv8q5r4C"
+      : Deno.env.get("STRIPE_PRICE_CREATOR_ANNUAL_ID") ?? "price_1Sw59xK6nfDI8t5ulRQf6kmx");
   const envPriceId = interval === "year" ? annualPriceIdRaw : monthlyPriceIdRaw;
   const envPriceIdOk = Boolean(envPriceId && envPriceId.startsWith("price_"));
 
-  const creatorProductId = (Deno.env.get("STRIPE_PRODUCT_CREATOR_ID") ?? "prod_TimpRrgY9Ko9IL").trim();
-  const professionalProductId = (Deno.env.get("STRIPE_PRODUCT_PROFESSIONAL_ID") ?? "prod_ThZDvY85b9kQtx").trim();
+  const creatorProductId = (Deno.env.get("STRIPE_PRODUCT_CREATOR_ID") ?? "prod_Ttsv3QOElWOxvf").trim();
+  const professionalProductId = (Deno.env.get("STRIPE_PRODUCT_PROFESSIONAL_ID") ?? "prod_Ttsw7PftxfoIQg").trim();
   const productId = tier === "professional" ? professionalProductId : creatorProductId;
   const productIdOk = productId.startsWith("prod_");
   const missing: string[] = [];
@@ -143,20 +143,38 @@ serve(async (req: Request) => {
     return json(401, { error: "Missing Authorization header" });
   }
 
-  const supabaseClient = createClient(
-    supabaseUrl,
-    supabaseAnonKey ?? "",
-    { global: { headers: { Authorization: authHeader } } }
-  );
+  // Extract token from Bearer header
+  const token = authHeader.replace(/^Bearer\s+/i, "");
+  if (!token) {
+    console.error("Invalid Authorization header format");
+    return json(401, { error: "Invalid Authorization header" });
+  }
 
-  const {
-    data: { user },
-    error: userError,
-  } = await supabaseClient.auth.getUser();
+  // Decode JWT to get user info (token was issued by Supabase Auth)
+  let user: { id: string; email?: string } | null = null;
+  try {
+    const parts = token.split(".");
+    if (parts.length !== 3) throw new Error("Invalid JWT format");
+    const payload = JSON.parse(atob(parts[1]));
+    if (!payload.sub) throw new Error("Missing sub claim");
+    // Verify the token is from our Supabase project
+    const expectedIssuer = `${supabaseUrl}/auth/v1`;
+    if (payload.iss !== expectedIssuer) {
+      console.error("Invalid issuer:", payload.iss, "expected:", expectedIssuer);
+      throw new Error("Invalid token issuer");
+    }
+    // Check token expiration
+    if (payload.exp && payload.exp * 1000 < Date.now()) {
+      throw new Error("Token expired");
+    }
+    user = { id: payload.sub, email: payload.email };
+  } catch (e) {
+    console.error("JWT decode error:", e);
+    return json(401, { error: "Authorization failed", details: e instanceof Error ? e.message : "Invalid token" });
+  }
 
-  if (userError || !user) {
-    console.error("Authorization failed:", userError);
-    return json(401, { error: "Authorization failed", details: userError?.message });
+  if (!user || !user.id) {
+    return json(401, { error: "Authorization failed", details: "Invalid user data" });
   }
 
   const urls = buildCheckoutReturnUrls(req, { preferredBase: returnBase });
@@ -187,7 +205,10 @@ serve(async (req: Request) => {
   });
 
   const created = await createStripeCheckoutSession({ stripeSecretKey, idempotencyKey, form });
-  if (!created.ok) return json(502, { error: "Stripe session creation failed", status: created.status, details: created.stripeError ?? created.body ?? created.raw });
+  if (!created.ok) {
+    console.error("Stripe checkout failed:", JSON.stringify({ status: created.status, stripeError: created.stripeError, body: created.body, raw: created.raw }));
+    return json(502, { error: "Stripe session creation failed", status: created.status, details: created.stripeError ?? created.body ?? created.raw });
+  }
 
   return json(200, { url: created.url, sessionId: created.id });
 });

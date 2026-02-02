@@ -127,19 +127,19 @@ serve(async (req: Request) => {
 
   const priceEnvKey = priceEnvKeyForPack(pack);
   let defaultPriceId: string | null = null;
-  if (pack === "small") defaultPriceId = "price_1SlK6pGhz0DaM9Da16ezWBP0";
-  if (pack === "medium") defaultPriceId = "price_1SlK7tGhz0DaM9Da88lwWEOH";
-  if (pack === "large") defaultPriceId = "price_1SoBzBGhz0DaM9DaFeIUw3Eo";
+  if (pack === "small") defaultPriceId = "price_1Sw5A6K6nfDI8t5uBEi4GI6M";
+  if (pack === "medium") defaultPriceId = "price_1Sw5A3K6nfDI8t5u6b79Oto4";
+  if (pack === "large") defaultPriceId = "price_1Sw59qK6nfDI8t5u3svZgwze";
 
   const priceIdRaw = Deno.env.get(priceEnvKey) ?? defaultPriceId;
   const priceId = priceIdRaw && priceIdRaw.startsWith("price_") ? priceIdRaw : null;
 
   const productId =
     pack === "small"
-      ? (Deno.env.get("STRIPE_PRODUCT_CREDITS_SMALL_ID") ?? "prod_Tile8wkupI73el").trim()
+      ? (Deno.env.get("STRIPE_PRODUCT_CREDITS_SMALL_ID") ?? "prod_TtsvAOBuEtayqn").trim()
       : pack === "medium"
-        ? (Deno.env.get("STRIPE_PRODUCT_CREDITS_MEDIUM_ID") ?? "prod_TilfzH9y5Xt4ot").trim()
-        : (Deno.env.get("STRIPE_PRODUCT_CREDITS_LARGE_ID") ?? "prod_TljS29toykp4sN").trim();
+        ? (Deno.env.get("STRIPE_PRODUCT_CREDITS_MEDIUM_ID") ?? "prod_TtsvqADmVRgbAT").trim()
+        : (Deno.env.get("STRIPE_PRODUCT_CREDITS_LARGE_ID") ?? "prod_TtsvpkXkXQXZIi").trim();
   const productIdOk = productId.startsWith("prod_");
 
   const authHeader = req.headers.get("authorization") ?? req.headers.get("Authorization");
@@ -148,20 +148,38 @@ serve(async (req: Request) => {
     return json(401, { error: "Missing Authorization header" });
   }
 
-  const supabaseClient = createClient(
-    supabaseUrl,
-    supabaseAnonKey ?? "",
-    { global: { headers: { Authorization: authHeader } } }
-  );
+  // Extract token from Bearer header
+  const token = authHeader.replace(/^Bearer\s+/i, "");
+  if (!token) {
+    console.error("Invalid Authorization header format");
+    return json(401, { error: "Invalid Authorization header" });
+  }
 
-  const {
-    data: { user },
-    error: userError,
-  } = await supabaseClient.auth.getUser();
+  // Decode JWT to get user info (token was issued by Supabase Auth)
+  let user: { id: string; email?: string } | null = null;
+  try {
+    const parts = token.split(".");
+    if (parts.length !== 3) throw new Error("Invalid JWT format");
+    const payload = JSON.parse(atob(parts[1]));
+    if (!payload.sub) throw new Error("Missing sub claim");
+    // Verify the token is from our Supabase project
+    const expectedIssuer = `${supabaseUrl}/auth/v1`;
+    if (payload.iss !== expectedIssuer) {
+      console.error("Invalid issuer:", payload.iss, "expected:", expectedIssuer);
+      throw new Error("Invalid token issuer");
+    }
+    // Check token expiration
+    if (payload.exp && payload.exp * 1000 < Date.now()) {
+      throw new Error("Token expired");
+    }
+    user = { id: payload.sub, email: payload.email };
+  } catch (e) {
+    console.error("JWT decode error:", e);
+    return json(401, { error: "Authorization failed", details: e instanceof Error ? e.message : "Invalid token" });
+  }
 
-  if (userError || !user) {
-    console.error("Authorization failed:", userError);
-    return json(401, { error: "Authorization failed", details: userError?.message });
+  if (!user || !user.id) {
+    return json(401, { error: "Authorization failed", details: "Invalid user data" });
   }
 
   const urls = buildCheckoutReturnUrls(req, {
@@ -203,7 +221,10 @@ serve(async (req: Request) => {
   });
 
   const created = await createStripeCheckoutSession({ stripeSecretKey, idempotencyKey, form });
-  if (!created.ok) return json(502, { error: "Stripe session creation failed", status: created.status, details: created.stripeError ?? created.body ?? created.raw });
+  if (!created.ok) {
+    console.error("Stripe checkout failed:", JSON.stringify({ status: created.status, stripeError: created.stripeError, body: created.body, raw: created.raw }));
+    return json(502, { error: "Stripe session creation failed", status: created.status, details: created.stripeError ?? created.body ?? created.raw });
+  }
 
   return json(200, { url: created.url, sessionId: created.id });
 });
